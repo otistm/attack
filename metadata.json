@@ -1,0 +1,6 @@
+{
+  "name": "Diamond Tactics",
+  "description": "An interactive 3D isometric baseball autobattler field.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
