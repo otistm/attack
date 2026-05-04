@@ -1,7 +1,13 @@
-import { CardDefinition } from "./cards";
+import { CardDefinition, TagLiteral } from "./cards";
 import { ShapeType } from "../components/cardShapes";
 import { canConnect } from "./connect";
 import type { ScoringContext } from "./scoring";
+import { batterTeamLead, runnersOnCount } from "./scoring";
+
+// Note: cardEffects <-> scoring is a soft cycle (scoring imports applyCardEffect /
+// applyOpponentTotalAdjustments from here, and we import the Phase 6 helpers
+// from scoring). It's safe because every binding on either side is a function
+// reference accessed at call time, not at module-init time.
 
 export interface EffectContext extends ScoringContext {
   hand: CardDefinition[];
@@ -15,16 +21,34 @@ export interface EffectResult {
   selfValueDelta: number;
   // Delta applied to the opponent's total this round.
   opponentValueDelta: number;
-  // Bonus added to the Hit Scale calculation only (not the head-to-head total).
+  /**
+   * Optional attribution: when the description targets a specific opponent
+   * card (e.g. b-2 "opponent's highest single -2", b-30 "opponent's base card
+   * halved"), the effect can name the card that took the hit. The math still
+   * lands as `opponentValueDelta` on the opponent's total -- this field is
+   * purely presentational so the reveal animator can drop the correct
+   * opponent card's number visibly. Aggregate debuffs (p-38, p-72, p-60)
+   * leave it undefined.
+   */
+  opponentTargetCardId?: string;
+  // Additive bonus to the Hit Scale calculation (does not affect head-to-head total).
+  // On the BATTING side a positive value pushes the batter UP the Hit Scale ladder.
+  // On the PITCHING side a positive value RAISES the requirements (debuff to batter).
+  // Negative values are valid on either side.
   hitScaleBonus: number;
-  // Tier shift for the Hit Scale ladder. +5 typically means "upgrade one tier".
-  hitScaleTierShift: number;
   // Force the entire play to a specific outcome regardless of score.
   forcedOutcome?: "single" | "homerun";
   // Pitcher wins ties this round.
   pitcherWinsTies?: boolean;
   // Adjustment to pitcher's combined values (b-17 Line Drive: -2).
   pitcherCombinedDelta: number;
+  /**
+   * Per-pitcher-card breakdown of `pitcherCombinedDelta`. b-17 Line Drive's
+   * description ("pitcher's combined cards each get -2") implies one tick per
+   * combined opponent card, so we surface that list for the animator. Engine
+   * math still folds to `pitcherCombinedDelta` for back-compat.
+   */
+  pitcherCombinedDebuffs?: { targetCardId: string; delta: number }[];
   // Optional debug log.
   log?: string[];
 }
@@ -33,7 +57,6 @@ const NOOP: EffectResult = {
   selfValueDelta: 0,
   opponentValueDelta: 0,
   hitScaleBonus: 0,
-  hitScaleTierShift: 0,
   pitcherCombinedDelta: 0,
 };
 
@@ -59,7 +82,14 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   "b-1": (ctx) => (ctx.isCombined ? r({ selfValueDelta: 4 }) : NOOP),
 
   // b-2 Judge's Chamber: opponent's highest single card -2.
-  "b-2": () => r({ opponentValueDelta: -2 }),
+  // Attribution targets the highest-value UNCOMBINED card if any exist
+  // ("single" in the description), otherwise falls back to the overall highest
+  // (opponentBaseCard) so the reveal animator always has a card to point at.
+  "b-2": (ctx) => {
+    const target =
+      highestUncombinedInHand(ctx.opponentHand ?? []) ?? ctx.opponentBaseCard;
+    return r({ opponentValueDelta: -2, opponentTargetCardId: target?.id });
+  },
 
   // b-3 Barrel It Up: +3 if combined (combine constraint enforced by canConnect).
   "b-3": (ctx) => (ctx.isCombined ? r({ selfValueDelta: 3 }) : NOOP),
@@ -70,10 +100,11 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-5 Opposite Field Power: shape-reversal effect handled at hand-build time.
   "b-5": () => NOOP,
 
-  // b-6 50/50 Club: if you win the round, upgrade Hit Scale by +5 tier.
-  "b-6": () => r({ hitScaleTierShift: 5 }),
+  // b-6 50/50 Club: if you win the round, +5 to Hit Scale (typically upgrades the tier).
+  "b-6": () => r({ hitScaleBonus: 5 }),
 
-  // b-7 Soto Shuffle: information-only, no scoring impact.
+  // b-7 Soto Shuffle: information-only. Queues an opponentUncombined reveal
+  // request (gameStore.derivePendingReveals) shown by InfoRevealOverlay.
   "b-7": () => NOOP,
 
   // b-8 Elite Eye: +3 to highest UNCOMBINED card.
@@ -85,7 +116,9 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     return NOOP;
   },
 
-  // b-9 Generational Discipline: ignores all pitcher debuffs (handled in resolve step).
+  // b-9 Generational Discipline: ignores pitcher debuffs. Handled in
+  // gameStore.lockIn -- the per-card hook is intentionally a no-op because
+  // the cancellation is global to the round, not local to the card.
   "b-9": () => NOOP,
 
   // b-10 Electric Speed: pure wildcard - no value change.
@@ -94,14 +127,22 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-11 Chaos on the Basepaths: forced single if uncombined and you win.
   "b-11": (ctx) => (!ctx.isCombined ? r({ forcedOutcome: "single" }) : NOOP),
 
-  // b-12 Switch Hitter: shape-mod effect handled at hand-build time.
+  // b-12 Switch Hitter: queues a pickShape choice in derivePendingChoices.
+  // The chosen shape replaces the left shape of the lowest-value general in
+  // the batter's hand (resolveChoice mutation).
   "b-12": () => NOOP,
 
   // b-13 Leadoff Magic: +4 if first at-bat of inning.
   "b-13": (ctx) => (ctx.isFirstAtBatOfInning ? r({ selfValueDelta: 4 }) : NOOP),
 
-  // b-14 Bowling Strike: +3 to total if combined.
-  "b-14": (ctx) => (ctx.isCombined ? r({ selfValueDelta: 3 }) : NOOP),
+  // b-14 Bowling Strike: +3 if combined with a SQUARE neighbor (Phase 4
+  // tighten -- previously a flat +3 on any combine, which made it an auto-
+  // include in any 2+ card combo).
+  "b-14": (ctx) => {
+    if (!ctx.isCombined) return NOOP;
+    if (groupHasNeighborWithShape(ctx, "square")) return r({ selfValueDelta: 3 });
+    return NOOP;
+  },
 
   // b-15 Mookie's Hustle: per-side wildcard handled in canConnect.
   "b-15": () => NOOP,
@@ -113,11 +154,23 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     return NOOP;
   },
 
-  // b-17 Line Drive: pitcher's combined values reduced by 2.
-  "b-17": () => r({ pitcherCombinedDelta: -2 }),
+  // b-17 Line Drive: "Pitcher's combined values are reduced by 2." Reads as
+  // one tick per combined pitcher card. Emits a per-card breakdown so the
+  // reveal animator can drop each combined pitcher card individually; the
+  // flat `pitcherCombinedDelta` aggregate is the sum of the breakdown so the
+  // head-to-head math in `lockIn` keeps the same shape.
+  "b-17": (ctx) => {
+    const oppGroups = buildGroupsFor(ctx.opponentHand ?? []);
+    const combined = oppGroups.flatMap((g) => (g.length > 1 ? g : []));
+    if (combined.length === 0) return r({ pitcherCombinedDelta: 0 });
+    const debuffs = combined.map((c) => ({ targetCardId: c.id, delta: -2 }));
+    const sum = debuffs.reduce((a, d) => a + d.delta, 0);
+    return r({ pitcherCombinedDelta: sum, pitcherCombinedDebuffs: debuffs });
+  },
 
-  // b-18 In The Gap: +3 to Hit Scale only (if you win).
-  "b-18": () => r({ hitScaleBonus: 3 }),
+  // b-18 In The Gap: +3 to Hit Scale, but only when combined (Phase 4 nerf
+  // -- requires playing it through a connection rather than as a 1-card brick).
+  "b-18": (ctx) => (ctx.isCombined ? r({ hitScaleBonus: 3 }) : NOOP),
 
   // b-19 Philly Clutch: +5 if your team has 2 outs.
   "b-19": (ctx) => (ctx.outs === 2 ? r({ selfValueDelta: 5 }) : NOOP),
@@ -130,11 +183,23 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     return NOOP;
   },
 
-  // b-21 The Pandemonium: destroys an opponent card (resolve-step handler).
+  // b-21 The Pandemonium: destroys an opponent card. Handled in
+  // handTransforms (Phase 2) by zeroing & noCombining the highest-value
+  // pitcher general the round the batter holds b-21.
   "b-21": () => NOOP,
 
-  // b-22 Power/Speed Threat: coin flip; resolves at lock-in. We pick a deterministic average for preview (+3) when combined.
-  "b-22": (ctx) => (ctx.isCombined ? r({ selfValueDelta: 3, log: ["b-22 coin flip avg +3"] }) : NOOP),
+  // b-22 Power/Speed Threat: actual coin flip when combined. Heads = +5,
+  // tails = +1. The flip is generated at lock-in (gameStore stores it on
+  // ctx.coinFlips) so the result is deterministic during the reveal. The
+  // live preview has no flip yet, so it falls back to the average (+3) --
+  // keeps the matchup pill stable while the player arranges cards.
+  "b-22": (ctx) => {
+    if (!ctx.isCombined) return NOOP;
+    const flip = ctx.coinFlips?.["b-22"];
+    if (flip === "heads") return r({ selfValueDelta: 5, log: ["b-22 coin flip HEADS +5"] });
+    if (flip === "tails") return r({ selfValueDelta: 1, log: ["b-22 coin flip TAILS +1"] });
+    return r({ selfValueDelta: 3, log: ["b-22 coin flip avg +3 (preview)"] });
+  },
 
   // b-23 Stolen Base Threat: pitcher cannot use general cards (resolve-step).
   "b-23": () => NOOP,
@@ -148,8 +213,15 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     return r({ selfValueDelta: 2 * uncombinedCount });
   },
 
-  // b-26 Shortstop Slap: +4 to total if combined.
-  "b-26": (ctx) => (ctx.isCombined ? r({ selfValueDelta: 4 }) : NOOP),
+  // b-26 Shortstop Slap: +4 if combined on the RIGHT side (Phase 4 tighten
+  // -- previously +4 on any combine, this version asks the player to leave
+  // a partner on b-26's right shape, which is the natural combine direction
+  // for its star/square pair).
+  "b-26": (ctx) => {
+    if (!ctx.isCombined) return NOOP;
+    if (ctx.indexInGroup < ctx.group.length - 1) return r({ selfValueDelta: 4 });
+    return NOOP;
+  },
 
   // b-27 Camden Power: +3 if pitcher's base card is a Fastball.
   "b-27": (ctx) => (ctx.opponentBaseCard?.tags?.includes("fastball") ? r({ selfValueDelta: 3 }) : NOOP),
@@ -168,7 +240,10 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     if (!ctx.opponentBaseCard) return NOOP;
     const half = Math.floor(ctx.opponentBaseCard.baseValue / 2);
     const reduction = ctx.opponentBaseCard.baseValue - half;
-    return r({ opponentValueDelta: -reduction });
+    return r({
+      opponentValueDelta: -reduction,
+      opponentTargetCardId: ctx.opponentBaseCard.id,
+    });
   },
 
   // ============ PITCHING SIGNATURES (p-31..p-60) ============
@@ -176,11 +251,12 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // p-31 Splinker: high base; opponent cannot use wildcards (resolve-step).
   "p-31": () => NOOP,
 
-  // p-32 Triple Digits: +2 if uncombined.
-  "p-32": (ctx) => (!ctx.isCombined ? r({ selfValueDelta: 2 }) : NOOP),
+  // p-32 Triple Digits: +2 (always uncombined - noCombine is enforced by combineConstraint).
+  "p-32": () => r({ selfValueDelta: 2 }),
 
-  // p-33 The Mustache: batter's Hit Scale requirements +3 (negative tier shift).
-  "p-33": () => r({ hitScaleTierShift: -3, log: ["p-33 raises batter Hit Scale +3"] }),
+  // p-33 The Mustache: batter's Hit Scale requirements +3 (positive bonus on PITCHER side
+  // is read by lockIn as a debuff to the batter's effective Hit Scale).
+  "p-33": () => r({ hitScaleBonus: 3, log: ["p-33 raises batter Hit Scale requirement +3"] }),
 
   // p-34 Cole Train: +3 if combined on the right side.
   "p-34": (ctx) => {
@@ -191,16 +267,22 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // p-35 Knuckle Curve: batter cannot combine squares (resolve-step / hand-build).
   "p-35": () => NOOP,
 
-  // p-36 Ace's Command: nullify mechanic of batter's highest valued card (resolve-step).
+  // p-36 Ace's Command: nullifies the mechanic of the batter's highest card.
+  // Handled in gameStore.scoreBatter via ScoringContext.nullifiedCardIds --
+  // the targeted card still scores its base value, just not its ability.
   "p-36": () => NOOP,
 
   // p-37 Cy Young Heat: +2 if batter is left-handed.
   "p-37": (ctx) => (ctx.batterHandedness === "L" ? r({ selfValueDelta: 2 }) : NOOP),
 
-  // p-38 Wipeout Changeup: subtract 3 from batter's final combined score.
-  "p-38": () => r({ opponentValueDelta: -3 }),
+  // p-38 Wipeout Changeup: subtract 3 from batter's score, but only if this
+  // pitch combines with another (Phase 4 nerf -- previously fired flat from
+  // any hand, which made it an auto-include).
+  "p-38": (ctx) => (ctx.isCombined ? r({ opponentValueDelta: -3 }) : NOOP),
 
-  // p-39 Mound Presence: batter must discard 1 general (resolve-step).
+  // p-39 Mound Presence: batter discards 1 general at deal time. Handled in
+  // dealEffects -- auto-discards the lowest-value general until the picker UI
+  // exists.
   "p-39": () => NOOP,
 
   // p-40 Wheeler's Workhorse: +1 per card the batter combines.
@@ -210,7 +292,10 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     return r({ selfValueDelta: combinedCount });
   },
 
-  // p-41 Sweeping Slider: break batter's combo (resolve-step).
+  // p-41 Sweeping Slider: break the batter's strongest combo. Handled in
+  // gameStore.lockIn -- it scores once to find the best group, then nullifies
+  // its first seam and re-scores. Auto-targets the strongest combo until the
+  // player-choice modal can offer a manual pick.
   "p-41": () => NOOP,
 
   // p-42 Paint the Corners: batter's base value capped at 6 before combos (resolve-step).
@@ -247,11 +332,20 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     return longestCombo >= 3 ? r({ opponentValueDelta: -6 }) : NOOP;
   },
 
-  // p-51 Veteran Savvy: information-only.
+  // p-51 Veteran Savvy: information-only. Queues an opponentHand reveal
+  // request shown by InfoRevealOverlay.
   "p-51": () => NOOP,
 
   // p-52 Sweeper (Ohtani Pitching): if uncombined, batter's highest gets -3.
-  "p-52": (ctx) => (!ctx.isCombined ? r({ opponentValueDelta: -3 }) : NOOP),
+  // Description names the batter's highest as the target -- attribute the
+  // debuff to opponentBaseCard so the reveal animator can drop that card.
+  "p-52": (ctx) => {
+    if (ctx.isCombined) return NOOP;
+    return r({
+      opponentValueDelta: -3,
+      opponentTargetCardId: ctx.opponentBaseCard?.id,
+    });
+  },
 
   // p-53 Splitter: value becomes equal to batter's highest combined total.
   "p-53": (ctx) => {
@@ -262,13 +356,17 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     return r({ selfValueDelta: oppMax - card.baseValue });
   },
 
-  // p-54 Dual Threat: draw an extra pitching general (resolve-step).
+  // p-54 Dual Threat: draw an extra pitching general at deal time. Handled
+  // in dealEffects -- always taken since extra cards are pure upside for the
+  // pitcher.
   "p-54": () => NOOP,
 
   // p-55 Rainbow Curve: +3 if combined on the left side.
   "p-55": (ctx) => (ctx.indexInGroup > 0 ? r({ selfValueDelta: 3 }) : NOOP),
 
-  // p-56 Pinpoint Control: shape edit on draw (resolve-step / hand-build).
+  // p-56 Pinpoint Control: queues a pickShape choice in derivePendingChoices.
+  // The chosen shape replaces p-56's own right shape so it can match a drawn
+  // general's left shape (resolveChoice mutation).
   "p-56": () => NOOP,
 
   // p-57 The Japanese Ace: +4 if batter uses no combinations.
@@ -281,7 +379,8 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // p-58 Strikeout Artist: future-batter debuff if win by >5 (resolve-step).
   "p-58": () => NOOP,
 
-  // p-59 Nasty Slider: information-only.
+  // p-59 Nasty Slider: information-only. Queues an opponentLayout reveal
+  // request shown by InfoRevealOverlay.
   "p-59": () => NOOP,
 
   // p-60 Filthy Stuff: -1 to batter's score for every card they play (hand-level).
@@ -294,8 +393,21 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-62 Contact Swing: +2 if combined.
   "b-62": (ctx) => (ctx.isCombined ? r({ selfValueDelta: 2 }) : NOOP),
 
-  // b-63 Bunt Attempt: forced single if you win.
-  "b-63": () => r({ forcedOutcome: "single" }),
+  // b-63 Bunt Attempt: forced single if you win, plus +2 Value to actually
+  // help you win the head-to-head. Previously this card emitted +2/+1 Hit
+  // Scale, but `forcedOutcome` short-circuits the hit-scale ladder so those
+  // points were dead -- the description "guaranteed Single AND +2 Hit Scale"
+  // misled playtesters into expecting a double or triple. Re-routing the
+  // bonus through `selfValueDelta` makes it land on the head-to-head
+  // comparison, where it can swing a close at-bat without contradicting the
+  // single-cap. Phase 5 STARTER bonus stays in the same channel.
+  "b-63": (ctx) => {
+    const result = r({ forcedOutcome: "single", selfValueDelta: 2 });
+    if (handHasTag(ctx.opponentHand ?? [], "starter")) {
+      result.selfValueDelta = (result.selfValueDelta ?? 0) + 1;
+    }
+    return result;
+  },
 
   // b-64 Good Eye: +4 if pitcher uses a fastball.
   "b-64": (ctx) => {
@@ -306,10 +418,14 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-65 Guess Pitch: +4 if pitcher uses named shape (placeholder: assume not guessed).
   "b-65": () => NOOP,
 
-  // b-66 Solid Contact: +1 to Hit Scale.
-  "b-66": () => r({ hitScaleBonus: 1 }),
+  // b-66 Solid Contact: +2 to Hit Scale, but only when combined (Phase 4
+  // nerf -- the +1 free-include is now a +2 with a real condition, so it has
+  // to interact with the rest of the hand to matter).
+  "b-66": (ctx) => (ctx.isCombined ? r({ hitScaleBonus: 2 }) : NOOP),
 
-  // b-67 Foul Ball: re-draw effect (resolve-step).
+  // b-67 Foul Ball: discard b-67 + 1 other general -> draw 2 fresh generals.
+  // Handled at deal time in dealEffects (auto-targets the lowest-value
+  // general partner).
   "b-67": () => NOOP,
 
   // b-68 Steal Sign: per-side wildcard via canConnect.
@@ -318,21 +434,100 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-69 Sacrifice Fly: scores runner from 3rd if combined and you lose (resolve-step).
   "b-69": () => NOOP,
 
-  // b-70 The Sweet Spot: forced HR if combined on both sides.
+  // b-70 The Sweet Spot: +15 Hit Scale when combined on BOTH sides (Phase 4
+  // rebalance -- previously forced an automatic Home Run, which bypassed the
+  // win check entirely and made it the most lopsided card in the deck). The
+  // +15 still pushes a winning batter to a Home Run on the Hit Scale ladder
+  // but only when they actually win the head-to-head.
   "b-70": (ctx) => {
     if (ctx.indexInGroup > 0 && ctx.indexInGroup < ctx.group.length - 1) {
-      return r({ forcedOutcome: "homerun" });
+      return r({ hitScaleBonus: 15 });
     }
     return NOOP;
   },
 
-  // ============ PITCHING GENERAL DRAW (p-71..p-80) ============
+  // b-71 Manager's Challenge: hand-level tie-breaker; the batter wins all
+  // ties this round and overrides any pitcher tie-breaker (p-48 Lights Out,
+  // p-80 Umpire's Call). Detected directly from batterHand in computeMatchup
+  // -- mirrors the way b-9 Generational Discipline is hand-level rather than
+  // running through the per-card effect registry.
+  "b-71": () => NOOP,
+
+  // b-72 Walk-Off Swing: +1 per CLUTCH card in your hand. Counts itself, so
+  // a solo b-72 still pays out +1; the synergy reward kicks in when other
+  // clutch cards (b-65 Guess Pitch, b-69 Sacrifice Fly, b-71 Manager's
+  // Challenge, Mookie/Harper/Witt signatures) ride along.
+  "b-72": (ctx) => {
+    const clutch = countOtherHandTag(ctx, "clutch");
+    return clutch > 0 ? r({ selfValueDelta: clutch }) : NOOP;
+  },
+
+  // b-73 Stolen Sign Read: +3 Hit Scale when your hand carries 2+ OTHER
+  // SPEEDSTER cards. Self-tagged SPEEDSTER, so we exclude the source -- the
+  // intent is "two speedsters surrounding it" not "I count myself for one".
+  "b-73": (ctx) => (countOtherHandTag(ctx, "speedster") >= 2 ? r({ hitScaleBonus: 3 }) : NOOP),
+
+  // b-74 Veteran Presence: +1 per OTHER VETERAN card in your hand. Self-tagged
+  // VETERAN, so it must be paired with another veteran to do anything.
+  "b-74": (ctx) => {
+    const v = countOtherHandTag(ctx, "veteran");
+    return v > 0 ? r({ selfValueDelta: v }) : NOOP;
+  },
+
+  // b-75 Rookie Energy: +5 if any OTHER ROOKIE-tagged card is in your hand.
+  // Self-tagged rookie, so the bonus only fires when the batter signature
+  // (De La Cruz, Henderson) is actually a rookie alongside it.
+  "b-75": (ctx) => (handHasOtherTag(ctx, "rookie") ? r({ selfValueDelta: 5 }) : NOOP),
+
+  // b-76 Power Stance: +3 when combined AND your hand has another POWER-HITTER
+  // card. Self-tagged power-hitter, so the synergy must include a different
+  // power-hitter card (Judge, Vlad, Acuña, Harper signatures).
+  "b-76": (ctx) => {
+    if (!ctx.isCombined) return NOOP;
+    if (!handHasOtherTag(ctx, "power-hitter")) return NOOP;
+    return r({ selfValueDelta: 3 });
+  },
+
+  // b-77 Closer Hunter: +5 when the OPPONENT has a CLOSER tag. Rewards
+  // matchups against Clase/Miller specifically, scales the threat against
+  // the hardest pitches in the deck.
+  "b-77": (ctx) => (handHasTag(ctx.opponentHand ?? [], "closer") ? r({ selfValueDelta: 5 }) : NOOP),
+
+  // b-78 Bullpen Beater: hand-level "always fires when held" debuff. The
+  // per-card path here is intentionally a no-op -- the math lives in
+  // `applyOpponentTotalAdjustments` so the effect lands even if b-78 is in a
+  // group that didn't win the head-to-head (the description "if they are a
+  // starter" reads as an always-on condition; gating it on best-group
+  // arrangement was a Phase 5 oversight playtesters flagged as a bug).
+  "b-78": () => NOOP,
+
+  // b-79 Lefty Killer: +4 when the pitcher's hand carries a LEFTY tag (Sale,
+  // Skubal). Mirror of p-37 Cy Young Heat in the opposite direction.
+  "b-79": (ctx) => (handHasTag(ctx.opponentHand ?? [], "lefty") ? r({ selfValueDelta: 4 }) : NOOP),
+
+  // b-80 Off-Speed Spotter: +3 when the pitcher uses an OFF-SPEED pitch
+  // (Skubal Wipeout, Yamamoto Pinpoint, p-73 Changeup, p-82 Splitter).
+  // Same shape as b-64 Good Eye but for a different pitch family.
+  "b-80": (ctx) => (handHasTag(ctx.opponentHand ?? [], "off-speed") ? r({ selfValueDelta: 3 }) : NOOP),
+
+  // ============ PITCHING GENERAL DRAW (p-71..p-90) ============
 
   // p-71 Four-Seam Fastball: +1 if uncombined.
   "p-71": (ctx) => (!ctx.isCombined ? r({ selfValueDelta: 1 }) : NOOP),
 
-  // p-72 12-to-6 Curveball: -3 to batter's total.
-  "p-72": () => r({ opponentValueDelta: -3 }),
+  // p-72 12-to-6 Curveball: -3 to batter when this pitch combines with a
+  // DIAMOND or another BREAKING-BALL neighbor (Phase 4 nerf gated it on
+  // Diamond; Phase 5 also lets it trigger off the breaking-ball *tag* so
+  // breaker chains play nice without requiring a specific shape).
+  "p-72": (ctx) => {
+    if (!ctx.isCombined) return NOOP;
+    const neighbors = neighborsInGroup(ctx);
+    const hasBreakerTag = neighbors.some((n) => n.tags?.includes("breaking-ball"));
+    if (groupHasNeighborWithShape(ctx, "diamond") || hasBreakerTag) {
+      return r({ opponentValueDelta: -3 });
+    }
+    return NOOP;
+  },
 
   // p-73 Changeup: +3 if combined with a fastball.
   "p-73": (ctx) => {
@@ -348,8 +543,11 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     return r({ selfValueDelta: circles });
   },
 
-  // p-75 Pickoff Move: removes a runner if you win (resolve-step).
-  "p-75": () => NOOP,
+  // p-75 Pickoff Move: removes a runner if you win (resolve-step). Phase 5
+  // also adds +2 Value if the batter has any SPEEDSTER cards -- the pickoff
+  // hits hardest against runners who threaten to steal.
+  "p-75": (ctx) =>
+    handHasTag(ctx.opponentHand ?? [], "speedster") ? r({ selfValueDelta: 2 }) : NOOP,
 
   // p-76 Pitch Framing: +2 to your highest uncombined card.
   "p-76": (ctx) => {
@@ -360,7 +558,8 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     return NOOP;
   },
 
-  // p-77 Mound Visit: deck swap (resolve-step).
+  // p-77 Mound Visit: swap one card with the top of the deck. Handled at
+  // deal time in dealEffects -- auto-swaps the lowest-value pitcher card.
   "p-77": () => NOOP,
 
   // p-78 The Shift: nullify batter's star combos (resolve-step).
@@ -369,8 +568,151 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // p-79 Intentional Walk: skip at-bat -> forced single for batter.
   "p-79": () => r({ forcedOutcome: "single" }),
 
-  // p-80 Umpire's Call: pitcher wins all ties.
-  "p-80": () => r({ pitcherWinsTies: true }),
+  // p-80 Umpire's Call: pitcher wins all ties. Phase 5 also adds +2 Value
+  // when the batter brings CLUTCH cards -- the umpire's strike-three call
+  // bites hardest in late-and-close situations the batter built around.
+  "p-80": (ctx) => {
+    const result = r({ pitcherWinsTies: true });
+    if (handHasTag(ctx.opponentHand ?? [], "clutch")) {
+      result.selfValueDelta = (result.selfValueDelta ?? 0) + 2;
+    }
+    return result;
+  },
+
+  // p-81 Slider: +2 when combined with another BREAKING-BALL neighbor.
+  // Pairs with p-72 12-to-6 Curveball, p-74 Backdoor Slider, Cole's Knuckle
+  // Curve, Wheeler's Sweeping Slider, Cease's Nasty Slider/Strikeout Artist,
+  // Sale's Devastating Slider, Yamamoto's Rainbow Curve, Ohtani's Sweeper.
+  "p-81": (ctx) => {
+    if (!ctx.isCombined) return NOOP;
+    const neighbors = neighborsInGroup(ctx);
+    return neighbors.some((n) => n.tags?.includes("breaking-ball"))
+      ? r({ selfValueDelta: 2 })
+      : NOOP;
+  },
+
+  // p-82 Splitter: +3 when combined with a FASTBALL neighbor, OR +2 when
+  // combined with another OFF-SPEED neighbor. Mirrors p-73 Changeup and lets
+  // off-speed sequences (splitter -> changeup) reward themselves.
+  "p-82": (ctx) => {
+    if (!ctx.isCombined) return NOOP;
+    const neighbors = neighborsInGroup(ctx);
+    if (neighbors.some((n) => n.tags?.includes("fastball"))) return r({ selfValueDelta: 3 });
+    if (neighbors.some((n) => n.tags?.includes("off-speed"))) return r({ selfValueDelta: 2 });
+    return NOOP;
+  },
+
+  // p-83 Sinker: +1 per SQUARE shape on the batter's cards. Aggregate buff
+  // (rewards heat-stacked batter hands -- Acuña's Power/Speed Threat, b-22
+  // double squares, etc).
+  "p-83": (ctx) => {
+    const squares = ctx.opponentHand ? countShapesInHand(ctx.opponentHand, "square") : 0;
+    return squares > 0 ? r({ selfValueDelta: squares }) : NOOP;
+  },
+
+  // p-84 Cutter: +2 when uncombined. Mirror of b-25 Rookie of the Year on
+  // the pitcher side -- rewards the pitcher for not chaining (the cutter
+  // wants its own runway).
+  "p-84": (ctx) => (!ctx.isCombined ? r({ selfValueDelta: 2 }) : NOOP),
+
+  // p-85 Closer's Mentality: +4 if another CLOSER signature is in your hand
+  // (Clase, Miller). Self-tagged closer, so the bonus requires a true closer
+  // pitcher to back it up.
+  "p-85": (ctx) => (handHasOtherTag(ctx, "closer") ? r({ selfValueDelta: 4 }) : NOOP),
+
+  // p-86 Veteran Wisdom: +1 per OTHER VETERAN card in your hand. Self-tagged
+  // veteran. Most pitcher signatures are tagged veteran so the upside is
+  // reliable but capped.
+  "p-86": (ctx) => {
+    const v = countOtherHandTag(ctx, "veteran");
+    return v > 0 ? r({ selfValueDelta: v }) : NOOP;
+  },
+
+  // p-87 Rookie Heat: +3 if another ROOKIE-tagged card is in your hand
+  // (Skenes, Miller). Self-tagged rookie, mirrors b-75 with a smaller bonus
+  // because rookie pitcher signatures already start strong.
+  "p-87": (ctx) => (handHasOtherTag(ctx, "rookie") ? r({ selfValueDelta: 3 }) : NOOP),
+
+  // p-88 Starter's Stamina: +2 to the pitcher's hit-scale wall (raises the
+  // batter's required Hit Scale by 2). Doesn't move head-to-head, just makes
+  // every winning batter total resolve as a smaller hit. Stacks with p-33.
+  "p-88": () => r({ hitScaleBonus: 2, log: ["p-88 Starter's Stamina raises batter Hit Scale +2"] }),
+
+  // p-89 Lefty Specialist: +4 when the BATTER is left-handed. Reads from
+  // ScoringContext.batterHandedness like p-37 Cy Young Heat. Generalizes
+  // the lefty matchup off Skubal so any pitcher hand can punish an Ohtani /
+  // Soto / Harper / Henderson at-bat.
+  "p-89": (ctx) => (ctx.batterHandedness === "L" ? r({ selfValueDelta: 4 }) : NOOP),
+
+  // p-90 Power-Hitter Killer: hand-level "always fires when held" debuff.
+  // Same reasoning as b-78 -- the description doesn't gate on combination
+  // status, so the math lives in `applyOpponentTotalAdjustments`.
+  "p-90": () => NOOP,
+
+  // ============ PHASE 6 STATE-TRIGGER CARDS (b-91..b-96, p-91..p-94) ============
+
+  // b-91 RBI Threat: +3 Value when a runner is in scoring position (2B or 3B).
+  // Reads `bases` from the live game-state. With nobody in scoring position
+  // it's a vanilla 4-Value card -- the bonus only fires when the situation
+  // actually has a runner waiting to score.
+  "b-91": (ctx) => {
+    const bases = ctx.bases;
+    if (!bases) return NOOP;
+    const runnerOn2or3 = bases[1] || bases[2];
+    return runnerOn2or3 ? r({ selfValueDelta: 3 }) : NOOP;
+  },
+
+  // b-92 Grand Slam Threat: +6 Value with the bases loaded. Big swing card --
+  // dead weight when bases are empty, league-leading when all three bags are
+  // occupied. Forces the player to actually engineer (or wait for) a loaded
+  // situation rather than always-on power.
+  "b-92": (ctx) => {
+    const bases = ctx.bases;
+    if (!bases) return NOOP;
+    const loaded = bases[0] && bases[1] && bases[2];
+    return loaded ? r({ selfValueDelta: 6 }) : NOOP;
+  },
+
+  // b-93 Comeback Kid: +4 Value when the batter's team is losing. Reads from
+  // the live `homeScore` / `awayScore` / `half` so the comparison flips with
+  // who's at-bat. Tied counts as "not losing" -- explicit losing-only is
+  // closer to the late-inning rally flavor than a "tied or behind" buff.
+  "b-93": (ctx) => (batterTeamLead(ctx) < 0 ? r({ selfValueDelta: 4 }) : NOOP),
+
+  // b-94 Front-Runner: +2 Value when the batter's team is leading. Smaller
+  // bonus than b-93 because being ahead is already the comfortable state --
+  // this just keeps the lead momentum going.
+  "b-94": (ctx) => (batterTeamLead(ctx) > 0 ? r({ selfValueDelta: 2 }) : NOOP),
+
+  // b-95 Late Innings Hero: +4 Value in the 7th inning or later. Mirrors
+  // b-13 Leadoff Magic on the opposite axis -- early-inning Magic vs late-
+  // inning Heroics. Total innings is small (typically 9), so this isn't a
+  // free buff -- it requires the at-bat to actually land in the late game.
+  "b-95": (ctx) => ((ctx.inning ?? 0) >= 7 ? r({ selfValueDelta: 4 }) : NOOP),
+
+  // b-96 Home Cookin': +2 Value during the bottom half of the inning (the
+  // home team's at-bat). Modest but reliable in any "home" matchup.
+  "b-96": (ctx) => (ctx.half === "bottom" ? r({ selfValueDelta: 2 }) : NOOP),
+
+  // p-91 Bases Empty Heat: +3 Value with no runners on. The fastball-flavored
+  // pitcher who thrives without traffic on the bases.
+  "p-91": (ctx) => (runnersOnCount(ctx) === 0 ? r({ selfValueDelta: 3 }) : NOOP),
+
+  // p-92 Damage Control: +4 Value when 2 or more runners are on. Inverse of
+  // p-91 -- the starter who locks in only when the jam is real.
+  "p-92": (ctx) => (runnersOnCount(ctx) >= 2 ? r({ selfValueDelta: 4 }) : NOOP),
+
+  // p-93 Save Situation: +5 Value when the pitcher's team is leading by 3 or
+  // fewer runs. Exact MLB save rule. Pitcher's-team lead = -batterTeamLead.
+  "p-93": (ctx) => {
+    const pitcherLead = -batterTeamLead(ctx);
+    return pitcherLead > 0 && pitcherLead <= 3 ? r({ selfValueDelta: 5 }) : NOOP;
+  },
+
+  // p-94 Closer Mode: +3 Value in the 8th inning or later. Same shape as
+  // b-95 but pitcher-side and one inning later, since closers usually enter
+  // 8th-9th specifically.
+  "p-94": (ctx) => ((ctx.inning ?? 0) >= 8 ? r({ selfValueDelta: 3 }) : NOOP),
 };
 
 export function applyCardEffect(card: CardDefinition, ctx: EffectContext): EffectResult {
@@ -393,11 +735,35 @@ export function applyOpponentTotalAdjustments(
   const log: string[] = [];
 
   for (const card of hand) {
+    // Disabled cards (b-23 Stolen Base Threat nullifies pitcher generals)
+    // don't fire even at the hand level, so a Filthy Stuff turned off by b-23
+    // doesn't keep ticking the batter down.
+    if (card.disabled) continue;
     if (card.id === "p-60") {
-      // Filthy Stuff: -1 per opponent card played.
-      const oppCount = ctx.opponentHand?.length ?? 0;
-      opponentModifier -= oppCount;
-      log.push(`p-60 Filthy Stuff: -${oppCount}`);
+      // Filthy Stuff: -1 per SQUARE shape on the batter's cards (Phase 4
+      // nerf -- previously -1 per card flat, which was an auto-include from
+      // any pitcher hand). Squares are the fastball shape, so the flavor
+      // tightens to "filthy stuff eats fastball-shaped swings".
+      const squareCount = countShapesInHand(ctx.opponentHand ?? [], "square");
+      opponentModifier -= squareCount;
+      log.push(`p-60 Filthy Stuff: -${squareCount} (one per batter SQUARE)`);
+    }
+    if (card.id === "b-78") {
+      // Bullpen Beater: -2 to the pitcher's score when they carry STARTER.
+      // Lives at hand-level so it always fires when held, not only when in
+      // the best group. Symmetric with p-90.
+      if (handHasTag(ctx.opponentHand ?? [], "starter")) {
+        opponentModifier -= 2;
+        log.push("b-78 Bullpen Beater: -2 vs STARTER");
+      }
+    }
+    if (card.id === "p-90") {
+      // Power-Hitter Killer: -3 to the batter's score when they carry
+      // POWER-HITTER. Hand-level so it always fires when held.
+      if (handHasTag(ctx.opponentHand ?? [], "power-hitter")) {
+        opponentModifier -= 3;
+        log.push("p-90 Power-Hitter Killer: -3 vs POWER-HITTER");
+      }
     }
   }
 
@@ -442,6 +808,18 @@ function highestValueCard(cards: CardDefinition[]): CardDefinition | undefined {
   return cards.reduce((a, b) => (b.baseValue > a.baseValue ? b : a));
 }
 
+/**
+ * Highest-value UNCOMBINED card in the given hand, or undefined if every card
+ * is part of a multi-card group. Used by b-2 Judge's Chamber so the visual
+ * attribution matches the description ("opponent's highest single card").
+ */
+function highestUncombinedInHand(hand: CardDefinition[]): CardDefinition | undefined {
+  if (hand.length === 0) return undefined;
+  const groups = buildGroupsFor(hand);
+  const singles = groups.filter((g) => g.length === 1).map((g) => g[0]);
+  return highestValueCard(singles);
+}
+
 function countShapesInHand(hand: CardDefinition[], shape: ShapeType): number {
   let n = 0;
   for (const c of hand) {
@@ -470,6 +848,35 @@ function groupHasNeighborWithShape(ctx: EffectContext, shape: ShapeType): boolea
   if (left && (left.leftShape === shape || left.rightShape === shape)) return true;
   if (right && (right.leftShape === shape || right.rightShape === shape)) return true;
   return false;
+}
+
+function handHasTag(hand: CardDefinition[], tag: TagLiteral): boolean {
+  return hand.some((c) => c.tags?.includes(tag));
+}
+
+function countHandTag(hand: CardDefinition[], tag: TagLiteral): number {
+  return hand.reduce((n, c) => (c.tags?.includes(tag) ? n + 1 : n), 0);
+}
+
+/**
+ * Self-aware variants used by cards whose own tag matches what they're
+ * counting (e.g. b-74 Veteran Presence is itself tagged VETERAN). Without the
+ * exclude, the card would always self-trigger its bonus by one even when held
+ * solo, which confused playtesters watching their value tick up "for free".
+ * The natural reading of "+1 per VETERAN card in your hand" is "per OTHER
+ * VETERAN card", so we drop the source card from the count.
+ */
+function handHasOtherTag(ctx: EffectContext, tag: TagLiteral): boolean {
+  const selfId = ctx.group[ctx.indexInGroup].id;
+  return ctx.hand.some((c) => c.id !== selfId && c.tags?.includes(tag));
+}
+
+function countOtherHandTag(ctx: EffectContext, tag: TagLiteral): number {
+  const selfId = ctx.group[ctx.indexInGroup].id;
+  return ctx.hand.reduce(
+    (n, c) => (c.id !== selfId && c.tags?.includes(tag) ? n + 1 : n),
+    0,
+  );
 }
 
 function neighborsInGroup(ctx: EffectContext): CardDefinition[] {

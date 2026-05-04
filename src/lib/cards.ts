@@ -30,13 +30,65 @@ export interface CardDefinition {
   rightShape: ShapeType;
   description: string;
   color?: string;
-  // Free-form tags used by other cards' effects (e.g. ['fastball'] referenced by b-27, b-64, p-73).
-  tags?: string[];
+  /**
+   * Tags that other cards' effects key off. Free-form strings, but the live
+   * taxonomy is enumerated in `TAGS` below -- new cards should reuse those
+   * literals rather than coining one-off strings, so the synergy graph stays
+   * legible and tests can audit "every new tag has at least 2 keyers".
+   */
+  tags?: TagLiteral[];
   // Player handedness, referenced by p-37 Cy Young Heat.
   handedness?: Handedness;
   // Structured combine rules consulted by the connection engine.
   combineConstraint?: CombineConstraint;
+  /**
+   * Round-level kill switch set by hand-transforms (b-23 Stolen Base Threat
+   * uses it to silence pitcher generals). When true the scoring engine zeros
+   * the card's effect AND its base value, and the UI renders the X-mark
+   * blocked silhouette across both sides. Cards never declare this themselves
+   * -- it's only ever spliced on by `applyHandTransforms`.
+   */
+  disabled?: boolean;
 }
+
+/**
+ * Tag taxonomy (Phase 5 expansion). Each tag has at least one card that *carries*
+ * the tag and at least one card whose effect *keys off* the tag, so any new
+ * tagging shows up in real gameplay rather than as dead metadata.
+ *
+ * Pitch-shape tags describe what the card represents at the plate:
+ * - `fastball`    : straight heat (squares, raw velocity).
+ * - `breaking-ball`: curve/slider movement (diamonds).
+ * - `off-speed`   : changeup-style velocity drop (circles, splitters).
+ *
+ * Player-archetype tags describe the player on the card:
+ * - `power-hitter`: bat speed / HR threats (Judge, Vlad, Harper, Acuña).
+ * - `speedster`   : stolen-base / contact runners (De La Cruz, Witt, Acuña).
+ * - `clutch`      : late-inning specialists (Harper, Betts, Witt).
+ * - `lefty`       : left-handed batter or pitcher (Ohtani, Soto, Harper, Sale).
+ * - `veteran`     : multi-year established (Judge, Cole, Wheeler, Sale).
+ * - `rookie`      : recent debut / breakout (Skenes, De La Cruz).
+ * - `closer`      : 9th-inning bullpen role (Clase, Miller).
+ * - `starter`     : multi-inning rotation arm (most pitcher signatures).
+ */
+export const TAGS = {
+  fastball: "fastball",
+  breakingBall: "breaking-ball",
+  offSpeed: "off-speed",
+  powerHitter: "power-hitter",
+  speedster: "speedster",
+  clutch: "clutch",
+  lefty: "lefty",
+  veteran: "veteran",
+  rookie: "rookie",
+  closer: "closer",
+  starter: "starter",
+} as const;
+
+export type TagLiteral = (typeof TAGS)[keyof typeof TAGS];
+
+/** Convenience: full set of tag values, ordered. */
+export const ALL_TAGS: TagLiteral[] = Object.values(TAGS);
 
 export const ALL_CARDS: CardDefinition[] = [
   {
@@ -48,8 +100,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 8,
     "leftShape": "square",
     "rightShape": "diamond",
-    "description": "If combined on either side, add +4 to final score.",
-    "color": "bg-emerald-500"
+    "description": "If combined on either side, +4 Value.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "veteran"]
   },
   {
     "id": "b-2",
@@ -60,8 +113,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 6,
     "leftShape": "diamond",
     "rightShape": "circle",
-    "description": "Opponent's highest single card gets -2 Value.",
-    "color": "bg-emerald-500"
+    "description": "Pitcher's highest uncombined card gets -2 Value.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "veteran"]
   },
   {
     "id": "b-3",
@@ -72,8 +126,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 7,
     "leftShape": "circle",
     "rightShape": "square",
-    "description": "Can only combine with S or D. If successful, +3 Value.",
+    "description": "Can only combine with SQUARE or DIAMOND. If combined, +3 Value.",
     "color": "bg-emerald-500",
+    "tags": ["power-hitter", "veteran"],
     "combineConstraint": { "allowedShapes": ["square", "diamond"] }
   },
   {
@@ -87,6 +142,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "rightShape": "star",
     "description": "Cannot be combined. High base value.",
     "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty", "veteran"],
     "handedness": "L",
     "combineConstraint": { "noCombine": true }
   },
@@ -99,8 +155,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "diamond",
     "rightShape": "square",
-    "description": "Reverses your Left and Right shapes on all your cards this turn.",
+    "description": "Reverses your Left and Right shapes on all your cards this round.",
     "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty", "veteran"],
     "handedness": "L"
   },
   {
@@ -112,8 +169,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 6,
     "leftShape": "square",
     "rightShape": "diamond",
-    "description": "If you win the round, automatically upgrade the Hit Scale by +5 (e.g., Single becomes Double).",
+    "description": "If you win, +5 Value.",
     "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty", "veteran"],
     "handedness": "L"
   },
   {
@@ -125,8 +183,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 4,
     "leftShape": "circle",
     "rightShape": "circle",
-    "description": "Reveal the Pitcher's uncombined cards before you lock in.",
-    "color": "bg-emerald-500"
+    "description": "Reveal the Pitcher's uncombined cards before you lock in your layout.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty", "veteran"]
   },
   {
     "id": "b-8",
@@ -138,7 +197,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "diamond",
     "rightShape": "star",
     "description": "+3 Value to your highest uncombined card.",
-    "color": "bg-emerald-500"
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty", "veteran"]
   },
   {
     "id": "b-9",
@@ -149,8 +209,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "star",
     "rightShape": "square",
-    "description": "Ignores all Pitcher debuff mechanics this turn.",
-    "color": "bg-emerald-500"
+    "description": "Ignores all Pitcher debuff mechanics this round.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty", "veteran"]
   },
   {
     "id": "b-10",
@@ -162,7 +223,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "wildcard",
     "rightShape": "wildcard",
     "description": "Both sides are Wildcards and match any shape.",
-    "color": "bg-emerald-500"
+    "color": "bg-emerald-500",
+    "tags": ["speedster", "rookie"]
   },
   {
     "id": "b-11",
@@ -174,7 +236,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "square",
     "rightShape": "circle",
     "description": "If you win with this card uncombined, an automatic Single is awarded regardless of score.",
-    "color": "bg-emerald-500"
+    "color": "bg-emerald-500",
+    "tags": ["speedster", "rookie"]
   },
   {
     "id": "b-12",
@@ -185,8 +248,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 6,
     "leftShape": "circle",
     "rightShape": "square",
-    "description": "You may change the shape of one of your drawn General cards.",
-    "color": "bg-emerald-500"
+    "description": "Change the shape of one of your General cards this round.",
+    "color": "bg-emerald-500",
+    "tags": ["speedster", "rookie"]
   },
   {
     "id": "b-13",
@@ -198,7 +262,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "diamond",
     "rightShape": "diamond",
     "description": "+4 Value if this is the first at-bat of the inning.",
-    "color": "bg-emerald-500"
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran"]
   },
   {
     "id": "b-14",
@@ -209,8 +274,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "square",
     "rightShape": "star",
-    "description": "If successfully combined, add +3 to your total score.",
-    "color": "bg-emerald-500"
+    "description": "If combined with a SQUARE, +3 Value.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran"]
   },
   {
     "id": "b-15",
@@ -223,6 +289,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "rightShape": "circle",
     "description": "Left shape acts as a Wildcard.",
     "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran"],
     "combineConstraint": { "leftWildcard": true }
   },
   {
@@ -235,7 +302,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "circle",
     "rightShape": "diamond",
     "description": "If combined with a DIAMOND, +4 Value.",
-    "color": "bg-emerald-500"
+    "color": "bg-emerald-500",
+    "tags": ["speedster", "clutch"]
   },
   {
     "id": "b-17",
@@ -247,7 +315,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "diamond",
     "rightShape": "square",
     "description": "Pitcher's combined values are reduced by 2.",
-    "color": "bg-emerald-500"
+    "color": "bg-emerald-500",
+    "tags": ["speedster", "clutch"]
   },
   {
     "id": "b-18",
@@ -258,8 +327,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 7,
     "leftShape": "square",
     "rightShape": "star",
-    "description": "If you win, +3 to your score specifically for calculating the Hit Scale.",
-    "color": "bg-emerald-500"
+    "description": "If combined and you win, +3 Hit Scale.",
+    "color": "bg-emerald-500",
+    "tags": ["speedster", "clutch"]
   },
   {
     "id": "b-19",
@@ -271,7 +341,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "star",
     "rightShape": "diamond",
     "description": "+5 Value if your team has 2 Outs.",
-    "color": "bg-emerald-500"
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty", "clutch", "veteran"]
   },
   {
     "id": "b-20",
@@ -283,7 +354,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "diamond",
     "rightShape": "circle",
     "description": "If combined on both sides, base value becomes 12.",
-    "color": "bg-emerald-500"
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty", "clutch", "veteran"]
   },
   {
     "id": "b-21",
@@ -294,8 +366,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "circle",
     "rightShape": "square",
-    "description": "Destroys one of the Pitcher's uncombined general cards.",
-    "color": "bg-emerald-500"
+    "description": "Destroys one of the Pitcher's uncombined General cards.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty", "clutch", "veteran"]
   },
   {
     "id": "b-22",
@@ -307,7 +380,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "square",
     "rightShape": "square",
     "description": "If combined, flip a coin. Heads: +5 Value. Tails: +1 Value.",
-    "color": "bg-emerald-500"
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "speedster"]
   },
   {
     "id": "b-23",
@@ -319,7 +393,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "star",
     "rightShape": "circle",
     "description": "Pitcher cannot use any General cards this round.",
-    "color": "bg-emerald-500"
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "speedster"]
   },
   {
     "id": "b-24",
@@ -330,8 +405,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 7,
     "leftShape": "circle",
     "rightShape": "diamond",
-    "description": "Can only combine with C shapes.",
+    "description": "Can only combine with CIRCLE.",
     "color": "bg-emerald-500",
+    "tags": ["power-hitter", "speedster"],
     "combineConstraint": { "allowedShapes": ["circle"] }
   },
   {
@@ -344,7 +420,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "diamond",
     "rightShape": "star",
     "description": "+2 Value for every uncombined card you leave on the table.",
-    "color": "bg-emerald-500"
+    "color": "bg-emerald-500",
+    "tags": ["rookie", "lefty", "speedster"]
   },
   {
     "id": "b-26",
@@ -355,8 +432,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "star",
     "rightShape": "square",
-    "description": "If combined with another card, +4 to your total.",
-    "color": "bg-emerald-500"
+    "description": "If combined on the right, +4 Value.",
+    "color": "bg-emerald-500",
+    "tags": ["rookie", "lefty", "speedster"]
   },
   {
     "id": "b-27",
@@ -368,12 +446,13 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "square",
     "rightShape": "circle",
     "description": "+3 Value if the Pitcher's base card is a Fastball.",
-    "color": "bg-emerald-500"
+    "color": "bg-emerald-500",
+    "tags": ["rookie", "lefty", "speedster"]
   },
   {
     "id": "b-28",
     "name": "Vlad's Vengeance",
-    "player": "Vladimir Guerrero Jr",
+    "player": "Vladimir Guerrero Jr. (TOR)",
     "type": "Batting",
     "abilityType": "Signature",
     "baseValue": 8,
@@ -381,31 +460,34 @@ export const ALL_CARDS: CardDefinition[] = [
     "rightShape": "circle",
     "description": "Cannot be combined on the left side.",
     "color": "bg-emerald-500",
+    "tags": ["power-hitter", "veteran"],
     "combineConstraint": { "leftNoCombine": true }
   },
   {
     "id": "b-29",
     "name": "Home Run Derby",
-    "player": "Vladimir Guerrero Jr",
+    "player": "Vladimir Guerrero Jr. (TOR)",
     "type": "Batting",
     "abilityType": "Signature",
     "baseValue": 5,
     "leftShape": "circle",
     "rightShape": "diamond",
-    "description": "+1 Value for every CIRCLE shapes currently on the board.",
-    "color": "bg-emerald-500"
+    "description": "+1 Value for every CIRCLE on the board.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "veteran"]
   },
   {
     "id": "b-30",
     "name": "Laser Show",
-    "player": "Vladimir Guerrero Jr",
+    "player": "Vladimir Guerrero Jr. (TOR)",
     "type": "Batting",
     "abilityType": "Signature",
     "baseValue": 7,
     "leftShape": "diamond",
     "rightShape": "square",
-    "description": "Opponent's base card value is halved (rounded down).",
-    "color": "bg-emerald-500"
+    "description": "Pitcher's base card value is halved (rounded down).",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "veteran"]
   },
   {
     "id": "p-31",
@@ -416,9 +498,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 9,
     "leftShape": "square",
     "rightShape": "square",
-    "description": "High base value. Opponent cannot use Wildcards.",
+    "description": "High base value. Batter cannot use Wildcards.",
     "color": "bg-blue-500",
-    "tags": ["fastball"]
+    "tags": ["fastball", "rookie", "starter"]
   },
   {
     "id": "p-32",
@@ -431,7 +513,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "rightShape": "circle",
     "description": "Cannot be combined. If played uncombined, +2 Value.",
     "color": "bg-blue-500",
-    "tags": ["fastball"],
+    "tags": ["fastball", "rookie", "starter"],
     "combineConstraint": { "noCombine": true }
   },
   {
@@ -443,8 +525,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "circle",
     "rightShape": "star",
-    "description": "Intimidates batter: Batter's Hit Scale requirements increase by 3.",
-    "color": "bg-blue-500"
+    "description": "If the Batter wins, subtract 3 from the Batter's score.",
+    "color": "bg-blue-500",
+    "tags": ["rookie", "starter"]
   },
   {
     "id": "p-34",
@@ -456,7 +539,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "star",
     "rightShape": "diamond",
     "description": "+3 Value if combined on the right side.",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["fastball", "veteran", "starter"]
   },
   {
     "id": "p-35",
@@ -467,8 +551,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "diamond",
     "rightShape": "square",
-    "description": "Batter cannot combine any SQUARE shapes this turn.",
-    "color": "bg-blue-500"
+    "description": "Batter cannot combine SQUAREs this round.",
+    "color": "bg-blue-500",
+    "tags": ["breaking-ball", "veteran", "starter"]
   },
   {
     "id": "p-36",
@@ -480,7 +565,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "square",
     "rightShape": "circle",
     "description": "Nullifies the mechanic of the Batter's highest valued card.",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["veteran", "starter"]
   },
   {
     "id": "p-37",
@@ -493,7 +579,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "rightShape": "diamond",
     "description": "+2 Value if the Batter is using a left-handed player.",
     "color": "bg-blue-500",
-    "tags": ["fastball"]
+    "tags": ["fastball", "lefty", "starter"]
   },
   {
     "id": "p-38",
@@ -504,8 +590,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 6,
     "leftShape": "diamond",
     "rightShape": "star",
-    "description": "Subtract 3 from the Batter's final combined score.",
-    "color": "bg-blue-500"
+    "description": "If combined, subtract 3 from the Batter's score.",
+    "color": "bg-blue-500",
+    "tags": ["off-speed", "lefty", "starter"]
   },
   {
     "id": "p-39",
@@ -516,8 +603,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "star",
     "rightShape": "square",
-    "description": "Batter must discard 1 general draw card before playing.",
-    "color": "bg-blue-500"
+    "description": "Batter must discard 1 General card before playing.",
+    "color": "bg-blue-500",
+    "tags": ["lefty", "starter"]
   },
   {
     "id": "p-40",
@@ -529,7 +617,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "square",
     "rightShape": "circle",
     "description": "+1 Value for every card the Batter combines.",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["fastball", "veteran", "starter"]
   },
   {
     "id": "p-41",
@@ -541,7 +630,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "circle",
     "rightShape": "star",
     "description": "Break the Batter's combo (Choose one connection to nullify).",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["breaking-ball", "veteran", "starter"]
   },
   {
     "id": "p-42",
@@ -553,7 +643,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "star",
     "rightShape": "diamond",
     "description": "Batter's base value is capped at 6 before combos.",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["veteran", "starter"]
   },
   {
     "id": "p-43",
@@ -566,7 +657,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "rightShape": "none",
     "description": "Flat edges. Cannot be combined. Pure overpowering heat.",
     "color": "bg-blue-500",
-    "tags": ["fastball"],
+    "tags": ["fastball", "closer", "veteran"],
     "combineConstraint": { "noCombine": true }
   },
   {
@@ -579,7 +670,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "diamond",
     "rightShape": "square",
     "description": "If you win the round, it counts as 2 Outs instead of 1.",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["closer", "veteran"]
   },
   {
     "id": "p-45",
@@ -591,7 +683,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "square",
     "rightShape": "circle",
     "description": "+5 Value if it is the 9th Inning (or final inning).",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["closer", "veteran"]
   },
   {
     "id": "p-46",
@@ -604,7 +697,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "rightShape": "star",
     "description": "+2 Value if you have no combinations this round.",
     "color": "bg-blue-500",
-    "tags": ["fastball"]
+    "tags": ["fastball", "closer", "rookie"]
   },
   {
     "id": "p-47",
@@ -617,7 +710,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "rightShape": "diamond",
     "description": "Batter's DIAMOND shapes are treated as None (Flat).",
     "color": "bg-blue-500",
-    "tags": ["fastball"]
+    "tags": ["fastball", "closer", "rookie"]
   },
   {
     "id": "p-48",
@@ -629,7 +722,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "diamond",
     "rightShape": "circle",
     "description": "If Batter's total is exactly equal to yours, Pitcher wins the tie.",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["closer", "rookie"]
   },
   {
     "id": "p-49",
@@ -641,7 +735,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "square",
     "rightShape": "square",
     "description": "Reverses the Batter's Left and Right shapes.",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["lefty", "veteran", "starter"]
   },
   {
     "id": "p-50",
@@ -652,8 +747,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 6,
     "leftShape": "square",
     "rightShape": "diamond",
-    "description": "If Batter successfully combines 3 cards, subtract 6 from their total.",
-    "color": "bg-blue-500"
+    "description": "If Batter combines 3 cards, subtract 6 from their score.",
+    "color": "bg-blue-500",
+    "tags": ["breaking-ball", "lefty", "veteran", "starter"]
   },
   {
     "id": "p-51",
@@ -664,8 +760,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "diamond",
     "rightShape": "star",
-    "description": "Look at the Batter's 5 cards before you lock in your layout.",
-    "color": "bg-blue-500"
+    "description": "Reveal the Batter's hand before you lock in your layout.",
+    "color": "bg-blue-500",
+    "tags": ["lefty", "veteran", "starter"]
   },
   {
     "id": "p-52",
@@ -676,8 +773,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 8,
     "leftShape": "star",
     "rightShape": "circle",
-    "description": "If uncombined, Batter's highest card gets -3.",
-    "color": "bg-blue-500"
+    "description": "If uncombined, Batter's highest uncombined card gets -3 Value.",
+    "color": "bg-blue-500",
+    "tags": ["breaking-ball", "starter", "veteran"]
   },
   {
     "id": "p-53",
@@ -689,7 +787,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "circle",
     "rightShape": "square",
     "description": "Value becomes equal to the Batter's highest combined total.",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["off-speed", "starter", "veteran"]
   },
   {
     "id": "p-54",
@@ -700,44 +799,48 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "square",
     "rightShape": "diamond",
-    "description": "You may draw 1 extra Pitching General Card this turn.",
-    "color": "bg-blue-500"
+    "description": "Draw 1 extra Pitching General card this round.",
+    "color": "bg-blue-500",
+    "tags": ["starter", "veteran"]
   },
   {
     "id": "p-55",
     "name": "Rainbow Curve",
-    "player": "Yoshinobu Yamamoto",
+    "player": "Yoshinobu Yamamoto (LAD)",
     "type": "Pitching",
     "abilityType": "Signature",
     "baseValue": 6,
     "leftShape": "diamond",
     "rightShape": "circle",
     "description": "+3 Value if combined on the left side.",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["breaking-ball", "starter"]
   },
   {
     "id": "p-56",
     "name": "Pinpoint Control",
-    "player": "Yoshinobu Yamamoto",
+    "player": "Yoshinobu Yamamoto (LAD)",
     "type": "Pitching",
     "abilityType": "Signature",
     "baseValue": 5,
     "leftShape": "circle",
     "rightShape": "star",
-    "description": "Change one of your card's shapes to match a drawn general card.",
-    "color": "bg-blue-500"
+    "description": "Change the shape of one side of one of your cards this round.",
+    "color": "bg-blue-500",
+    "tags": ["off-speed", "starter"]
   },
   {
     "id": "p-57",
     "name": "The Japanese Ace",
-    "player": "Yoshinobu Yamamoto",
+    "player": "Yoshinobu Yamamoto (LAD)",
     "type": "Pitching",
     "abilityType": "Signature",
     "baseValue": 7,
     "leftShape": "star",
     "rightShape": "square",
     "description": "+4 Value if the Batter uses no combinations.",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["starter"]
   },
   {
     "id": "p-58",
@@ -749,7 +852,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "square",
     "rightShape": "diamond",
     "description": "If Pitcher wins by more than 5 points, next Batter starts with -2.",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["breaking-ball", "starter", "veteran"]
   },
   {
     "id": "p-59",
@@ -761,7 +865,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "diamond",
     "rightShape": "circle",
     "description": "Batter must reveal their layout before Pitcher locks in.",
-    "color": "bg-blue-500"
+    "color": "bg-blue-500",
+    "tags": ["breaking-ball", "starter", "veteran"]
   },
   {
     "id": "p-60",
@@ -772,8 +877,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "circle",
     "rightShape": "square",
-    "description": "Subtract 1 from the Batter's score for every card they play.",
-    "color": "bg-blue-500"
+    "description": "Subtract 1 from the Batter's score for every SQUARE card they play.",
+    "color": "bg-blue-500",
+    "tags": ["starter", "veteran"]
   },
   {
     "id": "b-61",
@@ -783,8 +889,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 6,
     "leftShape": "square",
     "rightShape": "diamond",
-    "description": "Can only be combined with D or S shapes.",
+    "description": "Can only combine with SQUARE or DIAMOND.",
     "color": "bg-amber-500",
+    "tags": ["power-hitter"],
     "combineConstraint": { "allowedShapes": ["square", "diamond"] }
   },
   {
@@ -795,7 +902,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 4,
     "leftShape": "circle",
     "rightShape": "circle",
-    "description": "If combined, +2 to your base card value.",
+    "description": "If combined, +2 Value.",
     "color": "bg-amber-500"
   },
   {
@@ -803,11 +910,12 @@ export const ALL_CARDS: CardDefinition[] = [
     "name": "Bunt Attempt",
     "type": "Batting",
     "abilityType": "General Draw",
-    "baseValue": 2,
+    "baseValue": 4,
     "leftShape": "star",
     "rightShape": "star",
-    "description": "If you win, guarantees exactly a Base Hit (prevents double plays).",
-    "color": "bg-amber-500"
+    "description": "+2 Value. If you win, your hit is capped at a Single (no double-play risk).",
+    "color": "bg-amber-500",
+    "tags": ["speedster"]
   },
   {
     "id": "b-64",
@@ -828,8 +936,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "square",
     "rightShape": "star",
-    "description": "Name a shape. If Pitcher uses it, +4 Value.",
-    "color": "bg-amber-500"
+    "description": "Name a shape. If Pitcher uses it, +4 Value. Otherwise +1.",
+    "color": "bg-amber-500",
+    "tags": ["clutch"]
   },
   {
     "id": "b-66",
@@ -839,7 +948,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "circle",
     "rightShape": "diamond",
-    "description": "+1 to the Hit Scale score.",
+    "description": "If combined and you win, +2 Hit Scale.",
     "color": "bg-amber-500"
   },
   {
@@ -847,10 +956,10 @@ export const ALL_CARDS: CardDefinition[] = [
     "name": "Foul Ball",
     "type": "Batting",
     "abilityType": "General Draw",
-    "baseValue": 2,
+    "baseValue": 4,
     "leftShape": "star",
     "rightShape": "circle",
-    "description": "Discard this to re-draw 2 General Batting cards.",
+    "description": "Discard this to redraw 2 Batting General cards.",
     "color": "bg-amber-500"
   },
   {
@@ -863,6 +972,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "rightShape": "diamond",
     "description": "Left shape acts as a Wildcard.",
     "color": "bg-amber-500",
+    "tags": ["speedster"],
     "combineConstraint": { "leftWildcard": true }
   },
   {
@@ -870,11 +980,12 @@ export const ALL_CARDS: CardDefinition[] = [
     "name": "Sacrifice Fly",
     "type": "Batting",
     "abilityType": "General Draw",
-    "baseValue": 1,
+    "baseValue": 3,
     "leftShape": "square",
     "rightShape": "circle",
-    "description": "If combined and you lose, a runner on 3rd still scores.",
-    "color": "bg-amber-500"
+    "description": "If you lose, a runner on 3rd still scores.",
+    "color": "bg-amber-500",
+    "tags": ["clutch"]
   },
   {
     "id": "b-70",
@@ -884,7 +995,195 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 7,
     "leftShape": "circle",
     "rightShape": "square",
-    "description": "If successfully combined on both sides, automatic Home Run.",
+    "description": "If combined on both sides and you win, +15 Hit Scale.",
+    "color": "bg-amber-500",
+    "tags": ["power-hitter"]
+  },
+  {
+    "id": "b-71",
+    "name": "Manager's Challenge",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 3,
+    "leftShape": "circle",
+    "rightShape": "star",
+    "description": "Batter wins all ties this round (overrides Pitcher tie-breakers).",
+    "color": "bg-amber-500",
+    "tags": ["clutch"]
+  },
+  {
+    "id": "b-72",
+    "name": "Walk-Off Swing",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "star",
+    "description": "+1 Value for each other CLUTCH card in your hand.",
+    "color": "bg-amber-500",
+    "tags": ["clutch"]
+  },
+  {
+    "id": "b-73",
+    "name": "Stolen Sign Read",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "circle",
+    "rightShape": "star",
+    "description": "If your hand has 2+ other SPEEDSTER cards, +3 Hit Scale.",
+    "color": "bg-amber-500",
+    "tags": ["speedster"]
+  },
+  {
+    "id": "b-74",
+    "name": "Veteran Presence",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "diamond",
+    "rightShape": "circle",
+    "description": "+1 Value for each other VETERAN card in your hand.",
+    "color": "bg-amber-500",
+    "tags": ["veteran"]
+  },
+  {
+    "id": "b-75",
+    "name": "Rookie Energy",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "+5 Value if another ROOKIE card is in your hand.",
+    "color": "bg-amber-500",
+    "tags": ["rookie"]
+  },
+  {
+    "id": "b-76",
+    "name": "Power Stance",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "If combined and another POWER-HITTER is in your hand, +3 Value.",
+    "color": "bg-amber-500",
+    "tags": ["power-hitter"]
+  },
+  {
+    "id": "b-77",
+    "name": "Closer Hunter",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "star",
+    "rightShape": "square",
+    "description": "+5 Value if the Pitcher is a CLOSER.",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-78",
+    "name": "Bullpen Beater",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "diamond",
+    "rightShape": "diamond",
+    "description": "Subtract 2 from the Pitcher's score if they are a STARTER.",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-79",
+    "name": "Lefty Killer",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "circle",
+    "rightShape": "diamond",
+    "description": "+4 Value if the Pitcher is LEFTY.",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-80",
+    "name": "Off-Speed Spotter",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "star",
+    "rightShape": "circle",
+    "description": "+3 Value if the Pitcher uses an OFF-SPEED pitch.",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-91",
+    "name": "RBI Threat",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "+3 Value with a runner in scoring position (2nd or 3rd).",
+    "color": "bg-amber-500",
+    "tags": ["clutch"]
+  },
+  {
+    "id": "b-92",
+    "name": "Grand Slam Threat",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "star",
+    "rightShape": "star",
+    "description": "+6 Value with the bases loaded.",
+    "color": "bg-amber-500",
+    "tags": ["power-hitter"]
+  },
+  {
+    "id": "b-93",
+    "name": "Comeback Kid",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "diamond",
+    "rightShape": "circle",
+    "description": "+4 Value if your team is losing.",
+    "color": "bg-amber-500",
+    "tags": ["clutch"]
+  },
+  {
+    "id": "b-94",
+    "name": "Front-Runner",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "square",
+    "rightShape": "circle",
+    "description": "+2 Value if your team is leading.",
+    "color": "bg-amber-500",
+    "tags": ["veteran"]
+  },
+  {
+    "id": "b-95",
+    "name": "Late Innings Hero",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "diamond",
+    "rightShape": "star",
+    "description": "+4 Value in the 7th inning or later.",
+    "color": "bg-amber-500",
+    "tags": ["clutch"]
+  },
+  {
+    "id": "b-96",
+    "name": "Home Cookin'",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "circle",
+    "rightShape": "circle",
+    "description": "+2 Value during the bottom of any inning (home at-bat).",
     "color": "bg-amber-500"
   },
   {
@@ -907,8 +1206,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 4,
     "leftShape": "circle",
     "rightShape": "diamond",
-    "description": "-3 to the Batter's total combined score.",
-    "color": "bg-violet-500"
+    "description": "If combined with a DIAMOND, subtract 3 from the Batter's score.",
+    "color": "bg-violet-500",
+    "tags": ["breaking-ball"]
   },
   {
     "id": "p-73",
@@ -919,7 +1219,8 @@ export const ALL_CARDS: CardDefinition[] = [
     "leftShape": "diamond",
     "rightShape": "star",
     "description": "+3 Value if combined with a Fastball card.",
-    "color": "bg-violet-500"
+    "color": "bg-violet-500",
+    "tags": ["off-speed"]
   },
   {
     "id": "p-74",
@@ -929,8 +1230,9 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "star",
     "rightShape": "circle",
-    "description": "+1 Value for every CIRCLE shape currently in play by Batter.",
-    "color": "bg-violet-500"
+    "description": "+1 Value for every CIRCLE the Batter has in play.",
+    "color": "bg-violet-500",
+    "tags": ["breaking-ball"]
   },
   {
     "id": "p-75",
@@ -962,7 +1264,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 2,
     "leftShape": "diamond",
     "rightShape": "diamond",
-    "description": "Swap one card from your hand with the top card of your deck.",
+    "description": "Swap your lowest-Value card for a fresh General Pitching card.",
     "color": "bg-violet-500"
   },
   {
@@ -998,5 +1300,172 @@ export const ALL_CARDS: CardDefinition[] = [
     "rightShape": "star",
     "description": "Pitcher wins all ties this round.",
     "color": "bg-violet-500"
+  },
+  {
+    "id": "p-81",
+    "name": "Slider",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "diamond",
+    "rightShape": "circle",
+    "description": "+2 Value if combined with another BREAKING-BALL.",
+    "color": "bg-violet-500",
+    "tags": ["breaking-ball"]
+  },
+  {
+    "id": "p-82",
+    "name": "Splitter",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "circle",
+    "rightShape": "diamond",
+    "description": "+3 Value if combined with a FASTBALL.",
+    "color": "bg-violet-500",
+    "tags": ["off-speed"]
+  },
+  {
+    "id": "p-83",
+    "name": "Sinker",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "square",
+    "rightShape": "square",
+    "description": "+1 Value for each SQUARE the Batter has in play.",
+    "color": "bg-violet-500",
+    "tags": ["fastball"]
+  },
+  {
+    "id": "p-84",
+    "name": "Cutter",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "+2 Value if uncombined.",
+    "color": "bg-violet-500",
+    "tags": ["fastball"]
+  },
+  {
+    "id": "p-85",
+    "name": "Closer's Mentality",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "circle",
+    "rightShape": "square",
+    "description": "+4 Value if another CLOSER card is in your hand.",
+    "color": "bg-violet-500",
+    "tags": ["closer"]
+  },
+  {
+    "id": "p-86",
+    "name": "Veteran Wisdom",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "diamond",
+    "rightShape": "star",
+    "description": "+1 Value for each other VETERAN card in your hand.",
+    "color": "bg-violet-500",
+    "tags": ["veteran"]
+  },
+  {
+    "id": "p-87",
+    "name": "Rookie Heat",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "star",
+    "rightShape": "square",
+    "description": "+3 Value if another ROOKIE card is in your hand.",
+    "color": "bg-violet-500",
+    "tags": ["rookie"]
+  },
+  {
+    "id": "p-88",
+    "name": "Starter's Stamina",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "circle",
+    "rightShape": "circle",
+    "description": "Raises the Batter's Hit Scale requirements by 2.",
+    "color": "bg-violet-500",
+    "tags": ["starter"]
+  },
+  {
+    "id": "p-89",
+    "name": "Lefty Specialist",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "diamond",
+    "rightShape": "star",
+    "description": "+4 Value if the Batter is LEFTY.",
+    "color": "bg-violet-500",
+    "tags": ["lefty"]
+  },
+  {
+    "id": "p-90",
+    "name": "Power-Hitter Killer",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "circle",
+    "description": "Subtract 3 from the Batter's score if they have a POWER-HITTER.",
+    "color": "bg-violet-500"
+  },
+  {
+    "id": "p-91",
+    "name": "Bases Empty Heat",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "star",
+    "description": "+3 Value with no runners on base.",
+    "color": "bg-violet-500",
+    "tags": ["fastball"]
+  },
+  {
+    "id": "p-92",
+    "name": "Damage Control",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "diamond",
+    "rightShape": "circle",
+    "description": "+4 Value with 2 or more runners on base.",
+    "color": "bg-violet-500",
+    "tags": ["starter"]
+  },
+  {
+    "id": "p-93",
+    "name": "Save Situation",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "circle",
+    "rightShape": "star",
+    "description": "+5 Value if your team is leading by 3 runs or fewer.",
+    "color": "bg-violet-500",
+    "tags": ["closer"]
+  },
+  {
+    "id": "p-94",
+    "name": "Closer Mode",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "+3 Value in the 8th inning or later.",
+    "color": "bg-violet-500",
+    "tags": ["closer"]
   }
 ];

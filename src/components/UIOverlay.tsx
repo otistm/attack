@@ -1,12 +1,30 @@
 import { CardGameOverlay } from './CardGameOverlay';
 import { CollectionScreen } from './CollectionScreen';
-import { useState } from 'react';
-import { AnimatePresence } from 'motion/react';
+import { PlayerChoiceModal } from './PlayerChoiceModal';
+import { InfoRevealOverlay } from './InfoRevealOverlay';
+import { useEffect, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import { Layers, RotateCcw } from 'lucide-react';
 import { useGameStore } from '../lib/gameStore';
 
+const SPLASH_DURATION_MS = 3000;
+
 export function UIOverlay() {
   const [showCollection, setShowCollection] = useState(false);
+  // Splash screen on first load. `splashVisible` drives the AnimatePresence
+  // exit; `cardsReady` mounts the game overlay at the SAME moment the splash
+  // starts exiting so the two animations cross-fade rather than stutter-cut.
+  const [splashVisible, setSplashVisible] = useState(true);
+  const [cardsReady, setCardsReady] = useState(false);
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setSplashVisible(false);
+      setCardsReady(true);
+    }, SPLASH_DURATION_MS);
+    return () => clearTimeout(t);
+  }, []);
+
   const inning = useGameStore((s) => s.inning);
   const half = useGameStore((s) => s.half);
   const homeScore = useGameStore((s) => s.homeScore);
@@ -21,12 +39,14 @@ export function UIOverlay() {
   const phaseLabel: Record<typeof phase, string> = {
     selecting: 'Card Selection',
     resolving: 'Resolving',
+    revealing: 'Revealing',
     'between-at-bats': 'Result',
     'game-over': 'Game Over',
   };
   const phaseTone: Record<typeof phase, string> = {
     selecting: 'text-amber-400',
     resolving: 'text-sky-400',
+    revealing: 'text-fuchsia-400',
     'between-at-bats': 'text-emerald-400',
     'game-over': 'text-rose-400',
   };
@@ -85,12 +105,173 @@ export function UIOverlay() {
         </div>
       </header>
 
-      <CardGameOverlay />
+      {cardsReady && (
+        <motion.div
+          key="game-overlay"
+          className="absolute inset-0 pointer-events-none"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ duration: 0.3, ease: 'easeOut' }}
+        >
+          <CardGameOverlay />
+        </motion.div>
+      )}
+
+      <AnimatePresence>
+        {splashVisible && <IntroSplash key="intro-splash" />}
+      </AnimatePresence>
 
       <AnimatePresence>
         {showCollection && <CollectionScreen key="collection-screen" onClose={() => setShowCollection(false)} />}
       </AnimatePresence>
+
+      {cardsReady && <PlayerChoiceModal />}
+      {cardsReady && <InfoRevealOverlay />}
+      {cardsReady && <InningTransitionBanner />}
     </div>
+  );
+}
+
+/**
+ * Transient banner that briefly takes over the screen whenever the half-
+ * inning changes (top -> bottom, or bottom -> top of the next inning).
+ * Driven by watching `inning` + `half` for changes via a ref-based "previous
+ * value" diff, so the banner fires once per transition without requiring a
+ * dedicated event in the store. Skips the very first mount so the player
+ * doesn't see "TOP OF 1ST" pop in over the splash exit.
+ */
+function InningTransitionBanner() {
+  const inning = useGameStore((s) => s.inning);
+  const half = useGameStore((s) => s.half);
+  const phase = useGameStore((s) => s.phase);
+  const lastSig = useRef<string | null>(null);
+  const [message, setMessage] = useState<{
+    title: string;
+    subtitle: string;
+    key: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const sig = `${inning}-${half}`;
+    if (lastSig.current === null) {
+      lastSig.current = sig;
+      return;
+    }
+    if (lastSig.current === sig) return;
+    lastSig.current = sig;
+    if (phase === 'game-over') return;
+    const ordinal = ordinalSuffix(inning);
+    const title = `${half === 'top' ? 'TOP' : 'BOTTOM'} OF THE ${ordinal}`;
+    setMessage({ title, subtitle: 'Side Retired', key: Date.now() });
+    const t = setTimeout(() => setMessage(null), 1900);
+    return () => clearTimeout(t);
+  }, [inning, half, phase]);
+
+  return (
+    <AnimatePresence>
+      {message && (
+        <motion.div
+          key={message.key}
+          className="absolute inset-0 z-30 flex items-center justify-center pointer-events-none"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1, transition: { duration: 0.18 } }}
+          exit={{ opacity: 0, transition: { duration: 0.35, ease: 'easeOut' } }}
+        >
+          <motion.div
+            className="absolute inset-x-0 h-40 bg-gradient-to-r from-amber-600/0 via-amber-600/35 to-amber-600/0"
+            initial={{ scaleX: 0.6, opacity: 0 }}
+            animate={{
+              scaleX: 1,
+              opacity: 1,
+              transition: { type: 'spring', stiffness: 200, damping: 24 },
+            }}
+            exit={{ scaleX: 1.1, opacity: 0, transition: { duration: 0.35 } }}
+            style={{ transformOrigin: 'center' }}
+          />
+          <motion.div
+            className="relative flex flex-col items-center gap-1 px-12 py-5 bg-slate-950/85 border-y border-amber-500/40"
+            initial={{ y: -16, opacity: 0 }}
+            animate={{
+              y: 0,
+              opacity: 1,
+              transition: { type: 'spring', stiffness: 280, damping: 22 },
+            }}
+            exit={{ y: -16, opacity: 0, transition: { duration: 0.3 } }}
+          >
+            <span className="text-[10px] font-black uppercase tracking-[0.5em] text-amber-300/80">
+              {message.subtitle}
+            </span>
+            <h2 className="text-3xl sm:text-5xl font-black uppercase tracking-tight text-white drop-shadow-[0_2px_12px_rgba(0,0,0,0.6)]">
+              {message.title}
+            </h2>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+function ordinalSuffix(n: number): string {
+  const s = ['TH', 'ST', 'ND', 'RD'];
+  const v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+function IntroSplash() {
+  return (
+    <motion.div
+      className="absolute inset-0 z-40 flex items-center justify-center pointer-events-none"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1, transition: { duration: 0.45, ease: 'easeOut' } }}
+      exit={{ opacity: 0, transition: { duration: 0.5, ease: 'easeInOut' } }}
+    >
+      {/* Soft radial backdrop so the headline reads on the busy stadium scene */}
+      <motion.div
+        className="absolute inset-0"
+        style={{
+          background:
+            'radial-gradient(ellipse at center, rgba(15,23,42,0.85) 0%, rgba(15,23,42,0.55) 35%, rgba(15,23,42,0) 75%)',
+        }}
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1, transition: { duration: 0.4 } }}
+        exit={{ opacity: 0, transition: { duration: 0.45, ease: 'easeInOut' } }}
+      />
+
+      <motion.div
+        className="relative flex flex-col items-center gap-3 px-10"
+        initial={{ scale: 0.6, y: 20, opacity: 0 }}
+        animate={{
+          scale: 1,
+          y: 0,
+          opacity: 1,
+          transition: { type: 'spring', stiffness: 220, damping: 18 },
+        }}
+        exit={{
+          scale: 1.18,
+          y: -22,
+          opacity: 0,
+          transition: { duration: 0.45, ease: [0.4, 0, 0.6, 1] },
+        }}
+      >
+        <span className="text-[10px] sm:text-xs font-black uppercase tracking-[0.6em] text-amber-400/80">
+          Welcome to
+        </span>
+        <h1 className="text-5xl sm:text-7xl md:text-8xl font-black uppercase tracking-tight text-white text-center leading-none drop-shadow-[0_6px_24px_rgba(0,0,0,0.65)]">
+          Let&apos;s Play{' '}
+          <span className="bg-gradient-to-r from-amber-300 via-amber-400 to-orange-500 bg-clip-text text-transparent">
+            Dugout!
+          </span>
+        </h1>
+        <motion.span
+          className="mt-1 text-[11px] sm:text-xs font-bold uppercase tracking-[0.4em] text-slate-300/80"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1, transition: { delay: 0.35, duration: 0.4 } }}
+          exit={{ opacity: 0, transition: { duration: 0.25, ease: 'easeOut' } }}
+        >
+          Step up to the plate
+        </motion.span>
+      </motion.div>
+    </motion.div>
   );
 }
 
@@ -105,21 +286,56 @@ interface MatchupProps {
 function Matchup({ batterName, batterTeam, pitcherName, pitcherTeam, battingTeam }: MatchupProps) {
   const batterColor = battingTeam === 'HOME' ? 'text-blue-300' : 'text-rose-300';
   const pitcherColor = battingTeam === 'HOME' ? 'text-rose-300' : 'text-blue-300';
+  // 2-way matchups (Ohtani vs Ohtani): the two seats happen to be the same
+  // real player. Tag both cards so the player understands the pairing isn't
+  // a bug -- and so the immersive read ("Shohei vs Shohei") gets a wink.
+  const isTwoWay = batterName === pitcherName && batterTeam === pitcherTeam;
   return (
     <div className="flex items-stretch gap-3 text-[11px] uppercase tracking-wide">
-      <PlayerCard role="At Bat" name={batterName} team={batterTeam} color={batterColor} />
+      <PlayerCard
+        role="At Bat"
+        name={batterName}
+        team={batterTeam}
+        color={batterColor}
+        twoWay={isTwoWay}
+      />
       <div className="flex items-center text-slate-500 font-black text-xs">VS</div>
-      <PlayerCard role="Pitching" name={pitcherName} team={pitcherTeam} color={pitcherColor} />
+      <PlayerCard
+        role="Pitching"
+        name={pitcherName}
+        team={pitcherTeam}
+        color={pitcherColor}
+        twoWay={isTwoWay}
+      />
     </div>
   );
 }
 
-function PlayerCard({ role, name, team, color }: { role: string; name: string; team: string; color: string }) {
+function PlayerCard({
+  role,
+  name,
+  team,
+  color,
+  twoWay = false,
+}: {
+  role: string;
+  name: string;
+  team: string;
+  color: string;
+  twoWay?: boolean;
+}) {
   return (
-    <div className="flex flex-col justify-center bg-slate-800/70 border border-slate-700/80 rounded-md px-3 py-1.5 min-w-[140px]">
+    <div className="relative flex flex-col justify-center bg-slate-800/70 border border-slate-700/80 rounded-md px-3 py-1.5 min-w-[140px]">
       <div className="text-[8px] font-bold text-slate-500 uppercase tracking-widest leading-none">{role}</div>
       <div className={`font-black ${color} text-[13px] leading-tight truncate`}>{name}</div>
-      <div className="text-[9px] text-slate-400 font-bold tracking-widest leading-tight">{team}</div>
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[9px] text-slate-400 font-bold tracking-widest leading-tight">{team}</span>
+        {twoWay && (
+          <span className="text-[8px] font-black text-amber-300 bg-amber-500/20 border border-amber-400/40 rounded px-1.5 py-0.5 tracking-widest leading-none">
+            2-WAY
+          </span>
+        )}
+      </div>
     </div>
   );
 }
