@@ -1,5 +1,6 @@
 import { CardDefinition, CombineConstraint } from "./cards";
 import { ShapeType } from "../components/cardShapes";
+import { canConnect } from "./connect";
 
 /**
  * Pre-scoring pass that lets cards mutate hands BEFORE the connection engine
@@ -77,6 +78,63 @@ const nullifyGenerals = (c: CardDefinition): CardDefinition => {
 };
 
 /**
+ * b-119 Quick Bat: shave -2 baseValue off every General card in the pitcher
+ * hand. Floors at 0 so a 1-Value general can't go negative -- the description
+ * says "-2 Value" not "subtract 2 Value", and a negative card would land us
+ * in undefined territory at the score pill. Disabled cards (already nuked by
+ * b-23 etc.) are left alone since their baseValue is locked at 0.
+ */
+const debuffGenerals = (c: CardDefinition): CardDefinition => {
+  if (c.abilityType !== "General Draw") return c;
+  if (c.disabled) return c;
+  return {
+    ...c,
+    baseValue: Math.max(0, c.baseValue - 2),
+  };
+};
+
+/**
+ * b-125 Green Monster: every DIAMOND slot on the batter's hand turns into a
+ * wildcard for the round. Both shape-based and `*Wildcard` constraint
+ * placements need to apply -- we rewrite the shape and clear any conflicting
+ * constraints so the connect engine treats the slot as truly free.
+ */
+const diamondToWildcard = (c: CardDefinition): CardDefinition => {
+  const leftDiamond = c.leftShape === "diamond";
+  const rightDiamond = c.rightShape === "diamond";
+  if (!leftDiamond && !rightDiamond) return c;
+  return {
+    ...c,
+    leftShape: leftDiamond ? "wildcard" : c.leftShape,
+    rightShape: rightDiamond ? "wildcard" : c.rightShape,
+  };
+};
+
+/**
+ * b-133 Jazz Hands: if b-133 has no mechanically-connectable neighbor in the
+ * current batter arrangement, swap its own shapes to dual-wildcard so it can
+ * still chain. Conditional pre-pass -- when b-133 is already adjacent to a
+ * compatible neighbor it stays as star/diamond and the player gets no extra
+ * help. The check runs BEFORE any other transform mutates the hand so the
+ * "uncombined" reading is anchored to the player's deliberate arrangement.
+ */
+const jazzHandsConditional = (cards: CardDefinition[]): CardDefinition[] => {
+  const idx = cards.findIndex((c) => c.id === "b-133");
+  if (idx === -1) return cards;
+  const b133 = cards[idx];
+  const left = idx > 0 ? cards[idx - 1] : null;
+  const right = idx < cards.length - 1 ? cards[idx + 1] : null;
+  const leftConnects = left ? canConnect(left, b133) : false;
+  const rightConnects = right ? canConnect(b133, right) : false;
+  if (leftConnects || rightConnects) return cards;
+  return cards.map((c, i) =>
+    i === idx
+      ? { ...c, leftShape: "wildcard" as ShapeType, rightShape: "wildcard" as ShapeType }
+      : c,
+  );
+};
+
+/**
  * Destroy the highest-value general in the given hand: zero the value, flag
  * the card as `disabled` (so the engine NOOPs its effect and the UI renders
  * the blocked silhouette) and disable combine. Used by b-21 The Pandemonium.
@@ -147,6 +205,17 @@ export const HAND_TRANSFORMS: Record<string, TransformFn> = {
   "p-78": () => ({
     opponentHandPatch: (cards) => cards.map(replaceShape("star", "none")),
   }),
+
+  // b-119 Quick Bat: -2 to every pitcher General card's value.
+  "b-119": () => ({ opponentHandPatch: (cards) => cards.map(debuffGenerals) }),
+
+  // b-125 Green Monster: own DIAMONDs become Wildcards for the round.
+  "b-125": () => ({ ownHandPatch: (cards) => cards.map(diamondToWildcard) }),
+
+  // b-133 Jazz Hands: conditional dual-Wildcard when b-133 is uncombined.
+  // The conditional runs over the WHOLE hand at once (it needs neighbor
+  // context) rather than card-by-card, hence the direct array transform.
+  "b-133": () => ({ ownHandPatch: jazzHandsConditional }),
 };
 
 export interface TransformResult {

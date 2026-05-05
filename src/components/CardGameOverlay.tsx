@@ -1,10 +1,10 @@
 import { useMemo, useState, useCallback, useEffect, useRef } from 'react';
 import { Reorder, motion, AnimatePresence } from 'motion/react';
 import { CardDefinition } from '../lib/cards';
-import { canConnect, shapeModeForSide } from '../lib/connect';
-import { useGameStore, ResolutionBeat, Phase } from '../lib/gameStore';
+import { canConnect, shapeModeForSide, seamKey } from '../lib/connect';
+import { useGameStore, getUserSide, ResolutionBeat, Phase } from '../lib/gameStore';
 import { HitOutcome } from '../lib/scoring';
-import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_PITCH_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
+import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
 
 /**
  * Reveal-sequence orchestrator timing. Tuned so a typical 3-5 beat hand
@@ -93,21 +93,21 @@ export const ShapeHalf = ({
     ? { border: '2.5px dashed #0f172a' /* slate-900 */ }
     : { border: '1.5px solid rgba(0,0,0,0.1)' };
 
-  // Phase 6 (M7): hover-tooltip the shape with its pitch-type re-flavor so
-  // descriptions like "+2 if combined with a SQUARE neighbor" can be parsed
-  // as "Fastball" without consulting a separate legend. Skipped for blocked /
-  // wildcard sides because the title would lie about the underlying meaning.
-  const pitchTitle =
+  // Hover-tooltip the shape with its plain capitalized name so descriptions
+  // like "+2 if combined with a SQUARE neighbor" stay anchored in the same
+  // vocabulary the player sees on the card. Skipped for blocked / wildcard
+  // sides because the title would lie about the underlying meaning.
+  const shapeTitle =
     !isBlocked && visualShape !== 'wildcard' && visualShape !== 'none'
-      ? `${visualShape.toUpperCase()} - ${SHAPE_PITCH_LABEL[visualShape as ShapeType] ?? ''}`
+      ? SHAPE_LABEL[visualShape as ShapeType]
       : undefined;
 
   return (
     <>
       <div
         className="absolute top-1/2 -translate-y-1/2 overflow-hidden z-20 flex items-center"
-        title={pitchTitle}
-        aria-label={pitchTitle}
+        title={shapeTitle}
+        aria-label={shapeTitle}
         style={{
           width: `${wrapperW}px`,
           height: `${wrapperH}px`,
@@ -519,6 +519,11 @@ export const CardGameOverlay = () => {
   const previewMatchupFn = useGameStore((s) => s.previewMatchup);
   const revealScript = useGameStore((s) => s.revealScript);
   const completeReveal = useGameStore((s) => s.completeReveal);
+  // Which seat is the human in this half? When pitching, the bottom strip
+  // becomes the pitcher hand (drag, lock-in, status chips on the user's
+  // side) and the top strip becomes the AI batter (face-down -> revealed).
+  const userSide = useGameStore(getUserSide);
+  const userIsBatting = userSide === 'Batting';
   // atBatId scopes per-card keys to a single at-bat so general-pool cards
   // shared between consecutive batters/pitchers remount cleanly (the pitcher
   // flip-back, in particular, depends on this).
@@ -530,6 +535,43 @@ export const CardGameOverlay = () => {
   const pitcherTransformsImpactingBatter = useGameStore(
     (s) => s.pitcherTransformsImpactingBatter,
   );
+
+  // Extra state slices that ALSO move the matchup pill but historically were
+  // missing from the `matchup` memo's dep list. Including them ensures the
+  // BATTER pill refreshes the moment any of these change. Without them the
+  // pill silently went stale between phases:
+  //  - resolvedChoices: b-65 Guess Pitch bonus, b-12 / p-56 modify-shape
+  //    target, etc. -- player picks "Fastball" from the modal but the pill
+  //    didn't include the +1/+4 until lockIn re-ran scoring (the playtest
+  //    "score jumps from X to X+1 between preview and final" surprise).
+  //  - coinFlips: b-22 Power/Speed Threat resolves at lockIn currently, but
+  //    any future card that flips pre-lock would land in here.
+  //  - pendingDebuffs: cross-at-bat carryover from previous innings.
+  //  - bases / half / homeScore / awayScore / inning: live game-state
+  //    triggers (b-91 RBI Threat, Home Cookin', late-inning bonuses, etc.)
+  //    feed into per-card scoring through the ScoringContext.
+  const resolvedChoices = useGameStore((s) => s.resolvedChoices);
+  const coinFlips = useGameStore((s) => s.coinFlips);
+  const pendingDebuffs = useGameStore((s) => s.pendingDebuffs);
+  const bases = useGameStore((s) => s.bases);
+  const half = useGameStore((s) => s.half);
+  const homeScore = useGameStore((s) => s.homeScore);
+  const awayScore = useGameStore((s) => s.awayScore);
+  const inning = useGameStore((s) => s.inning);
+
+  // User-affirmed connection seams + the action that updates them. The
+  // strip reads `affirmedSeams` to decide which adjacent pairs render as
+  // chained, and dispatches `affirmDraggedCard` on drag-end so the seam set
+  // refreshes against the new layout.
+  const affirmedSeams = useGameStore((s) => s.affirmedSeams);
+  const affirmDraggedCard = useGameStore((s) => s.affirmDraggedCard);
+  // Pending player-choice prompts (e.g. b-12 Switch Hitter). The user has
+  // to actively trigger these via the per-card "USE" pill -- the modal
+  // doesn't auto-open anymore. We only forward user-side prompts to the
+  // strip; AI-side prompts stay invisible and silently default to declined.
+  const pendingChoices = useGameStore((s) => s.pendingChoices);
+  const activeChoiceCardId = useGameStore((s) => s.activeChoiceCardId);
+  const triggerChoice = useGameStore((s) => s.triggerChoice);
   // Per-card modifier snapshots captured at lock-in. Used in lieu of the live
   // preview during the reveal + result phases so state-trigger cards keep the
   // numbers they had when the swing was committed (otherwise b-91 RBI Threat
@@ -539,14 +581,44 @@ export const CardGameOverlay = () => {
   const lastBatterCardModifiers = useGameStore((s) => s.lastBatterCardModifiers);
   const lastPitcherCardModifiers = useGameStore((s) => s.lastPitcherCardModifiers);
 
-  // Live previews (re-run whenever hand reorders or phase changes). The
-  // per-card scoring results still feed the card modifier display; the pill
-  // numbers come from previewMatchup so they include opponent debuffs, the
-  // hit-scale ladder bonus, b-9 immunity, and cross-at-bat debuffs without
-  // surfacing a separate "Pitcher debuff" badge.
-  const batterPreview = useMemo(() => scoreBatterFn(), [scoreBatterFn, batterHand, pitcherHand, phase]); // eslint-disable-line react-hooks/exhaustive-deps
-  const pitcherPreview = useMemo(() => scorePitcherFn(), [scorePitcherFn, batterHand, pitcherHand, phase]); // eslint-disable-line react-hooks/exhaustive-deps
-  const matchup = useMemo(() => previewMatchupFn(), [previewMatchupFn, batterHand, pitcherHand, phase]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Live preview. Single source of truth: `previewMatchup` runs both sides
+  // through the same scoring pass that feeds the pill (including p-41's
+  // Sweeping Slider seam-break on the working batter hand), then exposes
+  // both ScoringResults plus the per-component breakdown. The strip's
+  // per-card values and the BATTER pill all read from this one matchup --
+  // they can never desync from each other or from what locks in.
+  //
+  // CRITICAL: the memo dep list MUST include every slice that
+  // `previewMatchup` reads from the store. An incomplete dep list silently
+  // froze the pill on stale values until lockIn re-ran the engine -- the
+  // playtest "pill jumped +1 between preview and final" symptom that
+  // looked like an engine discrepancy was actually this stale memo (b-65
+  // Guess Pitch's +1/+4 bonus depended on `resolvedChoices`, which wasn't
+  // in deps).
+  const matchup = useMemo(
+    () => previewMatchupFn(),
+    [
+      previewMatchupFn,
+      batterHand,
+      pitcherHand,
+      phase,
+      resolvedChoices,
+      coinFlips,
+      pendingDebuffs,
+      bases,
+      half,
+      homeScore,
+      awayScore,
+      inning,
+      affirmedSeams,
+    ],
+  );
+  const batterPreview = matchup.batterScoringResult;
+  const pitcherPreview = matchup.pitcherScoringResult;
+  // Reference scoreBatterFn / scorePitcherFn so swap-in alternatives during
+  // tests still get the latest store action; no longer called per-render.
+  void scoreBatterFn;
+  void scorePitcherFn;
 
   const isSelecting = phase === 'selecting';
   const isRevealing = phase === 'revealing';
@@ -614,6 +686,40 @@ export const CardGameOverlay = () => {
   const _ignoredHitZoom = phase === 'between-at-bats' && lastOutcome !== null && lastOutcome !== 'out';
   void _ignoredHitZoom;
 
+  // Map per-side data into "user vs AI" lanes so the bottom strip is
+  // always the user's hand and the top strip is always the AI's. This
+  // keeps the rest of the JSX agnostic to which role the user is in.
+  const userHand = userIsBatting ? batterHand : pitcherHand;
+  const aiHand = userIsBatting ? pitcherHand : batterHand;
+  const userModifiers = userIsBatting ? batterModifiersForStrip : pitcherModifiersForStrip;
+  const aiModifiers = userIsBatting ? pitcherModifiersForStrip : batterModifiersForStrip;
+  const reorderUser = userIsBatting ? reorderBatter : reorderPitcher;
+  const userValueOverrides = userIsBatting ? reveal.batterValueOverrides : reveal.pitcherValueOverrides;
+  const aiValueOverrides = userIsBatting ? reveal.pitcherValueOverrides : reveal.batterValueOverrides;
+  const userHighlights = userIsBatting ? reveal.batterHighlights : reveal.pitcherHighlights;
+  const aiHighlights = userIsBatting ? reveal.pitcherHighlights : reveal.batterHighlights;
+  const userBanner = userIsBatting ? reveal.batterBanner : reveal.pitcherBanner;
+  const aiBanner = userIsBatting ? reveal.pitcherBanner : reveal.batterBanner;
+  const userPillValue = userIsBatting ? batterDisplayValue : pitcherDisplayValue;
+  const aiPillValue = userIsBatting ? pitcherDisplayValue : batterDisplayValue;
+  const userLabel = userIsBatting ? 'Batter' : 'Pitcher';
+  const aiLabel = userIsBatting ? 'Pitcher' : 'Batter';
+  const userTone = userIsBatting ? 'batter' : 'pitcher';
+  const aiTone = userIsBatting ? 'pitcher' : 'batter';
+
+  // Set of cardIds in the user's hand that have an unresolved player-choice
+  // prompt. The HandStrip uses this to render the "USE" pill on the
+  // matching card. We filter by `userSide` so an AI-side prompt that
+  // happens to share an id (in theory impossible since hands are
+  // disjoint) can never light up the user's strip.
+  const userPendingChoiceIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const c of pendingChoices) {
+      if (c.side === userSide) ids.add(c.cardId);
+    }
+    return ids;
+  }, [pendingChoices, userSide]);
+
   return (
     <>
       {/* Big dramatic outcome banner -- pops over the field for a beat after
@@ -624,7 +730,9 @@ export const CardGameOverlay = () => {
           ~1.6s so the player can immediately read the matchup and tap Next. */}
       <HitResultBanner outcome={lastOutcome} phase={phase} atBatId={atBatId} />
 
-      {/* Pitcher hand - top of screen */}
+      {/* AI hand - top of screen. Face-down during selection regardless of
+          whether the AI is playing batter or pitcher this half (same
+          fog-of-war either direction). */}
       <motion.div
         className="absolute inset-x-0 top-24 pointer-events-none flex flex-col items-center pt-4 pb-3 bg-gradient-to-b from-slate-900/70 via-slate-900/30 to-transparent"
         initial={false}
@@ -633,70 +741,114 @@ export const CardGameOverlay = () => {
       >
         <div className="pointer-events-auto flex flex-col items-center gap-2">
           <ScorePill
-            label="Pitcher"
-            tone="pitcher"
-            value={isSelecting ? null : pitcherDisplayValue}
+            label={aiLabel}
+            tone={aiTone}
+            value={isSelecting ? null : aiPillValue}
             outcomeStyle={outcomeBadgeStyle}
             compact
-            banner={reveal.pitcherBanner}
+            banner={aiBanner}
           />
           <FlipPitcherStrip
-            hand={pitcherHand}
-            modifiers={pitcherModifiersForStrip}
+            hand={aiHand}
+            modifiers={aiModifiers}
             revealed={!isSelecting}
             atBatId={atBatId}
             compact
-            valueOverrides={reveal.pitcherValueOverrides}
-            highlightTones={reveal.pitcherHighlights}
+            valueOverrides={aiValueOverrides}
+            highlightTones={aiHighlights}
           />
         </div>
       </motion.div>
 
-      {/* Batter hand - bottom of screen */}
+      {/* User hand - bottom of screen. Always interactive: drag, connect,
+          lock-in. Whether the user is the batter or the pitcher this half
+          is decided by `userTeam` + `half` via getUserSide. */}
       <div className="absolute inset-x-0 bottom-0 pointer-events-none flex flex-col items-center justify-end pb-8 bg-gradient-to-t from-slate-900/80 via-slate-900/40 to-transparent pt-32 h-80">
 
         <div className="pointer-events-auto flex flex-col items-center gap-4">
           <ScorePill
-            label="Batter"
-            tone="batter"
-            value={batterDisplayValue}
+            label={userLabel}
+            tone={userTone}
+            value={userPillValue}
             outcome={isResolved ? lastResultMessage : undefined}
             outcomeStyle={outcomeBadgeStyle}
-            banner={reveal.batterBanner}
+            atBatId={atBatId}
+            banner={userBanner}
+            // Hit Scale hint is a batter-only concept ("if you win, +N to
+            // your hit"). Only show it when the user IS the batter.
             hitScaleHint={
-              isSelecting && matchup.batterWinning && matchup.batterHitScaleBonus !== 0
+              userIsBatting && isSelecting && matchup.batterWinning && matchup.batterHitScaleBonus !== 0
                 ? matchup.batterHitScaleBonus
                 : null
             }
-            subtitle={
-              isSelecting && batterPreview.groups.length > 1
-                ? `Best chain: ${batterPreview.bestGroup.length} of ${batterHand.length} cards`
-                : null
-            }
           />
+
+          {/* Math breakdown: explains why the pill differs from the visible
+              chain sum when an opponent debuff (p-38 / p-50 / p-60 / p-72 /
+              p-90 etc.), a cross-at-bat carryover, or a b-65 guess bonus is
+              moving the pill. Hides itself entirely when the chain sum IS
+              the pill so we don't pollute the UI in vanilla matchups.
+              Batter-side concept: skip it when the user is pitching --
+              showing the AI batter's chain breakdown during selection
+              would leak their face-down hand. */}
+          {userIsBatting && isSelecting && (
+            <MatchupMath
+              chainSum={matchup.batterChainSum}
+              pitcherDelta={matchup.batterPitcherDelta}
+              carryoverDelta={matchup.batterCarryoverDelta}
+              guessDelta={matchup.batterGuessDelta}
+              total={matchup.batterDisplay}
+              ignoresDebuffs={matchup.batterIgnoresDebuffs}
+              chainOf={batterPreview.bestGroup.length}
+              handSize={batterHand.length}
+            />
+          )}
 
           {/* Anonymous status chips for any pitcher debuff currently affecting
               the batter. Surfaces hidden hand-transforms (shape mirror, value
               cap, shape flatten, generals nullified) so the player isn't left
               wondering why their cards changed shape or value. Hides on b-9
               Generational Discipline since the immunity already cancels these
-              effects. Only renders during selection. */}
-          <BatterStatusStrip
-            batterHand={batterHand}
-            pitcherHand={pitcherHand}
-            pitcherTransformsImpactingBatter={pitcherTransformsImpactingBatter}
-            visible={isSelecting}
-          />
+              effects. Only renders during selection AND only when the user
+              is the batter (otherwise we'd be telling the user about
+              effects they themselves dealt to the AI). */}
+          {userIsBatting && (
+            <BatterStatusStrip
+              batterHand={batterHand}
+              pitcherHand={pitcherHand}
+              pitcherTransformsImpactingBatter={pitcherTransformsImpactingBatter}
+              visible={isSelecting}
+            />
+          )}
 
           <HandStrip
-            hand={batterHand}
-            onReorder={reorderBatter}
-            modifiers={batterModifiersForStrip}
+            hand={userHand}
+            onReorder={reorderUser}
+            modifiers={userModifiers}
             disabled={!isSelecting}
             atBatId={atBatId}
             direction="bottom"
-            valueOverrides={reveal.batterValueOverrides}
-            highlightTones={reveal.batterHighlights}
+            valueOverrides={userValueOverrides}
+            highlightTones={userHighlights}
+            // Manual-connection mechanic: only seams the player has dragged
+            // into place chain. We pass affirmedSeams in EVERY phase so the
+            // visible chain art always matches what the engine actually
+            // scored at lock-in -- showing legacy auto-connect during the
+            // reveal would surface ghost chains the engine didn't credit.
+            // The drag-end action only fires during selection; outside
+            // that we leave `onAffirmConnections` undefined so even if
+            // Reorder.Item somehow fires a stale drag, nothing mutates.
+            // `affirmedSeams` and `affirmDraggedCard` both target the
+            // current user-side hand (gameStore branches on getUserSide).
+            affirmedSeams={affirmedSeams}
+            onAffirmConnections={isSelecting ? affirmDraggedCard : undefined}
+            // Per-card "USE" pill plumbing. Only enable the pill during
+            // selection -- once the swing locks in, the modal can't
+            // resolve anyway. The pill auto-hides per-card once the
+            // choice leaves `userPendingChoiceIds` (resolved or expired).
+            pendingChoiceIds={isSelecting ? userPendingChoiceIds : undefined}
+            activeChoiceCardId={activeChoiceCardId}
+            onTriggerChoice={isSelecting ? triggerChoice : undefined}
           />
 
           <AnimatePresence mode="wait">
@@ -729,7 +881,7 @@ export const CardGameOverlay = () => {
                   </button>
                 ) : (
                   <button
-                    onClick={reset}
+                    onClick={() => reset()}
                     className="px-10 py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-bold rounded-full shadow-lg uppercase tracking-wider text-sm transition-all hover:scale-105 active:scale-95"
                   >
                     New Game
@@ -766,10 +918,20 @@ const HitResultBanner = ({
 }) => {
   const [visible, setVisible] = useState(false);
   // Re-enter every time a fresh resolved-state lands. We key on atBatId so a
-  // second OUT in a row still pops a fresh banner.
+  // second OUT in a row still pops a fresh banner. We ALSO synchronously
+  // hide the moment the phase leaves the resolved states (B1 fix): without
+  // this, tapping `Next At-Bat` while the banner's 3.6s timer was still
+  // ticking would leave the prior at-bat's "OUT!" / "TRIPLE!" plate floating
+  // over the new at-bat's card selection.
   useEffect(() => {
-    if (phase !== 'between-at-bats' && phase !== 'game-over') return;
-    if (outcome === null) return;
+    if (phase !== 'between-at-bats' && phase !== 'game-over') {
+      setVisible(false);
+      return;
+    }
+    if (outcome === null) {
+      setVisible(false);
+      return;
+    }
     setVisible(true);
     // 3.6s gives the player time to actually savor (or stew on) the
     // outcome label. 2.2s was too brisk in playtest -- the banner faded
@@ -875,6 +1037,40 @@ const PITCHER_TRANSFORM_LABELS: Record<string, string> = {
   'p-78': 'Stars Flat',
 };
 
+/**
+ * One-sentence plain-English explanations for every status chip the BATTER
+ * sees during selection. Keyed by the same `chip.key` we already build the
+ * chip list with, so the lookup is a single map. Surfaced via the chip's
+ * native `title` attribute so the explanation is one hover away -- the
+ * chips themselves stay terse for at-a-glance reading.
+ *
+ * Strings reference cards by their display NAME only -- the engine ids
+ * (`b-9`, `p-31`, ...) are an internal naming convention with no meaning to
+ * the player and have no business in user-facing text.
+ */
+const STATUS_CHIP_EXPLANATIONS: Record<string, string> = {
+  discipline:
+    'Generational Discipline — your hand ignores all pitcher debuffs this round.',
+  'p-31':
+    'Splinker — the pitcher locked the wildcards in your hand to fixed shapes.',
+  'p-35':
+    'Knuckle Curve — your SQUARE shapes are treated as flat (none) and cannot connect.',
+  'p-42':
+    'Paint the Corners — every card in your hand has its value capped at 6.',
+  'p-47':
+    'Rising Fastball — your DIAMOND shapes are treated as flat (none) and cannot connect.',
+  'p-49':
+    'The Condor — every card in your hand has had its left and right shapes mirrored.',
+  'p-78':
+    'The Shift — your STAR shapes are treated as flat (none) and cannot connect.',
+  'p-36':
+    "Ace's Command — your highest-value card's ability is silenced. The base value still scores; the effect does not.",
+  'p-41':
+    'Sweeping Slider — at lock-in one seam in your best chain will break, dropping that card from the chain.',
+  'b-23':
+    'Stolen Base Threat — the pitcher cannot use any General cards this round (their generals are zeroed at scoring).',
+};
+
 const BatterStatusStrip = ({
   batterHand,
   pitcherHand,
@@ -944,10 +1140,15 @@ const BatterStatusStrip = ({
           {chips.map((c) => (
             <span
               key={c.key}
+              // Native `title` is enough here: the chip already says WHAT
+              // the impact is; the tooltip's job is just "what does this
+              // mean / which card caused it" for players who don't have
+              // the whole roster memorized.
+              title={STATUS_CHIP_EXPLANATIONS[c.key] ?? c.label}
               className={
                 c.key === 'discipline'
-                  ? 'px-2 py-0.5 rounded-full bg-emerald-900/70 border border-emerald-500/60 text-emerald-200 text-[10px] font-bold uppercase tracking-wider'
-                  : 'px-2 py-0.5 rounded-full bg-rose-900/70 border border-rose-500/60 text-rose-200 text-[10px] font-bold uppercase tracking-wider'
+                  ? 'px-2 py-0.5 rounded-full bg-emerald-900/70 border border-emerald-500/60 text-emerald-200 text-[10px] font-bold uppercase tracking-wider cursor-help'
+                  : 'px-2 py-0.5 rounded-full bg-rose-900/70 border border-rose-500/60 text-rose-200 text-[10px] font-bold uppercase tracking-wider cursor-help'
               }
             >
               {c.label}
@@ -992,12 +1193,12 @@ interface ScorePillProps {
    */
   hitScaleHint?: number | null;
   /**
-   * Tiny caption rendered above the pill (e.g. "Best chain: 3 of 5 cards")
-   * to explain what subset of the hand is actually contributing the score.
-   * Surfaces context that playtesters were missing -- they were summing all
-   * five visible cards and confused why the pill showed less.
+   * Current at-bat id. Used to scope the outcome chip's exit-animation key so
+   * that when `Next At-Bat` is clicked the prior chip ("ELLY DE LA CRUZ: OUT
+   * (17 vs 24)") force-unmounts crisply instead of bleeding 200-300ms of
+   * default exit fade into the next at-bat's card-selection HUD (B1 fix).
    */
-  subtitle?: string | null;
+  atBatId?: number;
 }
 
 /**
@@ -1023,28 +1224,21 @@ const ScorePill = ({
   compact = false,
   banner = null,
   hitScaleHint = null,
-  subtitle = null,
+  atBatId,
 }: ScorePillProps) => {
   const valueColor = tone === 'batter' ? 'text-blue-600' : 'text-rose-600';
   const containerSize = compact
     ? 'px-4 py-1 text-sm gap-2'
     : 'px-6 py-2 text-xl gap-4';
   return (
-    <div className="relative flex flex-col items-center">
-      <AnimatePresence>
-        {subtitle && (
-          <motion.div
-            key={subtitle}
-            initial={{ opacity: 0, y: 4 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 4 }}
-            transition={{ duration: 0.18 }}
-            className="absolute bottom-full mb-1 px-2 py-0.5 rounded-full bg-slate-900/85 border border-slate-600/60 text-[9px] font-bold uppercase tracking-widest text-amber-300 whitespace-nowrap pointer-events-none"
-          >
-            {subtitle}
-          </motion.div>
-        )}
-      </AnimatePresence>
+    // `z-30` lifts the pill (and the BeatBanner anchored absolute below it)
+    // above sibling cards in the user's column. Without this the banner
+    // anchored at `top-full mt-1.5` floats into the flex gap between the
+    // pill and the hand strip, and the cards -- whose Framer-applied
+    // transforms create their own stacking contexts -- paint over it. The
+    // banner only renders during reveal beats, so this z-index is moot
+    // during selection / between-at-bats.
+    <div className="relative z-30 flex flex-col items-center">
       <motion.div
         layout
         className={`bg-white/95 backdrop-blur rounded-full font-bold text-slate-900 shadow-xl border-2 border-white/50 flex items-center ${containerSize}`}
@@ -1084,13 +1278,19 @@ const ScorePill = ({
           )}
         </AnimatePresence>
 
+        {/* AnimatePresence keyed by atBatId in addition to the outcome string
+            so that `Next At-Bat` (which flips phase out of `between-at-bats`,
+            making `outcome` undefined) drops the chip immediately rather than
+            tweening it ~300ms into the next at-bat's CARD SELECTION HUD. The
+            tight 0.12s exit also keeps in-at-bat outcome swaps from feeling
+            laggy. (B1 fix.) */}
         <AnimatePresence>
           {outcome && (
             <motion.span
-              key={outcome}
+              key={`${atBatId ?? 'na'}-${outcome}`}
               initial={{ opacity: 0, scale: 0.8 }}
               animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.8 }}
+              exit={{ opacity: 0, scale: 0.8, transition: { duration: 0.12 } }}
               className={`font-black uppercase tracking-widest rounded-full shadow-inner ${outcomeStyle} ${compact ? 'text-[10px] px-2.5 py-0.5' : 'text-sm px-3.5 py-1'}`}
             >
               {outcome}
@@ -1101,8 +1301,10 @@ const ScorePill = ({
 
       {/* Banner sits in flow below the pill so it doesn't visually shove the
           rest of the column when it animates in. The pill itself gets `layout`
-          so its width tween reads naturally if a large value lands. */}
-      <div className="absolute top-full mt-1.5 pointer-events-none">
+          so its width tween reads naturally if a large value lands. `z-10`
+          here keeps the banner above the pill's own children if the chip
+          ever grows tall enough to overlap. */}
+      <div className="absolute top-full mt-1.5 pointer-events-none z-10">
         <AnimatePresence>
           {banner && <BeatBanner key={banner.key} banner={banner} />}
         </AnimatePresence>
@@ -1132,6 +1334,137 @@ const BeatBanner = ({ banner }: { banner: ScoreBanner }) => {
         {sign}
         {banner.delta}
       </span>
+    </motion.div>
+  );
+};
+
+interface MatchupMathProps {
+  /** Sum of card values in the player's current best chain. */
+  chainSum: number;
+  /** Aggregate pitcher pressure (typically negative). */
+  pitcherDelta: number;
+  /** Cross-at-bat carryover debuff (typically negative). */
+  carryoverDelta: number;
+  /** b-65 Guess Pitch bonus at lock-in (0/1/4). */
+  guessDelta: number;
+  /** chainSum + pitcherDelta + carryoverDelta + guessDelta -- mirrors the pill. */
+  total: number;
+  /** True when b-9 Generational Discipline is in play (debuffs zeroed). */
+  ignoresDebuffs: boolean;
+  /** How many cards form the best chain. */
+  chainOf: number;
+  /** Total cards in hand (for the X of Y caption). */
+  handSize: number;
+}
+
+/**
+ * Math breakdown rendered directly under the BATTER score pill during card
+ * selection. Decomposes the pill into its components so the player can see
+ * WHY the visible card sum doesn't always match the pill total -- previously
+ * cross-side effects (p-38 / p-50 / p-52 / p-60 / p-72 / p-90 aggregate
+ * debuffs, cross-at-bat carryover, b-65 guess bonus) silently moved the pill
+ * without ever touching the per-card numbers, which playtesters read as the
+ * pill being broken.
+ *
+ * Hides itself entirely when no cross-side delta applies (i.e. the chain sum
+ * IS the pill) so vanilla matchups stay uncluttered. Always shows when ANY
+ * delta is non-zero, even if it's just guess +1.
+ */
+const MatchupMath = ({
+  chainSum,
+  pitcherDelta,
+  carryoverDelta,
+  guessDelta,
+  total,
+  ignoresDebuffs,
+  chainOf,
+  handSize,
+}: MatchupMathProps) => {
+  const hasDelta = pitcherDelta !== 0 || carryoverDelta !== 0 || guessDelta !== 0;
+  if (!hasDelta && !ignoresDebuffs) return null;
+  const components: Array<{ label: string; value: number; tone: 'neutral' | 'pos' | 'neg'; title?: string }> = [
+    {
+      label: handSize > chainOf ? `Chain ${chainOf}/${handSize}` : 'Chain',
+      value: chainSum,
+      tone: 'neutral',
+      title: handSize > chainOf
+        ? `${chainOf} of ${handSize} cards form your best combined chain. Drag cards together to build a longer chain.`
+        : 'All cards combine into a single chain that feeds the pill.',
+    },
+  ];
+  if (pitcherDelta !== 0) {
+    components.push({
+      label: 'Pitcher',
+      value: pitcherDelta,
+      tone: pitcherDelta < 0 ? 'neg' : 'pos',
+      title: "Aggregate pressure from the pitcher's ability cards (e.g. Wipeout Changeup, Devastating Slider, Filthy Stuff).",
+    });
+  }
+  if (carryoverDelta !== 0) {
+    components.push({
+      label: 'Carryover',
+      value: carryoverDelta,
+      tone: carryoverDelta < 0 ? 'neg' : 'pos',
+      title: 'Debuffs queued by a previous at-bat that bleed into this one (e.g. Strikeout Artist hangover).',
+    });
+  }
+  if (guessDelta !== 0) {
+    components.push({
+      label: 'Guess',
+      value: guessDelta,
+      tone: 'pos',
+      title:
+        guessDelta >= 4
+          ? 'Guess Pitch: pitcher used the shape you named (+4).'
+          : 'Guess Pitch: pitcher did not use the shape you named (+1 consolation).',
+    });
+  }
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -4 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.22, ease: 'easeOut' }}
+      className="flex flex-row items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-900/85 backdrop-blur border border-white/10 shadow-lg flex-wrap justify-center max-w-[420px]"
+    >
+      {components.map((c, idx) => {
+        const sign = c.value > 0 ? '+' : c.value < 0 ? '−' : '';
+        const magnitude = Math.abs(c.value);
+        const valueColor =
+          c.tone === 'pos' ? 'text-emerald-300' : c.tone === 'neg' ? 'text-rose-300' : 'text-slate-100';
+        return (
+          <div key={c.label} className="flex items-center gap-1.5">
+            {idx > 0 && (
+              <span className="text-slate-600 text-[10px] font-bold select-none">·</span>
+            )}
+            <span
+              className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest"
+              title={c.title}
+            >
+              <span className="text-slate-400">{c.label}</span>
+              <span className={`${valueColor} font-mono tabular-nums`}>
+                {sign}
+                {magnitude}
+              </span>
+            </span>
+          </div>
+        );
+      })}
+      {hasDelta && (
+        <>
+          <span className="text-slate-600 text-[10px] font-bold select-none">=</span>
+          <span className="text-[11px] font-extrabold uppercase tracking-widest text-amber-300 font-mono tabular-nums">
+            {total}
+          </span>
+        </>
+      )}
+      {ignoresDebuffs && (
+        <span
+          className="ml-1 px-1.5 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-400/40 text-[9px] font-bold uppercase tracking-widest text-emerald-300"
+          title="Generational Discipline: pitcher debuffs are zeroed for this at-bat."
+        >
+          Discipline
+        </span>
+      )}
     </motion.div>
   );
 };
@@ -1702,6 +2035,38 @@ interface HandStripProps {
   valueOverrides?: Record<string, number>;
   /** Reveal-sequence per-card highlight tones, keyed by card id. */
   highlightTones?: Record<string, 'source' | 'target'>;
+  /**
+   * User-affirmed connection seams (seamKey-encoded). When provided, two
+   * adjacent cards are only rendered as connected if their seam is in this
+   * set -- the player must drag one onto the other for a connection to
+   * form. When omitted (pitcher strip / reveal phases), the strip falls
+   * back to legacy auto-connect on canConnect alone.
+   */
+  affirmedSeams?: ReadonlySet<string>;
+  /**
+   * Called on drag-end with the dropped card's id so the store can affirm
+   * its new neighbors. Optional -- read-only strips (reveal phase, pitcher
+   * peek) leave it undefined.
+   */
+  onAffirmConnections?: (cardId: string) => void;
+  /**
+   * Card ids that have an unresolved player-choice prompt for the user's
+   * current seat. Cards in this set render a "USE" trigger pill. Omit on
+   * the AI strip (no AI-side prompts are user-triggerable).
+   */
+  pendingChoiceIds?: ReadonlySet<string>;
+  /**
+   * Card id whose choice modal is currently open, if any. Used to highlight
+   * the corresponding pill so the player can tell which card the modal
+   * belongs to once it's open.
+   */
+  activeChoiceCardId?: string | null;
+  /**
+   * Click handler for the "USE" pill. Receives the card id; the store's
+   * `triggerChoice` opens the modal. Required when `pendingChoiceIds` is
+   * provided.
+   */
+  onTriggerChoice?: (cardId: string) => void;
 }
 
 const HandStrip = ({
@@ -1714,6 +2079,11 @@ const HandStrip = ({
   direction = 'bottom',
   valueOverrides,
   highlightTones,
+  affirmedSeams,
+  onAffirmConnections,
+  pendingChoiceIds,
+  activeChoiceCardId,
+  onTriggerChoice,
 }: HandStripProps) => {
   // Signature cards fly in from the screen edge they belong to (pitcher drops
   // from above, batter rises up from below); general-draw cards then sweep in
@@ -1727,13 +2097,26 @@ const HandStrip = ({
   // whether the current arrangement would form a connection at that seam. Only
   // the seams that touch the dragged card light up, so the hint is focused.
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  // Capture the in-flight drag id in a ref so handleDragEnd can fire the
+  // affirm action without recreating its callback on every render (the
+  // setState path in handleDragEnd is async, so reading state directly
+  // there is unreliable).
+  const draggingIdRef = useRef<string | null>(null);
 
   const handleDragStart = useCallback((id: string) => {
     setDraggingId(id);
+    draggingIdRef.current = id;
   }, []);
   const handleDragEnd = useCallback(() => {
+    const id = draggingIdRef.current;
+    draggingIdRef.current = null;
     setDraggingId(null);
-  }, []);
+    // The drop is the affirming gesture: tell the store to recompute
+    // affirmedSeams against the fresh hand order. Re-affirms the dropped
+    // card's new left/right seams (if mechanically connectable) and prunes
+    // any seams the reorder broke.
+    if (id && onAffirmConnections) onAffirmConnections(id);
+  }, [onAffirmConnections]);
 
   // Pre-compute hint state for each card index when a drag is in progress.
   // Each entry is `{ left, right }` ConnectHints for the card at that index.
@@ -1795,12 +2178,31 @@ const HandStrip = ({
         children plays badly with Framer's reorder swaps.
       */}
       {hand.map((card, index) => {
-          const isConnectedLeft = index > 0 && canConnect(hand[index - 1], card);
-          const isConnectedRight = index < hand.length - 1 && canConnect(card, hand[index + 1]);
+          // A seam is "connected" only if (a) the mechanic allows it
+          // (canConnect) AND (b) the user has affirmed it. When the strip
+          // doesn't get an `affirmedSeams` set (pitcher strip, reveal phase),
+          // we fall back to legacy auto-connect so existing flows aren't
+          // broken.
+          const seamLeftAffirmed =
+            index > 0 &&
+            (affirmedSeams === undefined ||
+              affirmedSeams.has(seamKey(hand[index - 1].id, card.id)));
+          const seamRightAffirmed =
+            index < hand.length - 1 &&
+            (affirmedSeams === undefined ||
+              affirmedSeams.has(seamKey(card.id, hand[index + 1].id)));
+          const isConnectedLeft =
+            index > 0 && canConnect(hand[index - 1], card) && seamLeftAffirmed;
+          const isConnectedRight =
+            index < hand.length - 1 &&
+            canConnect(card, hand[index + 1]) &&
+            seamRightAffirmed;
           const modifier = modifiers[card.id];
           const hintForCard = hints[index];
           const isGeneral = card.abilityType === 'General Draw';
           const skipEntryAnim = entryPlayedRef.current.cards.has(card.id);
+          const hasPendingChoice =
+            pendingChoiceIds?.has(card.id) ?? false;
           return (
             <HandCard
               key={`${atBatId}-${card.id}`}
@@ -1824,6 +2226,15 @@ const HandStrip = ({
               valueOverride={valueOverrides?.[card.id]}
               highlightTone={highlightTones?.[card.id]}
               dragActive={draggingId !== null}
+              hasPendingChoice={hasPendingChoice}
+              isChoiceActive={
+                hasPendingChoice && activeChoiceCardId === card.id
+              }
+              onTriggerChoice={
+                hasPendingChoice && onTriggerChoice
+                  ? () => onTriggerChoice(card.id)
+                  : undefined
+              }
             />
           );
         })}
@@ -1869,6 +2280,23 @@ interface HandCardProps {
    * already had its entry" and feed `skipEntryAnim` back on remount.
    */
   onEntryPlayed: (cardId: string) => void;
+  /**
+   * True when this card has an unresolved player-choice prompt waiting for
+   * the user. Renders a "USE" pill above the card; clicking it fires
+   * `onTriggerChoice` to open the modal.
+   */
+  hasPendingChoice?: boolean;
+  /**
+   * True when the choice modal is currently open for this card. Used to
+   * upgrade the pill's tone (filled amber vs. outlined) so the player can
+   * see at a glance which card the modal belongs to.
+   */
+  isChoiceActive?: boolean;
+  /**
+   * Click handler for the "USE" pill. Defined only when the card has an
+   * actual pending choice -- otherwise the pill is suppressed entirely.
+   */
+  onTriggerChoice?: () => void;
 }
 
 /**
@@ -1897,6 +2325,9 @@ const HandCard = ({
   dragActive = false,
   skipEntryAnim = false,
   onEntryPlayed,
+  hasPendingChoice = false,
+  isChoiceActive = false,
+  onTriggerChoice,
 }: HandCardProps) => {
   useEffect(() => {
     onEntryPlayed(card.id);
@@ -1953,9 +2384,62 @@ const HandCard = ({
         highlightTone={highlightTone}
         dragActive={dragActive}
       />
+      {hasPendingChoice && onTriggerChoice && (
+        <UseAbilityPill
+          active={isChoiceActive}
+          onClick={onTriggerChoice}
+        />
+      )}
     </Reorder.Item>
   );
 };
+
+/**
+ * Floating "USE" pill anchored just above a card. Renders only when the
+ * card has an unresolved player-choice prompt for the user; clicking it
+ * fires `triggerChoice` to open the modal. We stop pointer/click
+ * propagation so Framer's Reorder.Item drag doesn't kick in when the
+ * player taps the pill (the card body is still draggable normally).
+ *
+ * Two visual states:
+ *  - resting (active=false): amber pulse + soft shadow, the "you have an
+ *    ability ready" hint.
+ *  - active (active=true): solid filled chip in the same amber, signals
+ *    "the modal you see right now belongs to this card".
+ */
+function UseAbilityPill({ active, onClick }: { active: boolean; onClick: () => void }) {
+  return (
+    <motion.button
+      type="button"
+      onClick={onClick}
+      onPointerDown={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+      onTouchStart={(e) => e.stopPropagation()}
+      initial={{ opacity: 0, y: 6, scale: 0.85 }}
+      animate={
+        active
+          ? { opacity: 1, y: 0, scale: 1 }
+          : {
+              opacity: 1,
+              y: 0,
+              scale: [1, 1.06, 1],
+              transition: { scale: { duration: 1.4, repeat: Infinity, ease: 'easeInOut' } },
+            }
+      }
+      exit={{ opacity: 0, y: 6, scale: 0.85, transition: { duration: 0.15 } }}
+      whileHover={{ scale: 1.1 }}
+      whileTap={{ scale: 0.92 }}
+      className={`absolute -top-3 left-1/2 -translate-x-1/2 z-50 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-widest shadow-lg cursor-pointer select-none whitespace-nowrap border transition-colors ${
+        active
+          ? 'bg-amber-400 text-slate-900 border-amber-300 shadow-amber-500/50'
+          : 'bg-slate-900 text-amber-300 border-amber-400 shadow-amber-500/40 hover:bg-amber-400 hover:text-slate-900'
+      }`}
+      aria-label="Use ability"
+    >
+      ⚡ Use
+    </motion.button>
+  );
+}
 
 // ===========================================================================
 // Reveal-sequence orchestrator
@@ -2264,6 +2748,12 @@ function applyBeatStart(beat: ResolutionBeat, ctx: ApplyBeatStartCtx) {
       break;
     }
     case 'guessPitchHit': {
+      // Light up the b-65 card itself so the player SEES Guess Pitch
+      // fire alongside the banner -- same treatment any other source-
+      // attributable effect gets. Without this, the +4 / +1 used to
+      // appear on the pill with no visual anchor on the strip and read
+      // as "the pill just changed for some reason".
+      ctx.setBatterHighlights((prev) => ({ ...prev, [beat.sourceCardId]: 'source' }));
       ctx.setBatterBanner({
         key: `guess-${ctx.beatIndex}`,
         label: 'Guess Pitch',

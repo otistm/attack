@@ -36,6 +36,18 @@ export interface ResolveDelta {
   removeRunnerHint: RunnerSlot | null;
   /** b-69 Sacrifice Fly: a runner on 3rd scores even though the batter is out. */
   forceRunFromThird: boolean;
+  /**
+   * b-120 Steal Home: each existing base runner advances this many EXTRA bases
+   * on top of the natural outcome's advance. Stacks with hit-driven advancement
+   * (e.g. a single normally pushes 1B->2B; +1 boost makes it 1B->3B).
+   */
+  runnerAdvanceBoost: number;
+  /**
+   * b-135 Stolen Bag: place an extra runner on the named base after the
+   * natural outcome resolves. Currently only "first" is wired (b-135), but
+   * the slot type leaves room for future "extra runner on 2nd" effects.
+   */
+  extraRunnerOn: RunnerSlot | null;
   /** Cross-at-bat debuffs to enqueue (drained next at-bat). */
   pendingDebuffs: PendingDebuff[];
   log: string[];
@@ -45,6 +57,8 @@ const EMPTY: ResolveDelta = {
   outsAdjustment: 0,
   removeRunnerHint: null,
   forceRunFromThird: false,
+  runnerAdvanceBoost: 0,
+  extraRunnerOn: null,
   pendingDebuffs: [],
   log: [],
 };
@@ -82,6 +96,31 @@ export const RESOLVE_STEPS: Record<string, ResolveFn> = {
     return { forceRunFromThird: true, log: ["b-69 Sacrifice Fly: runner on 3rd scores"] };
   },
 
+  // b-120 Steal Home: if b-120 is in the best (combined) group AND the batter
+  // wins, every base runner advances one extra base. Combine + win mirrors
+  // the description's "if combined and you win" gate.
+  "b-120": (ctx) => {
+    if (!ctx.batterWins) return {};
+    if (!bestGroupContains(ctx.batterResult, "b-120")) return {};
+    if (ctx.batterResult.bestGroup.length < 2) return {};
+    return {
+      runnerAdvanceBoost: 1,
+      log: ["b-120 Steal Home: runners advance +1 extra base"],
+    };
+  },
+
+  // b-135 Stolen Bag: if the batter wins this at-bat, drop an additional
+  // runner on 1B after the natural outcome lays its runners down. b-135
+  // doesn't need to combine -- the steal flavor is a free bonus on any win.
+  "b-135": (ctx) => {
+    if (!ctx.batterWins) return {};
+    if (!ctx.batterHand.some((c) => c.id === "b-135")) return {};
+    return {
+      extraRunnerOn: "first",
+      log: ["b-135 Stolen Bag: extra runner placed on 1B"],
+    };
+  },
+
   // p-58 Strikeout Artist: if pitcher wins by more than 5, the next batter
   // starts with -2 to their effective hand total.
   "p-58": (ctx) => {
@@ -108,6 +147,8 @@ export function applyResolveStep(ctx: ResolveContext): ResolveDelta {
     outsAdjustment: 0,
     removeRunnerHint: null,
     forceRunFromThird: false,
+    runnerAdvanceBoost: 0,
+    extraRunnerOn: null,
     pendingDebuffs: [],
     log: [],
   };
@@ -122,6 +163,10 @@ export function applyResolveStep(ctx: ResolveContext): ResolveDelta {
       result.removeRunnerHint = partial.removeRunnerHint;
     }
     if (partial.forceRunFromThird) result.forceRunFromThird = true;
+    result.runnerAdvanceBoost += partial.runnerAdvanceBoost ?? 0;
+    if (partial.extraRunnerOn && !result.extraRunnerOn) {
+      result.extraRunnerOn = partial.extraRunnerOn;
+    }
     if (partial.pendingDebuffs?.length) result.pendingDebuffs.push(...partial.pendingDebuffs);
     if (partial.log?.length) result.log.push(...partial.log);
   }

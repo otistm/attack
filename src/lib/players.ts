@@ -21,6 +21,19 @@ export const PLAYERS: MlbPlayer[] = [
   { id: "acuna", name: "Ronald Acuña Jr.", team: "ATL", role: "Batter", handedness: "R", signatureCardIds: ["b-22", "b-23", "b-24"] },
   { id: "henderson", name: "Gunnar Henderson", team: "BAL", role: "Batter", handedness: "L", signatureCardIds: ["b-25", "b-26", "b-27"] },
   { id: "vlad", name: "Vladimir Guerrero Jr.", team: "TOR", role: "Batter", handedness: "R", signatureCardIds: ["b-28", "b-29", "b-30"] },
+  // Draft-pool expansion (Phase 7): 12 additional batters.
+  { id: "trout", name: "Mike Trout", team: "LAA", role: "Batter", handedness: "R", signatureCardIds: ["b-100", "b-101", "b-102"] },
+  { id: "freeman", name: "Freddie Freeman", team: "LAD", role: "Batter", handedness: "L", signatureCardIds: ["b-103", "b-104", "b-105"] },
+  { id: "alvarez", name: "Yordan Alvarez", team: "HOU", role: "Batter", handedness: "L", signatureCardIds: ["b-106", "b-107", "b-108"] },
+  { id: "seager", name: "Corey Seager", team: "TEX", role: "Batter", handedness: "L", signatureCardIds: ["b-109", "b-110", "b-111"] },
+  { id: "jramirez", name: "Jose Ramirez", team: "CLE", role: "Batter", handedness: "S", signatureCardIds: ["b-112", "b-113", "b-114"] },
+  { id: "alonso", name: "Pete Alonso", team: "NYM", role: "Batter", handedness: "R", signatureCardIds: ["b-115", "b-116", "b-117"] },
+  { id: "tturner", name: "Trea Turner", team: "PHI", role: "Batter", handedness: "R", signatureCardIds: ["b-118", "b-119", "b-120"] },
+  { id: "rutschman", name: "Adley Rutschman", team: "BAL", role: "Batter", handedness: "S", signatureCardIds: ["b-121", "b-122", "b-123"] },
+  { id: "devers", name: "Rafael Devers", team: "BOS", role: "Batter", handedness: "L", signatureCardIds: ["b-124", "b-125", "b-126"] },
+  { id: "lindor", name: "Francisco Lindor", team: "NYM", role: "Batter", handedness: "S", signatureCardIds: ["b-127", "b-128", "b-129"] },
+  { id: "altuve", name: "Jose Altuve", team: "HOU", role: "Batter", handedness: "R", signatureCardIds: ["b-130", "b-131", "b-132"] },
+  { id: "chisholm", name: "Jazz Chisholm Jr.", team: "NYY", role: "Batter", handedness: "L", signatureCardIds: ["b-133", "b-134", "b-135"] },
 
   // ===== Pitchers =====
   { id: "skenes", name: "Paul Skenes", team: "PIT", role: "Pitcher", handedness: "R", signatureCardIds: ["p-31", "p-32", "p-33"] },

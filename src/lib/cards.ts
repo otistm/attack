@@ -248,7 +248,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 6,
     "leftShape": "circle",
     "rightShape": "square",
-    "description": "Change the shape of one of your General cards this round.",
+    "description": "Change the shape on one side of one of your General cards this round.",
     "color": "bg-emerald-500",
     "tags": ["speedster", "rookie"]
   },
@@ -287,7 +287,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 6,
     "leftShape": "star",
     "rightShape": "circle",
-    "description": "Left shape acts as a Wildcard.",
+    "description": "Left side acts as a Wildcard.",
     "color": "bg-emerald-500",
     "tags": ["clutch", "veteran"],
     "combineConstraint": { "leftWildcard": true }
@@ -970,7 +970,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 3,
     "leftShape": "diamond",
     "rightShape": "diamond",
-    "description": "Left shape acts as a Wildcard.",
+    "description": "Left side acts as a Wildcard.",
     "color": "bg-amber-500",
     "tags": ["speedster"],
     "combineConstraint": { "leftWildcard": true }
@@ -1467,5 +1467,523 @@ export const ALL_CARDS: CardDefinition[] = [
     "description": "+3 Value in the 8th inning or later.",
     "color": "bg-violet-500",
     "tags": ["closer"]
+  },
+
+  // ============================================================================
+  // Phase 7 -- Draft-pool batter expansion (b-100..b-135).
+  //
+  // 12 new batters x 3 signature cards. IDs intentionally jump to 100 to leave
+  // b-31..b-60 and b-81..b-90 reserved for future signatures/generals without
+  // collision risk. Every ability here is unique vs. b-1..b-30 and b-61..b-96
+  // (see plan); novel mechanics are wired through handTransforms / resolveStep
+  // / scoring helpers rather than coining new effect-result fields.
+  // ============================================================================
+
+  // ---- Mike Trout (LAA, R) ----
+  {
+    "id": "b-100",
+    "name": "Five-Tool Threat",
+    "player": "Mike Trout (LAA)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 6,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "If combined and the Pitcher's base card is a FASTBALL, +5 Value.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "veteran"]
+  },
+  {
+    "id": "b-101",
+    "name": "MVP Resume",
+    "player": "Mike Trout (LAA)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 7,
+    "leftShape": "diamond",
+    "rightShape": "star",
+    "description": "+1 Value for every other VETERAN card in the Pitcher's hand.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "veteran"]
+  },
+  {
+    "id": "b-102",
+    "name": "Halo Bomb",
+    "player": "Mike Trout (LAA)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 8,
+    "leftShape": "square",
+    "rightShape": "circle",
+    "description": "Cannot be combined on the right side.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "veteran"],
+    "combineConstraint": { "rightNoCombine": true }
+  },
+
+  // ---- Freddie Freeman (LAD, L) ----
+  {
+    "id": "b-103",
+    "name": "1B Smooth",
+    "player": "Freddie Freeman (LAD)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 5,
+    "leftShape": "diamond",
+    "rightShape": "diamond",
+    "description": "+1 Value for every DIAMOND on the board.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran", "lefty"],
+    "handedness": "L"
+  },
+  {
+    "id": "b-104",
+    "name": "Calm at the Plate",
+    "player": "Freddie Freeman (LAD)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 6,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "+3 Value if your team has 0 Outs.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran", "lefty"],
+    "handedness": "L"
+  },
+  {
+    "id": "b-105",
+    "name": "Atlanta-LA Ring",
+    "player": "Freddie Freeman (LAD)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 6,
+    "leftShape": "circle",
+    "rightShape": "star",
+    "description": "The Pitcher's base card mechanic is nullified.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran", "lefty"],
+    "handedness": "L"
+  },
+
+  // ---- Yordan Alvarez (HOU, L) ----
+  {
+    "id": "b-106",
+    "name": "Cuban Crusher",
+    "player": "Yordan Alvarez (HOU)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 9,
+    "leftShape": "star",
+    "rightShape": "star",
+    "description": "If combined, base value becomes 14.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty"],
+    "handedness": "L"
+  },
+  {
+    "id": "b-107",
+    "name": "Crawford Boxes",
+    "player": "Yordan Alvarez (HOU)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 6,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "+2 Value for every other POWER-HITTER card in your hand.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty"],
+    "handedness": "L"
+  },
+  {
+    "id": "b-108",
+    "name": "DH Threat",
+    "player": "Yordan Alvarez (HOU)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 7,
+    "leftShape": "circle",
+    "rightShape": "square",
+    "description": "The Pitcher's OFF-SPEED cards have their effect nullified.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty"],
+    "handedness": "L"
+  },
+
+  // ---- Corey Seager (TEX, L) ----
+  {
+    "id": "b-109",
+    "name": "World Series MVP",
+    "player": "Corey Seager (TEX)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 6,
+    "leftShape": "star",
+    "rightShape": "diamond",
+    "description": "+3 Value in the 4th inning or later.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran", "lefty"],
+    "handedness": "L"
+  },
+  {
+    "id": "b-110",
+    "name": "Smooth Stroke",
+    "player": "Corey Seager (TEX)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 7,
+    "leftShape": "square",
+    "rightShape": "circle",
+    "description": "If combined on the left, +4 Value.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran", "lefty"],
+    "handedness": "L"
+  },
+  {
+    "id": "b-111",
+    "name": "October Hero",
+    "player": "Corey Seager (TEX)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 5,
+    "leftShape": "diamond",
+    "rightShape": "star",
+    "description": "+5 Value if the score is tied.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran", "lefty"],
+    "handedness": "L"
+  },
+
+  // ---- Jose Ramirez (CLE, S) ----
+  {
+    "id": "b-112",
+    "name": "Switch Slasher",
+    "player": "Jose Ramirez (CLE)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 6,
+    "leftShape": "circle",
+    "rightShape": "diamond",
+    "description": "+2 Value for every unique shape on the board (max +6).",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "speedster"]
+  },
+  {
+    "id": "b-113",
+    "name": "Cleveland Cutter",
+    "player": "Jose Ramirez (CLE)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 5,
+    "leftShape": "square",
+    "rightShape": "circle",
+    "description": "+1 Value for every card you have combined.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "speedster"]
+  },
+  {
+    "id": "b-114",
+    "name": "30-30 Threat",
+    "player": "Jose Ramirez (CLE)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 7,
+    "leftShape": "star",
+    "rightShape": "circle",
+    "description": "+3 Value if your hand has another SPEEDSTER and another POWER-HITTER.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "speedster"]
+  },
+
+  // ---- Pete Alonso (NYM, R) ----
+  {
+    "id": "b-115",
+    "name": "Polar Power",
+    "player": "Pete Alonso (NYM)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 8,
+    "leftShape": "square",
+    "rightShape": "star",
+    "description": "+1 Value for every STAR on the board.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter"]
+  },
+  {
+    "id": "b-116",
+    "name": "HR Derby Champ",
+    "player": "Pete Alonso (NYM)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 7,
+    "leftShape": "diamond",
+    "rightShape": "diamond",
+    "description": "If combined, +3 to the Hit Scale.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter"]
+  },
+  {
+    "id": "b-117",
+    "name": "Citi Bomb",
+    "player": "Pete Alonso (NYM)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 6,
+    "leftShape": "square",
+    "rightShape": "circle",
+    "description": "If combined, +2 Value and +2 to the Hit Scale.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter"]
+  },
+
+  // ---- Trea Turner (PHI, R) ----
+  {
+    "id": "b-118",
+    "name": "Track Star",
+    "player": "Trea Turner (PHI)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 5,
+    "leftShape": "circle",
+    "rightShape": "circle",
+    "description": "+5 Value if you have no combinations this round.",
+    "color": "bg-emerald-500",
+    "tags": ["speedster", "veteran"]
+  },
+  {
+    "id": "b-119",
+    "name": "Quick Bat",
+    "player": "Trea Turner (PHI)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 4,
+    "leftShape": "diamond",
+    "rightShape": "square",
+    "description": "The Pitcher's General cards each get -2 Value.",
+    "color": "bg-emerald-500",
+    "tags": ["speedster", "veteran"]
+  },
+  {
+    "id": "b-120",
+    "name": "Steal Home",
+    "player": "Trea Turner (PHI)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 5,
+    "leftShape": "star",
+    "rightShape": "circle",
+    "description": "If combined and you win, all base runners advance an extra base.",
+    "color": "bg-emerald-500",
+    "tags": ["speedster", "veteran"]
+  },
+
+  // ---- Adley Rutschman (BAL, S) ----
+  {
+    "id": "b-121",
+    "name": "Catcher's Eye",
+    "player": "Adley Rutschman (BAL)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 5,
+    "leftShape": "diamond",
+    "rightShape": "circle",
+    "description": "Reveal the Pitcher's signature shapes before you lock in your layout.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch"]
+  },
+  {
+    "id": "b-122",
+    "name": "Pitch Caller",
+    "player": "Adley Rutschman (BAL)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 6,
+    "leftShape": "square",
+    "rightShape": "star",
+    "description": "+5 Value if the Pitcher's base card is a BREAKING-BALL.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch"]
+  },
+  {
+    "id": "b-123",
+    "name": "Future Captain",
+    "player": "Adley Rutschman (BAL)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 5,
+    "leftShape": "circle",
+    "rightShape": "square",
+    "description": "+1 Value to every other card in your hand.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch"]
+  },
+
+  // ---- Rafael Devers (BOS, L) ----
+  {
+    "id": "b-124",
+    "name": "Carita's Cannon",
+    "player": "Rafael Devers (BOS)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 8,
+    "leftShape": "circle",
+    "rightShape": "diamond",
+    "description": "If combined on both sides, +6 Value.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty"],
+    "handedness": "L"
+  },
+  {
+    "id": "b-125",
+    "name": "Green Monster",
+    "player": "Rafael Devers (BOS)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 5,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "Your DIAMOND shapes are Wildcards this round.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty"],
+    "handedness": "L"
+  },
+  {
+    "id": "b-126",
+    "name": "Lefty Mash",
+    "player": "Rafael Devers (BOS)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 6,
+    "leftShape": "square",
+    "rightShape": "circle",
+    "description": "+3 Value if the Pitcher is right-handed.",
+    "color": "bg-emerald-500",
+    "tags": ["power-hitter", "lefty"],
+    "handedness": "L"
+  },
+
+  // ---- Francisco Lindor (NYM, S) ----
+  {
+    "id": "b-127",
+    "name": "Mr. Smile",
+    "player": "Francisco Lindor (NYM)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 5,
+    "leftShape": "star",
+    "rightShape": "star",
+    "description": "If combined, the Pitcher's lowest uncombined card is nullified.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran"]
+  },
+  {
+    "id": "b-128",
+    "name": "Switch-Cap",
+    "player": "Francisco Lindor (NYM)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 6,
+    "leftShape": "diamond",
+    "rightShape": "diamond",
+    "description": "+2 Value and +2 to the Hit Scale if the Pitcher is LEFTY.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran"]
+  },
+  {
+    "id": "b-129",
+    "name": "Captain Lindor",
+    "player": "Francisco Lindor (NYM)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 6,
+    "leftShape": "circle",
+    "rightShape": "square",
+    "description": "+1 Value to every uncombined card you leave.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran"]
+  },
+
+  // ---- Jose Altuve (HOU, R) ----
+  {
+    "id": "b-130",
+    "name": "Postseason Tuve",
+    "player": "Jose Altuve (HOU)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 6,
+    "leftShape": "circle",
+    "rightShape": "diamond",
+    "description": "+5 Value if your team is losing or tied.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran"]
+  },
+  {
+    "id": "b-131",
+    "name": "Tiny Terror",
+    "player": "Jose Altuve (HOU)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "circle",
+    "description": "+3 Value if your hand has 2 or more other CLUTCH cards.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran"]
+  },
+  {
+    "id": "b-132",
+    "name": "Champion's Heart",
+    "player": "Jose Altuve (HOU)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 7,
+    "leftShape": "diamond",
+    "rightShape": "star",
+    "description": "+1 Value for every Run your team has scored this game.",
+    "color": "bg-emerald-500",
+    "tags": ["clutch", "veteran"]
+  },
+
+  // ---- Jazz Chisholm Jr. (NYY, L) ----
+  {
+    "id": "b-133",
+    "name": "Jazz Hands",
+    "player": "Jazz Chisholm Jr. (NYY)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 5,
+    "leftShape": "star",
+    "rightShape": "diamond",
+    "description": "If uncombined, both sides act as Wildcards.",
+    "color": "bg-emerald-500",
+    "tags": ["speedster", "lefty"],
+    "handedness": "L"
+  },
+  {
+    "id": "b-134",
+    "name": "Bronx Hustle",
+    "player": "Jazz Chisholm Jr. (NYY)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 5,
+    "leftShape": "circle",
+    "rightShape": "square",
+    "description": "If uncombined and you win, +5 to the Hit Scale.",
+    "color": "bg-emerald-500",
+    "tags": ["speedster", "lefty"],
+    "handedness": "L"
+  },
+  {
+    "id": "b-135",
+    "name": "Stolen Bag",
+    "player": "Jazz Chisholm Jr. (NYY)",
+    "type": "Batting",
+    "abilityType": "Signature",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "star",
+    "description": "If you win, place an additional runner on 1st base.",
+    "color": "bg-emerald-500",
+    "tags": ["speedster", "lefty"],
+    "handedness": "L"
   }
 ];

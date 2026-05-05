@@ -27,6 +27,8 @@ import {
   PendingChoice,
   buildRevealScript,
   ResolutionBeat,
+  getUserSide,
+  derivePendingReveals,
 } from "./gameStore";
 
 let failures = 0;
@@ -605,7 +607,12 @@ function pitcherCtx(opp: CardDefinition[]): ScoringContext {
     pendingDebuffs?: PendingDebuff[];
     coinFlips?: Record<string, "heads" | "tails">;
   }, run: () => void) {
+    // Force `phase: "selecting"` so `lockIn()` actually fires. Used to be
+    // implicit (the store booted in "selecting") but the app now boots into
+    // "drafting" so the auction screen mounts before the field renders --
+    // tests have to opt in to the gameplay phase explicitly.
     useGameStore.setState({
+      phase: "selecting",
       batterHand: setup.batterHand,
       pitcherHand: setup.pitcherHand,
       pendingDebuffs: setup.pendingDebuffs ?? [],
@@ -728,6 +735,11 @@ function pitcherCtx(opp: CardDefinition[]): ScoringContext {
     "Phase 4 b-69: solo (uncombined) loss still scores runner from 3rd");
 
   // ---- b-65 Guess Pitch: miss now pays +1 (was 0). ----
+  // We assert against `lastBatterScore` (the post-lockIn final) rather than
+  // `previewMatchup().batterDisplay` because the live preview deliberately
+  // HIDES the guess bonus during selection (it would leak whether the guess
+  // hit before the pitcher hand flips). The bonus folds into the score at
+  // lockIn -- which is exactly what the player will see after the reveal.
   withReveal(
     { batterHand: [cardById("b-65")], pitcherHand: [cardById("p-44")] },
     () => {
@@ -735,11 +747,12 @@ function pitcherCtx(opp: CardDefinition[]): ScoringContext {
       useGameStore.setState({
         resolvedChoices: { "b-65": { kind: "shape", shape: "circle" } },
       });
-      const m = useGameStore.getState().previewMatchup();
+      useGameStore.getState().lockIn();
+      const s = useGameStore.getState();
       // batter: b-65 base 5 + miss bonus +1 = 6.
-      assert(m.batterDisplay >= 6,
+      assert(s.lastBatterScore >= 6,
         "Phase 4 b-65: missed guess pays +1 consolation",
-        m.batterDisplay);
+        s.lastBatterScore);
     },
   );
   withReveal(
@@ -749,10 +762,37 @@ function pitcherCtx(opp: CardDefinition[]): ScoringContext {
       useGameStore.setState({
         resolvedChoices: { "b-65": { kind: "shape", shape: "square" } },
       });
-      const m = useGameStore.getState().previewMatchup();
-      assert(m.batterDisplay >= 9,
+      useGameStore.getState().lockIn();
+      const s = useGameStore.getState();
+      assert(s.lastBatterScore >= 9,
         "Phase 4 b-65: correct guess pays +4 (5 + 4 = 9)",
-        m.batterDisplay);
+        s.lastBatterScore);
+    },
+  );
+
+  // ---- b-65 Guess Pitch: live preview MUST hide the bonus (no spoilers). ----
+  // The pitcher hand is face-down during selection; computing the bonus from
+  // it and showing it on the BATTER pill effectively answers "did I guess
+  // right?" before the cards flip. Codify the contract: previewMatchup
+  // returns the same value whether the guess hits or misses -- only lockIn
+  // (after the player has committed) folds the bonus in.
+  withReveal(
+    { batterHand: [cardById("b-65")], pitcherHand: [cardById("p-44")] },
+    () => {
+      useGameStore.setState({
+        resolvedChoices: { "b-65": { kind: "shape", shape: "square" } },
+      });
+      const hit = useGameStore.getState().previewMatchup();
+      useGameStore.setState({
+        resolvedChoices: { "b-65": { kind: "shape", shape: "circle" } },
+      });
+      const miss = useGameStore.getState().previewMatchup();
+      assert(hit.batterDisplay === miss.batterDisplay,
+        "Phase 7 b-65: previewMatchup hides guess bonus (hit and miss show same pill)",
+        `hit=${hit.batterDisplay} miss=${miss.batterDisplay}`);
+      assert(hit.batterGuessDelta === 0,
+        "Phase 7 b-65: previewMatchup reports 0 guess delta during selection",
+        hit.batterGuessDelta);
     },
   );
 
@@ -1791,6 +1831,1218 @@ function assertBeat(
       `Phase 6: ${id} is inert without game-state plumbed`,
       result.cardModifiers[id]?.value);
   }
+}
+
+// ---------------------------------------------------------------------------
+// "Switch sides" feature: getUserSide truth table + symmetric scoring.
+// ---------------------------------------------------------------------------
+{
+  // Truth table: HOME bats in the bottom, AWAY bats in the top. Anything
+  // else is the user pitching. Locking this in as a contract test so a
+  // future refactor can't silently flip the mapping.
+  assert(
+    getUserSide({ userTeam: "AWAY", half: "top" }) === "Batting",
+    "switch sides: AWAY in top of inning -> Batting",
+  );
+  assert(
+    getUserSide({ userTeam: "AWAY", half: "bottom" }) === "Pitching",
+    "switch sides: AWAY in bottom of inning -> Pitching",
+  );
+  assert(
+    getUserSide({ userTeam: "HOME", half: "top" }) === "Pitching",
+    "switch sides: HOME in top of inning -> Pitching",
+  );
+  assert(
+    getUserSide({ userTeam: "HOME", half: "bottom" }) === "Batting",
+    "switch sides: HOME in bottom of inning -> Batting",
+  );
+
+  // Run attribution stays driven by `half` (not `userTeam`), even when the
+  // user is on the home team and physically batting in the bottom. We
+  // smoke-test by directly inspecting the store -- a HR by the user with
+  // userTeam=HOME in the bottom of the 1st should still credit HOME.
+  // We can't easily simulate a home-run end-to-end in this script, so
+  // instead assert the lighter property: the store seeds AWAY by default,
+  // and `setUserTeam` flips userTeam without resetting scores.
+  const store = useGameStore.getState();
+  store.reset("AWAY");
+  assert(
+    useGameStore.getState().userTeam === "AWAY",
+    "switch sides: reset('AWAY') sets userTeam=AWAY",
+  );
+  assert(
+    getUserSide(useGameStore.getState()) === "Batting",
+    "switch sides: AWAY at game start (top of 1st) -> Batting",
+  );
+  store.reset("HOME");
+  assert(
+    useGameStore.getState().userTeam === "HOME",
+    "switch sides: reset('HOME') sets userTeam=HOME",
+  );
+  assert(
+    getUserSide(useGameStore.getState()) === "Pitching",
+    "switch sides: HOME at game start (top of 1st) -> Pitching",
+  );
+
+  // setUserTeam flips userTeam mid-game without touching scores / inning.
+  store.reset("AWAY");
+  useGameStore.getState().setUserTeam("HOME");
+  assert(
+    useGameStore.getState().userTeam === "HOME",
+    "switch sides: setUserTeam toggles userTeam in place",
+  );
+  assert(
+    useGameStore.getState().homeScore === 0 &&
+      useGameStore.getState().awayScore === 0,
+    "switch sides: setUserTeam does not clobber scores",
+  );
+
+  // userTeam persists across `reset()` when called with no argument
+  // (so a "rematch" replays as the same team).
+  store.reset("HOME");
+  useGameStore.getState().reset();
+  assert(
+    useGameStore.getState().userTeam === "HOME",
+    "switch sides: reset() with no team preserves prior userTeam",
+  );
+
+  // Restore the default seat so subsequent script suites see the
+  // pre-feature state. (This isn't strictly necessary -- this block
+  // lives at the very bottom of the script -- but it's a cheap safety.)
+  store.reset("AWAY");
+}
+
+// ---------------------------------------------------------------------------
+// User-triggered player choices.
+// ---------------------------------------------------------------------------
+// Verifies the "the modal doesn't auto-open anymore -- the player has to
+// click the per-card USE pill" mechanic. Choices stay queued in
+// `pendingChoices`; `activeChoiceCardId` controls modal visibility and
+// is only set by `triggerChoice`.
+{
+  // Reset to a known seat so the user is batting and any b-Batting choice
+  // we plant matches `getUserSide`.
+  useGameStore.getState().reset("AWAY");
+
+  // Plant a synthetic pending choice on the user's side. We bypass
+  // `derivePendingChoices` (which is tied to whatever was dealt) so the
+  // test is hand-agnostic.
+  useGameStore.setState({
+    pendingChoices: [
+      {
+        cardId: "b-12",
+        side: "Batting",
+        type: "pickShape",
+        options: ["circle", "diamond", "square", "star"],
+        targets: [],
+      },
+    ],
+    activeChoiceCardId: null,
+  });
+
+  const s0 = useGameStore.getState();
+  assert(
+    s0.pendingChoices.length === 1,
+    "trigger-modal: pending choice planted",
+  );
+  assert(
+    s0.activeChoiceCardId === null,
+    "trigger-modal: modal does NOT auto-open from pendingChoices alone",
+  );
+
+  // triggerChoice opens the modal for a known card id.
+  useGameStore.getState().triggerChoice("b-12");
+  assert(
+    useGameStore.getState().activeChoiceCardId === "b-12",
+    "trigger-modal: triggerChoice('b-12') opens the modal",
+  );
+
+  // dismissChoice closes WITHOUT removing the pending choice -- the user
+  // should be able to re-trigger after closing.
+  useGameStore.getState().dismissChoice();
+  const s1 = useGameStore.getState();
+  assert(
+    s1.activeChoiceCardId === null,
+    "trigger-modal: dismissChoice closes modal",
+  );
+  assert(
+    s1.pendingChoices.length === 1 &&
+      s1.pendingChoices[0].cardId === "b-12",
+    "trigger-modal: dismissChoice keeps the choice queued",
+  );
+
+  // Defensive: triggerChoice on a non-pending id is a no-op (no modal opens).
+  useGameStore.getState().triggerChoice("b-99-fake");
+  assert(
+    useGameStore.getState().activeChoiceCardId === null,
+    "trigger-modal: triggerChoice for non-pending id is a no-op",
+  );
+
+  // resolveChoice removes the pendingChoice AND clears the active modal.
+  useGameStore.getState().triggerChoice("b-12");
+  useGameStore.getState().resolveChoice("b-12", { kind: "shape", shape: "circle" });
+  const s2 = useGameStore.getState();
+  assert(
+    s2.activeChoiceCardId === null,
+    "trigger-modal: resolveChoice closes the modal",
+  );
+  assert(
+    s2.pendingChoices.length === 0,
+    "trigger-modal: resolveChoice removes the choice from the queue",
+  );
+
+  // triggerChoice refuses to open an opposite-seat (AI) prompt even if the
+  // caller knows its cardId. Plant an AI-side choice and confirm the modal
+  // stays closed.
+  useGameStore.setState({
+    pendingChoices: [
+      {
+        cardId: "p-56",
+        side: "Pitching",
+        type: "pickShape",
+        options: ["circle", "diamond", "square", "star"],
+        targets: [],
+      },
+    ],
+    activeChoiceCardId: null,
+  });
+  useGameStore.getState().triggerChoice("p-56");
+  assert(
+    useGameStore.getState().activeChoiceCardId === null,
+    "trigger-modal: triggerChoice refuses to open the AI's prompt while user is batting",
+  );
+
+  // Phase change clears the modal even if it was open. Plant + open, then
+  // call lockIn and confirm the modal closes (we don't care about the
+  // resolution outcome here -- only that activeChoiceCardId resets).
+  useGameStore.getState().reset("AWAY");
+  useGameStore.setState({
+    pendingChoices: [
+      {
+        cardId: "b-65",
+        side: "Batting",
+        type: "guessShape",
+        options: ["circle", "diamond", "square", "star"],
+      },
+    ],
+    activeChoiceCardId: "b-65",
+  });
+  assert(
+    useGameStore.getState().activeChoiceCardId === "b-65",
+    "trigger-modal: pre-lockIn modal is open",
+  );
+  useGameStore.getState().lockIn();
+  assert(
+    useGameStore.getState().activeChoiceCardId === null,
+    "trigger-modal: lockIn clears any open modal",
+  );
+
+  // startNextAtBat / reset both clear the active modal as part of their
+  // standard cleanup. Smoke-test by re-planting and calling each.
+  useGameStore.setState({ activeChoiceCardId: "b-65" });
+  useGameStore.getState().startNextAtBat();
+  assert(
+    useGameStore.getState().activeChoiceCardId === null,
+    "trigger-modal: startNextAtBat clears the modal",
+  );
+
+  useGameStore.setState({ activeChoiceCardId: "b-65" });
+  useGameStore.getState().reset();
+  assert(
+    useGameStore.getState().activeChoiceCardId === null,
+    "trigger-modal: reset clears the modal",
+  );
+
+  // Restore seat for downstream callers / future tests.
+  useGameStore.getState().reset("AWAY");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 -- 12 new batters / 36 new signature cards (b-100..b-135).
+//
+// Each card gets at least one focused assertion that proves the effect
+// fires (and gates) per its description. Novel-mechanic cards also get
+// integration coverage through applyHandTransforms / applyResolveStep /
+// scoreHand to confirm the new engine seams light up end-to-end.
+// ---------------------------------------------------------------------------
+{
+  const baseCtx = (
+    overrides: Partial<EffectContext> & { card: CardDefinition; group?: CardDefinition[] },
+  ): EffectContext => ({
+    side: "Batting",
+    hand: overrides.hand ?? [overrides.card],
+    group: overrides.group ?? [overrides.card],
+    indexInGroup: 0,
+    isCombined: (overrides.group ?? [overrides.card]).length > 1,
+    ...overrides,
+  });
+
+  // ---- b-100 Five-Tool Threat ----
+  const b100 = cardById("b-100");
+  // Combined + fastball base -> +5.
+  const e100Hit = applyCardEffect(b100, baseCtx({
+    card: b100,
+    group: [b100, cardById("b-1")],
+    indexInGroup: 0,
+    opponentBaseCard: cardById("p-32"), // tagged fastball
+    isCombined: true,
+  }));
+  assert(e100Hit.selfValueDelta === 5, "b-100: combined vs fastball base -> +5");
+  // Combined but not a fastball -> 0.
+  const e100Miss = applyCardEffect(b100, baseCtx({
+    card: b100,
+    group: [b100, cardById("b-1")],
+    opponentBaseCard: cardById("p-72"), // breaking-ball
+    isCombined: true,
+  }));
+  assert(e100Miss.selfValueDelta === 0, "b-100: combined vs non-fastball -> 0");
+  // Uncombined fastball base -> 0.
+  const e100Solo = applyCardEffect(b100, baseCtx({
+    card: b100,
+    opponentBaseCard: cardById("p-32"),
+  }));
+  assert(e100Solo.selfValueDelta === 0, "b-100: uncombined -> 0 even vs fastball");
+
+  // ---- b-101 MVP Resume ----
+  const b101 = cardById("b-101");
+  // Pitcher hand has 2 veterans (p-86 + p-45) -> +2.
+  const e101 = applyCardEffect(b101, baseCtx({
+    card: b101,
+    opponentHand: [cardById("p-86"), cardById("p-45"), cardById("p-71")],
+  }));
+  assert(e101.selfValueDelta === 2, "b-101: +1 per veteran in pitcher hand");
+  const e101Zero = applyCardEffect(b101, baseCtx({
+    card: b101,
+    opponentHand: [cardById("p-71")],
+  }));
+  assert(e101Zero.selfValueDelta === 0, "b-101: zero veterans -> 0");
+
+  // ---- b-102 Halo Bomb ----
+  // Combine constraint enforced by canConnect, not the effect. Effect noops.
+  const e102 = applyCardEffect(cardById("b-102"), baseCtx({ card: cardById("b-102") }));
+  assert(e102.selfValueDelta === 0, "b-102: per-card effect is a no-op");
+  assert(
+    cardById("b-102").combineConstraint?.rightNoCombine === true,
+    "b-102: combineConstraint declares rightNoCombine",
+  );
+
+  // ---- b-103 1B Smooth ----
+  const b103 = cardById("b-103"); // diamond/diamond, +2 own
+  const e103 = applyCardEffect(b103, baseCtx({
+    card: b103,
+    hand: [b103, cardById("b-16")], // b-16 left=square right=diamond -> +1
+    opponentHand: [cardById("p-72")], // circle/diamond -> +1
+  }));
+  // own diamonds: 2 (both sides of b-103) + 1 (b-16 right) = 3; opp diamonds: 1.
+  assert(e103.selfValueDelta === 4, "b-103: +1 per DIAMOND on the board (own+opp)");
+
+  // ---- b-104 Calm at the Plate ----
+  const b104 = cardById("b-104");
+  assert(
+    applyCardEffect(b104, baseCtx({ card: b104, outs: 0 })).selfValueDelta === 3,
+    "b-104: 0 outs -> +3",
+  );
+  assert(
+    applyCardEffect(b104, baseCtx({ card: b104, outs: 1 })).selfValueDelta === 0,
+    "b-104: 1 out -> 0",
+  );
+
+  // ---- b-105 Atlanta-LA Ring -- silences pitcher base mechanic ----
+  // Wired through ScoringContext.nullifyOpponentBaseMechanic on the pitcher
+  // pass. Use p-45 (Game Over, +5 in final inning, baseValue 5) solo so
+  // it's the highest in its own hand and the silencing flag targets it.
+  const ringPitcher = [cardById("p-45")];
+  const ringResultOff = scoreHand(ringPitcher, {
+    side: "Pitching",
+    isFinalInning: true,
+    nullifyOpponentBaseMechanic: false,
+  });
+  const ringResultOn = scoreHand(ringPitcher, {
+    side: "Pitching",
+    isFinalInning: true,
+    nullifyOpponentBaseMechanic: true,
+  });
+  assert(
+    ringResultOff.maxValue === 10,
+    "b-105 precondition: p-45 fires +5 in final inning",
+    { off: ringResultOff.maxValue },
+  );
+  assert(
+    ringResultOn.maxValue === 5,
+    "b-105: silencing pitcher base zeroes the per-card ability (5 + 0)",
+    { on: ringResultOn.maxValue },
+  );
+
+  // ---- b-106 Cuban Crusher ----
+  const b106 = cardById("b-106"); // base 9
+  const e106Solo = applyCardEffect(b106, baseCtx({ card: b106 }));
+  assert(e106Solo.selfValueDelta === 0, "b-106: uncombined -> 0");
+  const e106Combo = applyCardEffect(b106, baseCtx({
+    card: b106,
+    group: [b106, cardById("b-1")],
+    indexInGroup: 0,
+    isCombined: true,
+  }));
+  assert(e106Combo.selfValueDelta === 14 - 9, "b-106: combined -> base becomes 14");
+
+  // ---- b-107 Crawford Boxes ----
+  const b107 = cardById("b-107");
+  const e107 = applyCardEffect(b107, baseCtx({
+    card: b107,
+    hand: [b107, cardById("b-1"), cardById("b-29")], // 2 other power-hitters
+  }));
+  assert(e107.selfValueDelta === 4, "b-107: +2 per OTHER power-hitter (2 others -> +4)");
+
+  // ---- b-108 DH Threat -- silences off-speed pitcher cards ----
+  const dhPitcher = [cardById("p-73"), cardById("p-71")]; // p-73 is off-speed
+  // p-73 normally fires +3 if combined w/ a fastball -- isolate it solo to
+  // verify its own self-delta zeroes via scoring path. Combine with fastball
+  // p-71 next to it.
+  const dhCtx: ScoringContext = {
+    side: "Pitching",
+    nullifyOpponentTagMechanics: ["off-speed"],
+  };
+  const dhOnResult = scoreHand(dhPitcher, dhCtx);
+  const dhOffResult = scoreHand(dhPitcher, { side: "Pitching" });
+  assert(
+    dhOnResult.maxValue <= dhOffResult.maxValue,
+    "b-108: silencing off-speed never raises pitcher total",
+    { on: dhOnResult.maxValue, off: dhOffResult.maxValue },
+  );
+
+  // ---- b-109 World Series MVP ----
+  const b109 = cardById("b-109");
+  assert(
+    applyCardEffect(b109, baseCtx({ card: b109, inning: 4 })).selfValueDelta === 3,
+    "b-109: 4th inning -> +3",
+  );
+  assert(
+    applyCardEffect(b109, baseCtx({ card: b109, inning: 3 })).selfValueDelta === 0,
+    "b-109: 3rd inning -> 0",
+  );
+
+  // ---- b-110 Smooth Stroke ----
+  const b110 = cardById("b-110");
+  const stroke = applyCardEffect(b110, baseCtx({
+    card: b110,
+    group: [cardById("b-1"), b110],
+    indexInGroup: 1, // not the leftmost
+    isCombined: true,
+  }));
+  assert(stroke.selfValueDelta === 4, "b-110: combined on the LEFT -> +4");
+  const strokeRight = applyCardEffect(b110, baseCtx({
+    card: b110,
+    group: [b110, cardById("b-1")],
+    indexInGroup: 0, // leftmost
+    isCombined: true,
+  }));
+  assert(strokeRight.selfValueDelta === 0, "b-110: leftmost combine -> 0");
+
+  // ---- b-111 October Hero ----
+  const b111 = cardById("b-111");
+  // Tied score (homeScore=awayScore=0) -> +5.
+  assert(
+    applyCardEffect(b111, baseCtx({ card: b111, half: "top", homeScore: 0, awayScore: 0 }))
+      .selfValueDelta === 5,
+    "b-111: tied score -> +5",
+  );
+  // Batter trailing -> 0.
+  assert(
+    applyCardEffect(b111, baseCtx({ card: b111, half: "top", homeScore: 5, awayScore: 0 }))
+      .selfValueDelta === 0,
+    "b-111: not tied -> 0",
+  );
+
+  // ---- b-112 Switch Slasher ----
+  const b112 = cardById("b-112"); // circle/diamond
+  // Hand: b-112 (circle, diamond) + opp p-71 (square, square) -> 3 unique.
+  const e112 = applyCardEffect(b112, baseCtx({
+    card: b112,
+    hand: [b112],
+    opponentHand: [cardById("p-71")], // square/square -> adds square
+  }));
+  assert(e112.selfValueDelta === 6, "b-112: 3 unique shapes -> +6 (capped)");
+  // Cap at +6 even when board has 4 unique shapes.
+  const fakeStar: CardDefinition = { ...cardById("b-1"), id: "test-b112-star", leftShape: "star", rightShape: "star" };
+  const e112Cap = applyCardEffect(b112, baseCtx({
+    card: b112,
+    hand: [b112, fakeStar],
+    opponentHand: [cardById("p-71")], // adds square -> 4 unique board-wide
+  }));
+  assert(e112Cap.selfValueDelta === 6, "b-112: cap +6 even with 4 unique shapes");
+
+  // ---- b-113 Cleveland Cutter ----
+  const b113 = cardById("b-113"); // square/circle
+  // Hand of 2 chaining cards: b-113(square/circle) + b-118(circle/circle).
+  // b-113.right=circle, b-118.left=circle -> connect. 2 combined cards.
+  const cutterHand = [b113, cardById("b-118")];
+  const e113 = applyCardEffect(b113, baseCtx({
+    card: b113,
+    hand: cutterHand,
+    group: cutterHand,
+    indexInGroup: 0,
+    isCombined: true,
+  }));
+  assert(e113.selfValueDelta === 2, "b-113: +1 per combined card (2 combined -> +2)");
+
+  // ---- b-114 30-30 Threat ----
+  const b114 = cardById("b-114");
+  const e114Hit = applyCardEffect(b114, baseCtx({
+    card: b114,
+    hand: [b114, cardById("b-118"), cardById("b-1")], // b-118 speedster, b-1 power-hitter
+  }));
+  assert(e114Hit.selfValueDelta === 3, "b-114: another speedster + power-hitter -> +3");
+  const e114Miss = applyCardEffect(b114, baseCtx({
+    card: b114,
+    hand: [b114, cardById("b-118")], // missing power-hitter
+  }));
+  assert(e114Miss.selfValueDelta === 0, "b-114: missing tag -> 0");
+
+  // ---- b-115 Polar Power ----
+  const b115 = cardById("b-115"); // square/star
+  const e115 = applyCardEffect(b115, baseCtx({
+    card: b115,
+    hand: [b115], // 1 star
+    opponentHand: [cardById("p-32")], // square/square -> 0 stars
+  }));
+  // star count: own 1 + opp 0 = 1 -> +1.
+  assert(e115.selfValueDelta === 1, "b-115: +1 per star on the board");
+
+  // ---- b-116 HR Derby Champ ----
+  const b116 = cardById("b-116");
+  assert(
+    applyCardEffect(b116, baseCtx({
+      card: b116,
+      group: [b116, cardById("b-1")],
+      isCombined: true,
+    })).hitScaleBonus === 3,
+    "b-116: combined -> +3 Hit Scale",
+  );
+  assert(
+    applyCardEffect(b116, baseCtx({ card: b116 })).hitScaleBonus === 0,
+    "b-116: uncombined -> 0",
+  );
+
+  // ---- b-117 Citi Bomb ----
+  const b117 = cardById("b-117");
+  const e117 = applyCardEffect(b117, baseCtx({
+    card: b117,
+    group: [b117, cardById("b-1")],
+    isCombined: true,
+  }));
+  assert(
+    e117.selfValueDelta === 2 && e117.hitScaleBonus === 2,
+    "b-117: combined -> +2 Value AND +2 Hit Scale",
+  );
+
+  // ---- b-118 Track Star ----
+  const b118 = cardById("b-118");
+  // Single-card hand, no combinations possible -> +5.
+  assert(
+    applyCardEffect(b118, baseCtx({ card: b118 })).selfValueDelta === 5,
+    "b-118: no combinations -> +5",
+  );
+
+  // ---- b-119 Quick Bat -- hand-transform debuffs pitcher generals ----
+  // Per-card hook stays no-op; transform layer does the work.
+  assert(
+    applyCardEffect(cardById("b-119"), baseCtx({ card: cardById("b-119") })).selfValueDelta === 0,
+    "b-119: per-card hook is a no-op",
+  );
+
+  // ---- b-120 Steal Home -- resolveStep ----
+  assert(
+    applyCardEffect(cardById("b-120"), baseCtx({ card: cardById("b-120") })).selfValueDelta === 0,
+    "b-120: per-card hook is a no-op (resolveStep handles it)",
+  );
+
+  // ---- b-121 Catcher's Eye -- info reveal ----
+  assert(
+    applyCardEffect(cardById("b-121"), baseCtx({ card: cardById("b-121") })).selfValueDelta === 0,
+    "b-121: per-card hook is a no-op (reveal handles it)",
+  );
+
+  // ---- b-122 Pitch Caller ----
+  const b122 = cardById("b-122");
+  assert(
+    applyCardEffect(b122, baseCtx({ card: b122, opponentBaseCard: cardById("p-72") })) // breaking-ball
+      .selfValueDelta === 5,
+    "b-122: breaking-ball base -> +5",
+  );
+  assert(
+    applyCardEffect(b122, baseCtx({ card: b122, opponentBaseCard: cardById("p-71") })) // fastball
+      .selfValueDelta === 0,
+    "b-122: non-breaking-ball -> 0",
+  );
+
+  // ---- b-123 Future Captain ----
+  const b123 = cardById("b-123");
+  // Hand of 5 -> +1 per other = +4.
+  const e123 = applyCardEffect(b123, baseCtx({
+    card: b123,
+    hand: [b123, cardById("b-1"), cardById("b-2"), cardById("b-3"), cardById("b-4")],
+  }));
+  assert(e123.selfValueDelta === 4, "b-123: 4 other cards in hand -> +4 attribution");
+
+  // ---- b-124 Carita's Cannon ----
+  const b124 = cardById("b-124");
+  // Interior of 3-card group -> +6.
+  assert(
+    applyCardEffect(b124, baseCtx({
+      card: b124,
+      group: [cardById("b-1"), b124, cardById("b-3")],
+      indexInGroup: 1,
+      isCombined: true,
+    })).selfValueDelta === 6,
+    "b-124: combined on BOTH sides -> +6",
+  );
+  // Edge of group -> 0.
+  assert(
+    applyCardEffect(b124, baseCtx({
+      card: b124,
+      group: [b124, cardById("b-1")],
+      indexInGroup: 0,
+      isCombined: true,
+    })).selfValueDelta === 0,
+    "b-124: only one side combined -> 0",
+  );
+
+  // ---- b-125 Green Monster -- hand-transform ----
+  assert(
+    applyCardEffect(cardById("b-125"), baseCtx({ card: cardById("b-125") })).selfValueDelta === 0,
+    "b-125: per-card hook is a no-op (transform handles it)",
+  );
+
+  // ---- b-126 Lefty Mash ----
+  // Reads pitcherHandedness from the ScoringContext (the gameStore plumbs it
+  // through from the active MlbPlayer record, since handedness lives on the
+  // player not the card).
+  const b126 = cardById("b-126");
+  assert(
+    applyCardEffect(b126, baseCtx({ card: b126, pitcherHandedness: "R" })).selfValueDelta === 3,
+    "b-126: vs right-handed pitcher -> +3",
+  );
+  assert(
+    applyCardEffect(b126, baseCtx({ card: b126, pitcherHandedness: "L" })).selfValueDelta === 0,
+    "b-126: vs lefty pitcher -> 0",
+  );
+  assert(
+    applyCardEffect(b126, baseCtx({ card: b126 })).selfValueDelta === 0,
+    "b-126: missing handedness -> 0",
+  );
+
+  // ---- b-127 Mr. Smile -- per-card hook is a no-op (silencing in store) ----
+  assert(
+    applyCardEffect(cardById("b-127"), baseCtx({ card: cardById("b-127") })).selfValueDelta === 0,
+    "b-127: per-card hook is a no-op (gameStore handles silencing)",
+  );
+
+  // ---- b-128 Switch-Cap ----
+  const b128 = cardById("b-128");
+  const sale = ALL_CARDS.find((c) => c.tags?.includes("lefty") && c.type === "Pitching");
+  if (sale) {
+    const e128 = applyCardEffect(b128, baseCtx({
+      card: b128,
+      opponentHand: [sale],
+    }));
+    assert(
+      e128.selfValueDelta === 2 && e128.hitScaleBonus === 2,
+      "b-128: vs lefty pitcher -> +2 Value AND +2 Hit Scale",
+    );
+  }
+  // No lefty in opponent hand -> nothing.
+  const e128Miss = applyCardEffect(b128, baseCtx({
+    card: b128,
+    opponentHand: [cardById("p-32")],
+  }));
+  assert(
+    e128Miss.selfValueDelta === 0 && e128Miss.hitScaleBonus === 0,
+    "b-128: no lefty in pitcher hand -> 0",
+  );
+
+  // ---- b-129 Captain Lindor ----
+  const b129 = cardById("b-129"); // circle/square
+  // Build a hand where every adjacent pair fails canConnect:
+  //   b-129(circle/square) -> b-13(diamond/diamond): square vs diamond -> no
+  //   b-13(diamond/diamond) -> b-1(square/diamond):  diamond vs square -> no
+  // All three are uncombined. b-129 excludes itself -> +2.
+  const lindorHand = [b129, cardById("b-13"), cardById("b-1")];
+  const e129 = applyCardEffect(b129, baseCtx({
+    card: b129,
+    hand: lindorHand,
+  }));
+  assert(
+    e129.selfValueDelta === 2,
+    "b-129: 2 other uncombined cards -> +2",
+    { delta: e129.selfValueDelta },
+  );
+
+  // ---- b-130 Postseason Tuve ----
+  const b130 = cardById("b-130");
+  // half=top -> away batting. away losing means home > away.
+  assert(
+    applyCardEffect(b130, baseCtx({ card: b130, half: "top", homeScore: 5, awayScore: 0 }))
+      .selfValueDelta === 5,
+    "b-130: losing -> +5",
+  );
+  assert(
+    applyCardEffect(b130, baseCtx({ card: b130, half: "top", homeScore: 0, awayScore: 0 }))
+      .selfValueDelta === 5,
+    "b-130: tied -> +5",
+  );
+  assert(
+    applyCardEffect(b130, baseCtx({ card: b130, half: "top", homeScore: 0, awayScore: 5 }))
+      .selfValueDelta === 0,
+    "b-130: leading -> 0",
+  );
+
+  // ---- b-131 Tiny Terror ----
+  const b131 = cardById("b-131");
+  // Need 2+ other clutch cards. Use b-65 / b-71 (both clutch).
+  const e131 = applyCardEffect(b131, baseCtx({
+    card: b131,
+    hand: [b131, cardById("b-65"), cardById("b-71")],
+  }));
+  assert(e131.selfValueDelta === 3, "b-131: 2 other clutch -> +3");
+  const e131Miss = applyCardEffect(b131, baseCtx({
+    card: b131,
+    hand: [b131, cardById("b-65")], // only 1 other clutch
+  }));
+  assert(e131Miss.selfValueDelta === 0, "b-131: 1 other clutch -> 0");
+
+  // ---- b-132 Champion's Heart ----
+  const b132 = cardById("b-132");
+  // half=top -> batter is AWAY. AWAY scored 4 runs so far.
+  assert(
+    applyCardEffect(b132, baseCtx({ card: b132, half: "top", homeScore: 1, awayScore: 4 }))
+      .selfValueDelta === 4,
+    "b-132: +1 per batter-team run scored this game",
+  );
+  // half=bottom -> batter is HOME. HOME scored 7 runs.
+  assert(
+    applyCardEffect(b132, baseCtx({ card: b132, half: "bottom", homeScore: 7, awayScore: 2 }))
+      .selfValueDelta === 7,
+    "b-132: switches to home runs in bottom of inning",
+  );
+
+  // ---- b-133 Jazz Hands -- hand-transform ----
+  assert(
+    applyCardEffect(cardById("b-133"), baseCtx({ card: cardById("b-133") })).selfValueDelta === 0,
+    "b-133: per-card hook is a no-op (transform handles it)",
+  );
+
+  // ---- b-134 Bronx Hustle ----
+  const b134 = cardById("b-134");
+  assert(
+    applyCardEffect(b134, baseCtx({ card: b134 })).hitScaleBonus === 5,
+    "b-134: uncombined -> +5 Hit Scale",
+  );
+  assert(
+    applyCardEffect(b134, baseCtx({
+      card: b134,
+      group: [b134, cardById("b-1")],
+      isCombined: true,
+    })).hitScaleBonus === 0,
+    "b-134: combined -> 0 (description gates on uncombined)",
+  );
+
+  // ---- b-135 Stolen Bag -- resolveStep ----
+  assert(
+    applyCardEffect(cardById("b-135"), baseCtx({ card: cardById("b-135") })).selfValueDelta === 0,
+    "b-135: per-card hook is a no-op (resolveStep handles it)",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 -- hand-transform integration tests (b-119, b-125, b-133).
+// ---------------------------------------------------------------------------
+{
+  // ---- b-119 Quick Bat: -2 to every pitcher General card ----
+  const t119 = applyHandTransforms(
+    [cardById("b-119")],
+    [cardById("p-71"), cardById("p-72"), cardById("p-31")], // p-71/72 are generals; p-31 is sig
+  );
+  const p71After = t119.pitcherHand.find((c) => c.id === "p-71")!;
+  const p72After = t119.pitcherHand.find((c) => c.id === "p-72")!;
+  const p31After = t119.pitcherHand.find((c) => c.id === "p-31")!;
+  assert(
+    p71After.baseValue === Math.max(0, cardById("p-71").baseValue - 2),
+    "b-119 transform: p-71 baseValue -2",
+    { before: cardById("p-71").baseValue, after: p71After.baseValue },
+  );
+  assert(
+    p72After.baseValue === Math.max(0, cardById("p-72").baseValue - 2),
+    "b-119 transform: p-72 baseValue -2",
+  );
+  assert(
+    p31After.baseValue === cardById("p-31").baseValue,
+    "b-119 transform: signature card untouched",
+  );
+
+  // ---- b-125 Green Monster: own DIAMONDs become wildcards ----
+  // b-125 itself is square/diamond; b-16 is circle/diamond. After the
+  // transform the diamond slots flip to wildcard while non-diamond slots
+  // are preserved.
+  const t125 = applyHandTransforms(
+    [cardById("b-125"), cardById("b-16")],
+    [cardById("p-71")],
+  );
+  const b125After = t125.batterHand.find((c) => c.id === "b-125")!;
+  const b16After = t125.batterHand.find((c) => c.id === "b-16")!;
+  assert(b125After.rightShape === "wildcard", "b-125 transform: own diamond -> wildcard");
+  assert(b125After.leftShape === "square", "b-125 transform: own non-diamond left preserved");
+  assert(b16After.rightShape === "wildcard", "b-125 transform: other card's diamond also flipped");
+  assert(b16After.leftShape === "circle", "b-125 transform: other card's non-diamond preserved");
+
+  // ---- b-133 Jazz Hands: conditional dual-wildcard when uncombined ----
+  // b-133 is star/diamond. Surround with cards that don't allow combine.
+  const isolatedNeighbor: CardDefinition = {
+    ...cardById("b-1"),
+    id: "test-iso",
+    name: "Test Iso",
+    leftShape: "circle",
+    rightShape: "circle",
+  };
+  const isolatedNeighbor2: CardDefinition = {
+    ...cardById("b-1"),
+    id: "test-iso2",
+    name: "Test Iso2",
+    leftShape: "circle",
+    rightShape: "square",
+  };
+  const t133Iso = applyHandTransforms(
+    [isolatedNeighbor, cardById("b-133"), isolatedNeighbor2],
+    [cardById("p-71")],
+  );
+  const b133Iso = t133Iso.batterHand.find((c) => c.id === "b-133")!;
+  assert(
+    b133Iso.leftShape === "wildcard" && b133Iso.rightShape === "wildcard",
+    "b-133 transform: uncombined neighbors -> dual wildcard",
+    { left: b133Iso.leftShape, right: b133Iso.rightShape },
+  );
+
+  // b-133 already adjacent to a connectable neighbor (left=star/star).
+  const matchingNeighbor: CardDefinition = {
+    ...cardById("b-1"),
+    id: "test-star",
+    name: "Test Star",
+    leftShape: "star",
+    rightShape: "star",
+  };
+  const t133Match = applyHandTransforms(
+    [matchingNeighbor, cardById("b-133")],
+    [cardById("p-71")],
+  );
+  const b133Match = t133Match.batterHand.find((c) => c.id === "b-133")!;
+  assert(
+    b133Match.leftShape === "star" && b133Match.rightShape === "diamond",
+    "b-133 transform: already-combinable -> shapes preserved",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 -- resolveStep integration (b-120, b-135).
+// ---------------------------------------------------------------------------
+{
+  const blank: ScoringResult = {
+    groups: [],
+    bestGroup: [],
+    maxValue: 0,
+    opponentModifier: 0,
+    cardModifiers: {},
+    targetedOpponentDebuffs: [],
+    hitScaleBonus: 0,
+    pitcherWinsTies: false,
+    pitcherCombinedDelta: 0,
+    log: [],
+  };
+
+  // ---- b-120 Steal Home: combined + win -> runnerAdvanceBoost = 1 ----
+  const stealCombined: ScoringResult = {
+    ...blank,
+    bestGroup: [cardById("b-120"), cardById("b-1")],
+  };
+  const r120Hit = applyResolveStep({
+    batterHand: [cardById("b-120"), cardById("b-1")],
+    pitcherHand: [],
+    bases: [true, false, false],
+    batterResult: stealCombined,
+    pitcherResult: blank,
+    batterTotal: 12,
+    pitcherTotal: 8,
+    batterWins: true,
+  });
+  assert(r120Hit.runnerAdvanceBoost === 1, "b-120: combined + win -> +1 runner advance");
+  // Solo (uncombined) -> no boost.
+  const stealSolo: ScoringResult = { ...blank, bestGroup: [cardById("b-120")] };
+  const r120Solo = applyResolveStep({
+    batterHand: [cardById("b-120")],
+    pitcherHand: [],
+    bases: [true, false, false],
+    batterResult: stealSolo,
+    pitcherResult: blank,
+    batterTotal: 7,
+    pitcherTotal: 4,
+    batterWins: true,
+  });
+  assert(r120Solo.runnerAdvanceBoost === 0, "b-120: uncombined -> no boost");
+  // Combined but loss -> no boost.
+  const r120Loss = applyResolveStep({
+    batterHand: [cardById("b-120"), cardById("b-1")],
+    pitcherHand: [],
+    bases: [true, false, false],
+    batterResult: stealCombined,
+    pitcherResult: blank,
+    batterTotal: 4,
+    pitcherTotal: 12,
+    batterWins: false,
+  });
+  assert(r120Loss.runnerAdvanceBoost === 0, "b-120: loss -> no boost");
+
+  // ---- b-135 Stolen Bag: any win -> extra runner on 1B ----
+  const r135Win = applyResolveStep({
+    batterHand: [cardById("b-135")],
+    pitcherHand: [],
+    bases: [false, false, false],
+    batterResult: blank,
+    pitcherResult: blank,
+    batterTotal: 8,
+    pitcherTotal: 5,
+    batterWins: true,
+  });
+  assert(r135Win.extraRunnerOn === "first", "b-135: win -> extra runner on 1st");
+  const r135Loss = applyResolveStep({
+    batterHand: [cardById("b-135")],
+    pitcherHand: [],
+    bases: [false, false, false],
+    batterResult: blank,
+    pitcherResult: blank,
+    batterTotal: 4,
+    pitcherTotal: 7,
+    batterWins: false,
+  });
+  assert(r135Loss.extraRunnerOn === null, "b-135: loss -> no extra runner");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 -- reveal derivation (b-121).
+// ---------------------------------------------------------------------------
+{
+  const reveals = derivePendingReveals(
+    [cardById("b-121"), cardById("b-1")],
+    [cardById("p-31"), cardById("p-71")],
+  );
+  const sigShapes = reveals.find((r) => r.reveal === "signatureShapes");
+  assert(!!sigShapes, "b-121: derives a signatureShapes reveal");
+  assert(sigShapes?.forSide === "Batting", "b-121: reveal is for batter side");
+  assert(sigShapes?.source === "Catcher's Eye", "b-121: reveal source labelled Catcher's Eye");
+
+  // No b-121 -> no signatureShapes reveal.
+  const noReveal = derivePendingReveals(
+    [cardById("b-1")],
+    [cardById("p-31")],
+  );
+  assert(
+    !noReveal.some((r) => r.reveal === "signatureShapes"),
+    "no b-121 -> no signatureShapes reveal",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Draft -- pre-game auction.
+// ---------------------------------------------------------------------------
+import {
+  initDraftState,
+  nominate,
+  placeBid,
+  passBid,
+  aiNominate,
+  aiBidDecision,
+  aiBidAmount,
+  playerTier,
+  playerSignatureValue,
+  maxAffordableBid,
+  totalSlotsRemaining,
+  canSideBid,
+  forceFillIfBroke,
+  isDraftComplete,
+  rosterTagDistribution,
+  teamIdentityHeadline,
+  makeRng,
+  STARTING_BUDGET,
+  DEFAULT_REQUIREMENTS,
+  type DraftSide,
+  type DraftState,
+} from "./draft";
+import { BATTERS, PITCHERS, PLAYERS } from "./players";
+
+{
+  // ---- maxAffordableBid: safety reserve ----
+  assert(maxAffordableBid(100, 10) === 91, "maxAffordableBid: $100 / 10 slots = $91");
+  assert(maxAffordableBid(100, 1) === 100, "maxAffordableBid: $100 / 1 slot = $100");
+  assert(maxAffordableBid(5, 5) === 1, "maxAffordableBid: $5 / 5 slots = $1");
+  assert(maxAffordableBid(4, 5) === 0, "maxAffordableBid: $4 / 5 slots = $0 (insolvent)");
+  assert(maxAffordableBid(0, 3) === 0, "maxAffordableBid: $0 / any slots = $0");
+
+  // ---- playerTier covers the spectrum ----
+  const judge = PLAYERS.find((p) => p.id === "judge")!;
+  const tj = playerTier(judge);
+  assert(tj === "ELITE" || tj === "STAR", `playerTier(judge) is ELITE or STAR, got ${tj}`);
+  // Every player should resolve to a valid tier; collectively the pool spans tiers.
+  const tiers = new Set(PLAYERS.map((p) => playerTier(p)));
+  assert(tiers.size >= 2, "playerTier: pool spans at least 2 tiers");
+  for (const p of PLAYERS) {
+    const t = playerTier(p);
+    assert(
+      t === "ELITE" || t === "STAR" || t === "SOLID" || t === "FILLER",
+      `playerTier returns valid tier for ${p.id}`,
+    );
+  }
+
+  // ---- initDraftState ----
+  const init = initDraftState(12345);
+  assert(init.phase === "nominating", "initDraftState: starts in nominating phase");
+  assert(init.nominator === "user", "initDraftState: user nominates first");
+  assert(init.budget.user === STARTING_BUDGET, "initDraftState: user budget = STARTING_BUDGET");
+  assert(init.budget.ai === STARTING_BUDGET, "initDraftState: ai budget = STARTING_BUDGET");
+  assert(
+    init.pool.length === BATTERS.length + PITCHERS.length,
+    "initDraftState: pool = full BATTERS + PITCHERS",
+  );
+  assert(init.roster.user.batters.length === 0, "initDraftState: user has no batters yet");
+  assert(init.roster.ai.pitchers.length === 0, "initDraftState: ai has no pitchers yet");
+  assert(init.requirements.batters === 7, "initDraftState: batter requirement = 7");
+  assert(init.requirements.pitchers === 3, "initDraftState: pitcher requirement = 3");
+  assert(init.activeAuction === null, "initDraftState: no active auction");
+  assert(
+    ["POWER", "SPEED", "CLUTCH", "VETERAN"].includes(init.aiArchetype),
+    "initDraftState: aiArchetype is one of the four",
+  );
+  // Same seed -> same archetype.
+  const initB = initDraftState(12345);
+  assert(initB.aiArchetype === init.aiArchetype, "initDraftState: deterministic from seed");
+
+  // ---- nominate: opens auction with nominator as high bidder ----
+  const afterNom = nominate(init, "judge", "user");
+  assert(afterNom.phase === "bidding", "nominate: transitions to bidding");
+  assert(afterNom.activeAuction?.player.id === "judge", "nominate: auction holds nominee");
+  assert(afterNom.activeAuction?.nominator === "user", "nominate: nominator = user");
+  assert(afterNom.activeAuction?.highBidder === "user", "nominate: nominator opens as high bidder");
+  assert(afterNom.activeAuction?.currentBid === 1, "nominate: opens at $1");
+
+  // Wrong-side nominator no-ops.
+  const wrongSide = nominate(init, "judge", "ai");
+  assert(wrongSide === init, "nominate: wrong-side caller is a no-op");
+
+  // ---- placeBid: AI raises ----
+  const aiBid = placeBid(afterNom, "ai", 5);
+  assert(aiBid.activeAuction?.currentBid === 5, "placeBid: currentBid updates");
+  assert(aiBid.activeAuction?.highBidder === "ai", "placeBid: highBidder switches");
+  // User's pass status (if any) cleared so they get a fresh chance.
+  assert(aiBid.activeAuction?.passed.user === false, "placeBid: clears the other side's pass");
+
+  // Bidding against yourself is rejected.
+  const selfBid = placeBid(afterNom, "user", 10);
+  assert(selfBid === afterNom, "placeBid: high bidder cannot raise themselves");
+
+  // Bid not greater than current bid is rejected.
+  const tooLow = placeBid(aiBid, "user", 5);
+  assert(tooLow === aiBid, "placeBid: must exceed currentBid");
+
+  // Bid above maxAffordable is rejected. User has $100 / 10 slots = $91 max.
+  const tooHigh = placeBid(aiBid, "user", 95);
+  assert(tooHigh === aiBid, "placeBid: cannot exceed maxAffordableBid");
+
+  // ---- passBid: non-leader passing awards to leader ----
+  const userPass = passBid(afterNom, "ai");
+  assert(userPass.activeAuction === null, "passBid: non-leader pass clears auction");
+  assert(userPass.phase === "nominating", "passBid: post-award returns to nominating");
+  assert(userPass.roster.user.batters.length === 1, "passBid: nominator wins their nominee");
+  assert(
+    userPass.roster.user.batters[0].id === "judge",
+    "passBid: winner gets the nominated player",
+  );
+  assert(userPass.budget.user === STARTING_BUDGET - 1, "passBid: winner pays $1");
+  assert(userPass.nominator === "ai", "passBid: nomination alternates after award");
+  assert(userPass.log.length === 1 && userPass.log[0].reason === "auction", "passBid: logged as auction");
+
+  // ---- canSideBid: role full -> false ----
+  let s: DraftState = init;
+  // Stuff user with 7 batters from the pool.
+  for (let i = 0; i < 7; i++) {
+    const b = s.pool.find((p) => p.role === "Batter")!;
+    s = nominate(s, b.id, "user");
+    s = passBid(s, "ai"); // ai passes -> user wins at $1
+    // Skip ai's nomination turn for setup
+    if (s.nominator === "ai" && s.phase === "nominating") {
+      // Force AI to drop a pick, since we just want to test canSideBid.
+      const aiNom = aiNominate(s);
+      if (aiNom) {
+        s = nominate(s, aiNom.id, "ai");
+        s = passBid(s, "user");
+      }
+    }
+  }
+  assert(
+    s.roster.user.batters.length === 7,
+    "setup: user filled 7 batters",
+  );
+  // User's role for batters is now full.
+  const remainingBatter = s.pool.find((p) => p.role === "Batter");
+  if (remainingBatter) {
+    assert(
+      !canSideBid(s, "user", remainingBatter),
+      "canSideBid: user can't bid on batter when batter slots are full",
+    );
+  }
+
+  // ---- AI bid: passes when high bidder ----
+  const auctionAiHigh: DraftState = {
+    ...init,
+    activeAuction: {
+      player: BATTERS[0],
+      nominator: "ai",
+      currentBid: 5,
+      highBidder: "ai",
+      passed: { user: false, ai: false },
+    },
+    phase: "bidding",
+  };
+  assert(
+    aiBidDecision(auctionAiHigh) === "pass",
+    "aiBidDecision: AI never bids against itself",
+  );
+
+  // AI bid amount is currentBid + 1.
+  const auctionUserHigh: DraftState = {
+    ...init,
+    activeAuction: {
+      player: BATTERS[0],
+      nominator: "user",
+      currentBid: 7,
+      highBidder: "user",
+      passed: { user: false, ai: false },
+    },
+    phase: "bidding",
+  };
+  assert(aiBidAmount(auctionUserHigh) === 8, "aiBidAmount: raises by $1");
+
+  // ---- forceFillIfBroke: side with $1 budget and 10 slots gets force-filled ----
+  const broke: DraftState = {
+    ...init,
+    budget: { user: 1, ai: STARTING_BUDGET },
+  };
+  const filled = forceFillIfBroke(broke);
+  assert(
+    totalSlotsRemaining(filled.roster.user, filled.requirements) === 0,
+    "forceFillIfBroke: user filled all slots when broke",
+  );
+  assert(
+    filled.roster.user.batters.length === 7 && filled.roster.user.pitchers.length === 3,
+    "forceFillIfBroke: respects role requirements",
+  );
+  assert(
+    filled.log.every((e) => e.winner !== "user" || e.reason === "forced-fill"),
+    "forceFillIfBroke: every user pick logged as forced-fill",
+  );
+  assert(filled.budget.user === 0, "forceFillIfBroke: budget bottoms out at $0");
+
+  // forceFillIfBroke is a no-op when both sides solvent.
+  const solvent = forceFillIfBroke(init);
+  assert(solvent === init, "forceFillIfBroke: no-op when solvent");
+}
+
+// E2E: deterministic draft completes with valid rosters.
+{
+  let s = initDraftState(98765);
+  const pickerRng = makeRng(42);
+  let iters = 0;
+  const HARD_CAP = 500;
+  while (s.phase !== "complete" && iters < HARD_CAP) {
+    iters++;
+    if (s.phase === "nominating") {
+      const nom = aiNominate(s, pickerRng);
+      assert(nom !== null, `e2e: nominee found at iter ${iters} (nominator=${s.nominator})`);
+      if (!nom) break;
+      s = nominate(s, nom.id, s.nominator);
+      continue;
+    }
+    if (s.phase === "bidding" && s.activeAuction) {
+      const auction = s.activeAuction;
+      const challenger: DraftSide = auction.highBidder === "user" ? "ai" : "user";
+      // Give both sides an "AI-style" bidder for the simulation.
+      const slots = totalSlotsRemaining(s.roster[challenger], s.requirements);
+      const max = maxAffordableBid(s.budget[challenger], slots);
+      const required = auction.currentBid + 1;
+      // Random but bounded engagement: 60% chance to raise if affordable.
+      if (required <= max && pickerRng() < 0.6) {
+        s = placeBid(s, challenger, required);
+      } else {
+        s = passBid(s, challenger);
+      }
+    }
+  }
+  assert(s.phase === "complete", `e2e: draft completes within ${HARD_CAP} iters (took ${iters})`);
+  assert(isDraftComplete(s), "e2e: isDraftComplete is true");
+  assert(s.roster.user.batters.length === 7, "e2e: user has 7 batters");
+  assert(s.roster.user.pitchers.length === 3, "e2e: user has 3 pitchers");
+  assert(s.roster.ai.batters.length === 7, "e2e: ai has 7 batters");
+  assert(s.roster.ai.pitchers.length === 3, "e2e: ai has 3 pitchers");
+  assert(s.budget.user >= 0, "e2e: user budget never goes negative");
+  assert(s.budget.ai >= 0, "e2e: ai budget never goes negative");
+  assert(
+    s.log.length === 20,
+    `e2e: 20 picks logged total (got ${s.log.length})`,
+  );
+  // No player drafted by both sides.
+  const allDrafted = [
+    ...s.roster.user.batters,
+    ...s.roster.user.pitchers,
+    ...s.roster.ai.batters,
+    ...s.roster.ai.pitchers,
+  ];
+  const ids = new Set(allDrafted.map((p) => p.id));
+  assert(ids.size === allDrafted.length, "e2e: no duplicate player across rosters");
+
+  // Tag distribution is non-empty (Judge etc carry tags).
+  const dist = rosterTagDistribution(s.roster.user);
+  assert(Object.keys(dist).length > 0, "rosterTagDistribution: non-empty for a real roster");
+  // Identity headline returns a string.
+  const headline = teamIdentityHeadline(s.roster.user);
+  assert(typeof headline === "string" && headline.length > 0, "teamIdentityHeadline: returns a label");
+}
+
+// Force-fill consistency: a heavily-imbalanced auction still completes cleanly.
+{
+  let s = initDraftState(2024);
+  // User passes everything; AI wins everything until force-fill kicks in.
+  let iters = 0;
+  while (s.phase !== "complete" && iters < 200) {
+    iters++;
+    if (s.phase === "nominating") {
+      const nom = aiNominate(s);
+      if (!nom) break;
+      s = nominate(s, nom.id, s.nominator);
+      continue;
+    }
+    if (s.phase === "bidding" && s.activeAuction) {
+      const challenger: DraftSide =
+        s.activeAuction.highBidder === "user" ? "ai" : "user";
+      // User always passes; AI bids if affordable.
+      if (challenger === "user") {
+        s = passBid(s, "user");
+      } else {
+        const slots = totalSlotsRemaining(s.roster.ai, s.requirements);
+        const max = maxAffordableBid(s.budget.ai, slots);
+        const required = s.activeAuction.currentBid + 1;
+        if (required <= max) s = placeBid(s, "ai", required);
+        else s = passBid(s, "ai");
+      }
+    }
+  }
+  assert(s.phase === "complete", "imbalanced: draft still completes when user always passes");
+  assert(s.roster.user.batters.length === 7, "imbalanced: user filled 7 batters via force-fill / freebies");
+  assert(s.roster.user.pitchers.length === 3, "imbalanced: user filled 3 pitchers via force-fill / freebies");
 }
 
 // ---------------------------------------------------------------------------

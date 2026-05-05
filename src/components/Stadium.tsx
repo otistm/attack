@@ -1,6 +1,5 @@
 import { useMemo, useRef } from 'react';
 import { useFrame } from '@react-three/fiber';
-import { Text } from '@react-three/drei';
 import * as THREE from 'three';
 import { BaseTarget } from './BaseTarget';
 import { Player } from './Player';
@@ -173,11 +172,6 @@ export function Stadium() {
         <planeGeometry args={[0.5, foulLineDistance]} />
       </mesh>
 
-      {/* Backstop Wall behind home plate */}
-      <mesh position={[0, 8, homeToMound + 40]} castShadow receiveShadow material={wallMaterial}>
-         <boxGeometry args={[80, 16, 2]} />
-      </mesh>
-
       {/* Outfield Walls */}
       <mesh position={[-160, 8, -200]} rotation={[0, Math.PI / 6, 0]} castShadow receiveShadow material={wallMaterial}>
          <boxGeometry args={[180, 16, 4]} />
@@ -190,8 +184,6 @@ export function Stadium() {
       </mesh>
 
       {/* Facilities */}
-      <Scoreboard position={[0, 30, -280]} rotation={[0, 0, 0]} />
-      <ScoreboardText position={[0, 30, -278]} />
       <LightTower position={[-140, 0, -250]} rotation={[0, -Math.PI/6, 0]} />
       <LightTower position={[140, 0, -250]} rotation={[0, Math.PI/6, 0]} />
       <LightTower position={[-200, 0, 50]} rotation={[0, -Math.PI/3, 0]} />
@@ -219,34 +211,6 @@ export function Stadium() {
       
       {/* Trees outside */}
       <Trees />
-    </group>
-  );
-}
-
-function Scoreboard({ position, rotation }: { position: [number, number, number], rotation: [number, number, number] }) {
-  return (
-    <group position={position} rotation={rotation}>
-      <mesh position={[0, -10, 0]} castShadow>
-        <boxGeometry args={[4, 20, 4]} />
-        <meshStandardMaterial color="#455A64" />
-      </mesh>
-      <mesh position={[0, 10, 0]} castShadow>
-        <boxGeometry args={[100, 40, 4]} />
-        <meshStandardMaterial color="#263238" />
-      </mesh>
-      {/* Screen */}
-      <mesh position={[0, 10, 2.1]}>
-        <planeGeometry args={[90, 30]} />
-        <meshBasicMaterial color="#111111" />
-      </mesh>
-      <mesh position={[-25, 15, 2.2]}>
-        <planeGeometry args={[15, 15]} />
-        <meshBasicMaterial color="#F44336" />
-      </mesh>
-      <mesh position={[25, 15, 2.2]}>
-        <planeGeometry args={[15, 15]} />
-        <meshBasicMaterial color="#FFEB3B" />
-      </mesh>
     </group>
   );
 }
@@ -540,25 +504,6 @@ function ResultPulse({ outcome, position }: { outcome: string | null; position: 
       <ringGeometry args={[0.4, 0.5, 32]} />
       <meshBasicMaterial ref={matRef} color={color} transparent opacity={0.7} side={THREE.DoubleSide} />
     </mesh>
-  );
-}
-
-function ScoreboardText({ position }: { position: [number, number, number] }) {
-  const inning = useGameStore((s) => s.inning);
-  const half = useGameStore((s) => s.half);
-  const home = useGameStore((s) => s.homeScore);
-  const away = useGameStore((s) => s.awayScore);
-  const outs = useGameStore((s) => s.outs);
-  const halfMark = half === 'top' ? '▲' : '▼';
-  return (
-    <group position={position}>
-      <Text fontSize={4.5} color="#FFEB3B" anchorX="center" anchorY="middle" position={[0, 4, 2.2]} outlineColor="#000" outlineWidth={0.1}>
-        {`HOME ${home}  -  AWAY ${away}`}
-      </Text>
-      <Text fontSize={3.2} color="#FFFFFF" anchorX="center" anchorY="middle" position={[0, -1, 2.2]} outlineColor="#000" outlineWidth={0.08}>
-        {`INN ${inning} ${halfMark}   OUTS ${outs}`}
-      </Text>
-    </group>
   );
 }
 

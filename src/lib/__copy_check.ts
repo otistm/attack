@@ -21,6 +21,13 @@
  *                           "card", no "draw" word. Reveal verb is "Reveal"
  *                           (not "Look at").
  *
+ * Note: an earlier iteration added a C9 rule that BANNED the words
+ * "shape"/"shapes" in card text and required "pitch type"/"pitches"
+ * instead, mapping each geometric shape to a baseball pitch label. That
+ * was reverted -- the user's BATTER cards also have shapes, so calling
+ * their own circle "Off-Speed" was nonsense (the batter isn't pitching).
+ * Card text is back to talking about shapes.
+ *
  * Each rule is a regex applied to every description. A match means the rule
  * fires (i.e. the wording is forbidden). Pass `allowFor` to exempt specific
  * cards whose flavor text intentionally bends a rule.

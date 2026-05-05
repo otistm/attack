@@ -2,6 +2,19 @@ import { CardDefinition } from "./cards";
 import { ShapeMode, ShapeType } from "../components/cardShapes";
 
 /**
+ * Stable identifier for a seam between two cards, regardless of which side of
+ * the seam each card is on. Used by the user-affirmed-connections set so a
+ * seam between cards X and Y is the same key whether the order is X-Y or
+ * Y-X (e.g. when the user drags one over the other and back).
+ *
+ * The key always sorts the two ids lexically so the call site doesn't have
+ * to know who's left and who's right.
+ */
+export function seamKey(idA: string, idB: string): string {
+  return idA < idB ? `${idA}|${idB}` : `${idB}|${idA}`;
+}
+
+/**
  * Determine whether the right side of `leftCard` can connect to the left side of `rightCard`.
  *
  * Rules (in evaluation order):

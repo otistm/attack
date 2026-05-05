@@ -10,34 +10,23 @@ export const SHAPE_COLORS: Record<ShapeType, string> = {
 };
 
 /**
- * Phase 6 (M7): shape-as-pitch-type re-flavor. Each shape doubles as a pitch
- * archetype so descriptions like "+2 if combined with a SQUARE neighbor" read
- * baseball-naturally as "+2 if combined with a Fastball." The mapping mirrors
- * the existing tag taxonomy in `cards.ts` (fastball/breaking-ball/off-speed)
- * for shape <-> pitch consistency:
- *   - SQUARE  = Fastball       (straight heat; matches `fastball` tag)
- *   - DIAMOND = Breaking Ball  (curve/slider movement; matches `breaking-ball`)
- *   - CIRCLE  = Off-Speed      (changeup-style velocity drop; matches `off-speed`)
- *   - STAR    = Specialty      (signature pitch / out-pitch; spans tags)
- *   - WILD    = Anything       (per-side wildcards; canConnect treats as match)
+ * Capitalized display labels for each shape. Used in tooltips, modal pickers,
+ * and ARIA labels so the visual geometry on the card has a stable readable
+ * name (`Square` instead of `square`).
+ *
+ * Note: an earlier iteration tried to alias each shape to a baseball pitch
+ * type (square=Fastball, circle=Off-Speed, ...). That created confusion the
+ * moment a player saw the SAME shapes on their batter cards (the batter
+ * isn't pitching, so calling their CIRCLE "Off-Speed" was nonsense). We're
+ * back to plain shape names -- the visual geometry IS the vocabulary.
  */
-export const SHAPE_PITCH_LABEL: Record<ShapeType, string> = {
-  square: 'Fastball',
-  diamond: 'Breaking Ball',
-  circle: 'Off-Speed',
-  star: 'Specialty',
+export const SHAPE_LABEL: Record<ShapeType, string> = {
+  square: 'Square',
+  diamond: 'Diamond',
+  circle: 'Circle',
+  star: 'Star',
   wildcard: 'Wildcard',
-  none: 'No Connect',
-};
-
-/** Short one-or-two-word badge variant for compact UI surfaces. */
-export const SHAPE_PITCH_LABEL_SHORT: Record<ShapeType, string> = {
-  square: 'Fastball',
-  diamond: 'Breaking',
-  circle: 'Off-Speed',
-  star: 'Specialty',
-  wildcard: 'Wild',
-  none: '—',
+  none: 'None',
 };
 
 export const SHAPE_DEFAULTS: Record<ShapeType, { rotate: number; baseScale: number; borderRadius: string; clipPath?: string }> = {

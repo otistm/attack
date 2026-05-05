@@ -4,8 +4,9 @@ import { PlayerChoiceModal } from './PlayerChoiceModal';
 import { InfoRevealOverlay } from './InfoRevealOverlay';
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Layers, RotateCcw } from 'lucide-react';
-import { useGameStore } from '../lib/gameStore';
+import { Layers, RotateCcw, ChevronDown } from 'lucide-react';
+import { useGameStore, getUserSide, type Team } from '../lib/gameStore';
+import { teamPalette } from '../lib/teamColors';
 
 const SPLASH_DURATION_MS = 3000;
 
@@ -34,9 +35,11 @@ export function UIOverlay() {
   const batter = useGameStore((s) => s.batter);
   const pitcher = useGameStore((s) => s.pitcher);
   const bases = useGameStore((s) => s.bases);
-  const reset = useGameStore((s) => s.reset);
+  const userTeam = useGameStore((s) => s.userTeam);
+  const startDraft = useGameStore((s) => s.startDraft);
 
   const phaseLabel: Record<typeof phase, string> = {
+    drafting: 'Draft',
     selecting: 'Card Selection',
     resolving: 'Resolving',
     revealing: 'Revealing',
@@ -44,6 +47,7 @@ export function UIOverlay() {
     'game-over': 'Game Over',
   };
   const phaseTone: Record<typeof phase, string> = {
+    drafting: 'text-violet-400',
     selecting: 'text-amber-400',
     resolving: 'text-sky-400',
     revealing: 'text-fuchsia-400',
@@ -77,6 +81,7 @@ export function UIOverlay() {
           outs={outs}
           bases={bases}
           battingTeam={battingTeam}
+          userTeam={userTeam}
         />
 
         {/* Right: phase + actions */}
@@ -94,14 +99,10 @@ export function UIOverlay() {
             <Layers className="w-3.5 h-3.5" />
             Collection
           </button>
-          <button
-            onClick={reset}
-            className="flex items-center gap-1.5 px-3 py-2 bg-slate-700/80 hover:bg-rose-600 rounded-md text-[11px] font-bold text-slate-200 hover:text-white transition-colors uppercase tracking-wide"
-            title="Reset to a new game"
-          >
-            <RotateCcw className="w-3.5 h-3.5" />
-            New Game
-          </button>
+          <NewGamePicker
+            onPick={(team) => startDraft(team)}
+            currentTeam={userTeam}
+          />
         </div>
       </header>
 
@@ -139,15 +140,23 @@ export function UIOverlay() {
  * value" diff, so the banner fires once per transition without requiring a
  * dedicated event in the store. Skips the very first mount so the player
  * doesn't see "TOP OF 1ST" pop in over the splash exit.
+ *
+ * When the half flip also flips the user's seat (e.g. user is HOME and
+ * the half goes top -> bottom: they were pitching, now they're up to
+ * bat), the banner appends "YOU'RE UP TO BAT" / "YOU'RE PITCHING NOW"
+ * so the role swap is unmissable -- without it, players were missing
+ * that the bottom strip had become their pitcher hand.
  */
 function InningTransitionBanner() {
   const inning = useGameStore((s) => s.inning);
   const half = useGameStore((s) => s.half);
   const phase = useGameStore((s) => s.phase);
+  const userSide = useGameStore(getUserSide);
   const lastSig = useRef<string | null>(null);
   const [message, setMessage] = useState<{
     title: string;
     subtitle: string;
+    seatCue: string | null;
     key: number;
   } | null>(null);
 
@@ -162,10 +171,16 @@ function InningTransitionBanner() {
     if (phase === 'game-over') return;
     const ordinal = ordinalSuffix(inning);
     const title = `${half === 'top' ? 'TOP' : 'BOTTOM'} OF THE ${ordinal}`;
-    setMessage({ title, subtitle: 'Side Retired', key: Date.now() });
+    // Seat cue only fires on the half flip (which is the only transition
+    // this banner watches), so the user always sees a side-change line
+    // here. Built off `userSide` directly -- whichever role they're now
+    // in, that's the cue.
+    const seatCue =
+      userSide === 'Batting' ? "YOU'RE UP TO BAT" : "YOU'RE PITCHING NOW";
+    setMessage({ title, subtitle: 'Side Retired', seatCue, key: Date.now() });
     const t = setTimeout(() => setMessage(null), 1900);
     return () => clearTimeout(t);
-  }, [inning, half, phase]);
+  }, [inning, half, phase, userSide]);
 
   return (
     <AnimatePresence>
@@ -204,10 +219,132 @@ function InningTransitionBanner() {
             <h2 className="text-3xl sm:text-5xl font-black uppercase tracking-tight text-white drop-shadow-[0_2px_12px_rgba(0,0,0,0.6)]">
               {message.title}
             </h2>
+            {message.seatCue && (
+              <span className="text-[11px] sm:text-sm font-black uppercase tracking-[0.3em] text-amber-300 drop-shadow-[0_1px_6px_rgba(0,0,0,0.5)]">
+                {message.seatCue}
+              </span>
+            )}
           </motion.div>
         </motion.div>
       )}
     </AnimatePresence>
+  );
+}
+
+/**
+ * "New Game" entry point. Replaces the bare reset button with a small
+ * dropdown so the player can pick which team they're playing AS for the
+ * fresh game. Picking opens the auction draft via `startDraft(team)` --
+ * the store carries that team across the next New Game (e.g. "rematch as
+ * HOME") unless the player picks a different one.
+ *
+ * The current `userTeam` is highlighted in the dropdown so they can tell
+ * which side they're already on without opening it twice. Closes on
+ * outside-click via a transparent fullscreen catcher (no portal needed).
+ */
+function NewGamePicker({
+  onPick,
+  currentTeam,
+}: {
+  onPick: (team: Team) => void;
+  currentTeam: Team;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative">
+      {open && (
+        <div
+          className="fixed inset-0 z-40"
+          onClick={() => setOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1.5 px-3 py-2 bg-slate-700/80 hover:bg-rose-600 rounded-md text-[11px] font-bold text-slate-200 hover:text-white transition-colors uppercase tracking-wide"
+        title="Start a fresh game and pick your team"
+      >
+        <RotateCcw className="w-3.5 h-3.5" />
+        New Game
+        <ChevronDown
+          className={`w-3 h-3 transition-transform ${open ? 'rotate-180' : ''}`}
+        />
+      </button>
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            className="absolute right-0 mt-2 z-50 w-48 bg-slate-900 border border-slate-700 rounded-md shadow-2xl overflow-hidden"
+            initial={{ opacity: 0, y: -8, scale: 0.96 }}
+            animate={{
+              opacity: 1,
+              y: 0,
+              scale: 1,
+              transition: { type: 'spring', stiffness: 320, damping: 24 },
+            }}
+            exit={{ opacity: 0, y: -6, scale: 0.96, transition: { duration: 0.12 } }}
+          >
+            <div className="px-3 pt-2 pb-1 text-[9px] font-black uppercase tracking-[0.2em] text-slate-500 border-b border-slate-800">
+              Play as...
+            </div>
+            <PickerOption
+              team="AWAY"
+              accent="text-rose-300"
+              hint="Bats first (top of inning)"
+              isCurrent={currentTeam === 'AWAY'}
+              onPick={() => {
+                onPick('AWAY');
+                setOpen(false);
+              }}
+            />
+            <PickerOption
+              team="HOME"
+              accent="text-blue-300"
+              hint="Pitches first (top of inning)"
+              isCurrent={currentTeam === 'HOME'}
+              onPick={() => {
+                onPick('HOME');
+                setOpen(false);
+              }}
+            />
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function PickerOption({
+  team,
+  accent,
+  hint,
+  isCurrent,
+  onPick,
+}: {
+  team: Team;
+  accent: string;
+  hint: string;
+  isCurrent: boolean;
+  onPick: () => void;
+}) {
+  return (
+    <button
+      onClick={onPick}
+      className="w-full text-left px-3 py-2 hover:bg-slate-800 transition-colors flex items-center justify-between gap-2 group"
+    >
+      <div className="flex flex-col">
+        <span className={`text-xs font-black uppercase tracking-wider ${accent}`}>
+          {team}
+        </span>
+        <span className="text-[9px] text-slate-500 group-hover:text-slate-400 transition-colors">
+          {hint}
+        </span>
+      </div>
+      {isCurrent && (
+        <span className="text-[8px] font-black text-amber-300 bg-amber-500/20 border border-amber-400/40 rounded px-1.5 py-0.5 tracking-widest leading-none">
+          CURRENT
+        </span>
+      )}
+    </button>
   );
 }
 
@@ -311,6 +448,14 @@ function Matchup({ batterName, batterTeam, pitcherName, pitcherTeam, battingTeam
   );
 }
 
+/**
+ * Compact field-view nameplate for the at-bat / pitching matchup. Same
+ * visual language as the draft pool cards (team-color header band with a
+ * circular team badge) so a player who left the draft as "Yankees navy +
+ * grey" still reads as Yankees navy + grey when they step up to the plate.
+ * Without this, every nameplate during gameplay was a uniform slate which
+ * stripped the team identity the user had just spent the auction earning.
+ */
 function PlayerCard({
   role,
   name,
@@ -324,17 +469,34 @@ function PlayerCard({
   color: string;
   twoWay?: boolean;
 }) {
+  const tp = teamPalette(team);
   return (
-    <div className="relative flex flex-col justify-center bg-slate-800/70 border border-slate-700/80 rounded-md px-3 py-1.5 min-w-[140px]">
-      <div className="text-[8px] font-bold text-slate-500 uppercase tracking-widest leading-none">{role}</div>
-      <div className={`font-black ${color} text-[13px] leading-tight truncate`}>{name}</div>
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-[9px] text-slate-400 font-bold tracking-widest leading-tight">{team}</span>
+    <div className="relative flex flex-col bg-slate-800/70 border border-slate-700/80 rounded-md overflow-hidden min-w-[150px] shadow-[0_2px_6px_rgba(0,0,0,0.35)]">
+      <div
+        className="flex items-center gap-1.5 px-2 py-1 text-white"
+        style={{
+          background: `linear-gradient(110deg, ${tp.primary} 0%, ${tp.primary} 60%, ${tp.secondary} 100%)`,
+        }}
+      >
+        <span
+          className="w-5 h-5 rounded-full flex items-center justify-center text-[7px] font-black tracking-tight ring-1 ring-white/50 shrink-0 shadow-sm"
+          style={{ background: tp.secondary }}
+        >
+          {team}
+        </span>
+        <span className="text-[8px] font-black uppercase tracking-[0.2em] opacity-90">
+          {role}
+        </span>
         {twoWay && (
-          <span className="text-[8px] font-black text-amber-300 bg-amber-500/20 border border-amber-400/40 rounded px-1.5 py-0.5 tracking-widest leading-none">
+          <span className="ml-auto text-[7px] font-black text-amber-300 bg-amber-500/25 ring-1 ring-amber-300/60 rounded px-1 py-0.5 tracking-widest leading-none">
             2-WAY
           </span>
         )}
+      </div>
+      <div className="px-3 py-1.5">
+        <div className={`font-black ${color} text-[13px] leading-tight truncate`}>
+          {name}
+        </div>
       </div>
     </div>
   );
@@ -348,15 +510,28 @@ interface ScoreboardProps {
   outs: number;
   bases: [boolean, boolean, boolean];
   battingTeam: 'HOME' | 'AWAY';
+  userTeam: Team;
 }
 
-function Scoreboard({ inning, half, homeScore, awayScore, outs, bases, battingTeam }: ScoreboardProps) {
+function Scoreboard({ inning, half, homeScore, awayScore, outs, bases, battingTeam, userTeam }: ScoreboardProps) {
   return (
     <div className="flex items-stretch gap-px bg-slate-700 rounded-md overflow-hidden border border-slate-700 shadow-[inset_0_0_0_1px_rgba(0,0,0,0.6)]">
       {/* Team scores */}
       <div className="bg-slate-950 px-4 py-1.5 grid grid-cols-[auto_auto] gap-x-4 gap-y-0.5 items-center">
-        <TeamRow label="AWAY" score={awayScore} batting={battingTeam === 'AWAY'} accent="text-rose-300" />
-        <TeamRow label="HOME" score={homeScore} batting={battingTeam === 'HOME'} accent="text-blue-300" />
+        <TeamRow
+          label="AWAY"
+          score={awayScore}
+          batting={battingTeam === 'AWAY'}
+          accent="text-rose-300"
+          isUser={userTeam === 'AWAY'}
+        />
+        <TeamRow
+          label="HOME"
+          score={homeScore}
+          batting={battingTeam === 'HOME'}
+          accent="text-blue-300"
+          isUser={userTeam === 'HOME'}
+        />
       </div>
 
       {/* Inning indicator */}
@@ -395,7 +570,19 @@ function Scoreboard({ inning, half, homeScore, awayScore, outs, bases, battingTe
   );
 }
 
-function TeamRow({ label, score, batting, accent }: { label: string; score: number; batting: boolean; accent: string }) {
+function TeamRow({
+  label,
+  score,
+  batting,
+  accent,
+  isUser,
+}: {
+  label: string;
+  score: number;
+  batting: boolean;
+  accent: string;
+  isUser: boolean;
+}) {
   return (
     <>
       <div className={`flex items-center gap-1.5 ${accent}`}>
@@ -406,6 +593,14 @@ function TeamRow({ label, score, batting, accent }: { label: string; score: numb
           }
         />
         <span className="text-[10px] font-extrabold tracking-widest">{label}</span>
+        {isUser && (
+          <span
+            className="text-[7px] font-black tracking-[0.2em] text-amber-300 bg-amber-500/15 border border-amber-400/40 rounded px-1 leading-none"
+            title="This is your team"
+          >
+            YOU
+          </span>
+        )}
       </div>
       <div className="font-mono font-black text-2xl tabular-nums text-amber-400 text-right leading-none">{score}</div>
     </>

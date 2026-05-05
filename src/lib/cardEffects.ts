@@ -2,7 +2,12 @@ import { CardDefinition, TagLiteral } from "./cards";
 import { ShapeType } from "../components/cardShapes";
 import { canConnect } from "./connect";
 import type { ScoringContext } from "./scoring";
-import { batterTeamLead, runnersOnCount } from "./scoring";
+import {
+  batterTeamLead,
+  batterTeamRunsThisGame,
+  runnersOnCount,
+  uniqueShapeCount,
+} from "./scoring";
 
 // Note: cardEffects <-> scoring is a soft cycle (scoring imports applyCardEffect /
 // applyOpponentTotalAdjustments from here, and we import the Phase 6 helpers
@@ -713,6 +718,244 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-95 but pitcher-side and one inning later, since closers usually enter
   // 8th-9th specifically.
   "p-94": (ctx) => ((ctx.inning ?? 0) >= 8 ? r({ selfValueDelta: 3 }) : NOOP),
+
+  // ============ PHASE 7 BATTER EXPANSION (b-100..b-135) ============
+
+  // b-100 Five-Tool Threat: +5 if combined AND pitcher's base is fastball.
+  // Two gates so it doesn't dwarf b-1 (a flat +4 on combine) -- you have to
+  // both arrange a chain AND face a fastball-tagged base card.
+  "b-100": (ctx) => {
+    if (!ctx.isCombined) return NOOP;
+    if (!ctx.opponentBaseCard?.tags?.includes("fastball")) return NOOP;
+    return r({ selfValueDelta: 5 });
+  },
+
+  // b-101 MVP Resume: +1 per OTHER VETERAN card in the pitcher's hand.
+  // Mirror of b-74 (own hand veteran scaling) into the opposite hand --
+  // rewards facing veteran-stacked pitchers.
+  "b-101": (ctx) => {
+    const v = ctx.opponentHand
+      ? ctx.opponentHand.reduce(
+          (n, c) => (c.tags?.includes("veteran") ? n + 1 : n),
+          0,
+        )
+      : 0;
+    // "every other" excludes b-101 itself, but b-101 is BATTER-side so it
+    // can never appear in opponentHand -- the count is naturally "other".
+    return v > 0 ? r({ selfValueDelta: v }) : NOOP;
+  },
+
+  // b-102 Halo Bomb: combine constraint already enforces rightNoCombine.
+  "b-102": () => NOOP,
+
+  // b-103 1B Smooth: +1 per DIAMOND on the BOARD (across both hands).
+  // Mirrors b-29 Home Run Derby's circle-counter, but board-wide so the
+  // pitcher's diamonds also scale Freeman up -- it reads as "every diamond
+  // on the table" rather than "every diamond you brought".
+  "b-103": (ctx) => {
+    const own = countShapesInHand(ctx.hand, "diamond");
+    const opp = ctx.opponentHand ? countShapesInHand(ctx.opponentHand, "diamond") : 0;
+    const total = own + opp;
+    return total > 0 ? r({ selfValueDelta: total }) : NOOP;
+  },
+
+  // b-104 Calm at the Plate: +3 if your team has 0 outs.
+  "b-104": (ctx) => (ctx.outs === 0 ? r({ selfValueDelta: 3 }) : NOOP),
+
+  // b-105 Atlanta-LA Ring: pitcher's BASE card mechanic is nullified. The
+  // silencing flag flows through ScoringContext.nullifyOpponentBaseMechanic
+  // (set in gameStore.scorePitcher when the batter holds b-105). This per-
+  // card hook stays a no-op -- b-105 itself doesn't change its own value.
+  "b-105": () => NOOP,
+
+  // b-106 Cuban Crusher: if combined, base value becomes 14.
+  "b-106": (ctx) => {
+    if (!ctx.isCombined) return NOOP;
+    const card = ctx.group[ctx.indexInGroup];
+    return r({ selfValueDelta: 14 - card.baseValue });
+  },
+
+  // b-107 Crawford Boxes: +2 per OTHER POWER-HITTER card in your hand.
+  "b-107": (ctx) => {
+    const p = countOtherHandTag(ctx, "power-hitter");
+    return p > 0 ? r({ selfValueDelta: 2 * p }) : NOOP;
+  },
+
+  // b-108 DH Threat: nullifies pitcher's OFF-SPEED card abilities. Wired
+  // through ScoringContext.nullifyOpponentTagMechanics (set in
+  // gameStore.scorePitcher). Self hook is a no-op like b-105.
+  "b-108": () => NOOP,
+
+  // b-109 World Series MVP: +3 in the 4th inning or later.
+  "b-109": (ctx) => ((ctx.inning ?? 0) >= 4 ? r({ selfValueDelta: 3 }) : NOOP),
+
+  // b-110 Smooth Stroke: +4 if combined on the LEFT side. Mirror of b-26
+  // Shortstop Slap which fires on the right side.
+  "b-110": (ctx) => {
+    if (!ctx.isCombined) return NOOP;
+    if (ctx.indexInGroup > 0) return r({ selfValueDelta: 4 });
+    return NOOP;
+  },
+
+  // b-111 October Hero: +5 if the score is tied.
+  "b-111": (ctx) => (batterTeamLead(ctx) === 0 ? r({ selfValueDelta: 5 }) : NOOP),
+
+  // b-112 Switch Slasher: +2 per unique shape on the board (max +6).
+  // "Board" = both hands. Wildcards count as their own slot. Cap mirrors
+  // the description -- without it, every full board would push +8.
+  "b-112": (ctx) => {
+    const board = [...ctx.hand, ...(ctx.opponentHand ?? [])];
+    const shapes = uniqueShapeCount(board);
+    const bonus = Math.min(6, shapes * 2);
+    return bonus > 0 ? r({ selfValueDelta: bonus }) : NOOP;
+  },
+
+  // b-113 Cleveland Cutter: +1 per card YOU have combined. Mirror of p-40
+  // Wheeler's Workhorse on the batter side; counts the batter's own combined
+  // cards (incl. b-113 if it's combined too).
+  "b-113": (ctx) => {
+    const combined = countCombinedCards(ctx.hand);
+    return combined > 0 ? r({ selfValueDelta: combined }) : NOOP;
+  },
+
+  // b-114 30-30 Threat: +3 if your hand has another SPEEDSTER and another
+  // POWER-HITTER. Self-tagged BOTH speedster and power-hitter, so each
+  // count must exclude b-114 itself.
+  "b-114": (ctx) => {
+    const speedster = countOtherHandTag(ctx, "speedster") >= 1;
+    const power = countOtherHandTag(ctx, "power-hitter") >= 1;
+    return speedster && power ? r({ selfValueDelta: 3 }) : NOOP;
+  },
+
+  // b-115 Polar Power: +1 per STAR shape on the board (both hands).
+  "b-115": (ctx) => {
+    const own = countShapesInHand(ctx.hand, "star");
+    const opp = ctx.opponentHand ? countShapesInHand(ctx.opponentHand, "star") : 0;
+    const total = own + opp;
+    return total > 0 ? r({ selfValueDelta: total }) : NOOP;
+  },
+
+  // b-116 HR Derby Champ: +3 to Hit Scale on combine alone (no win check).
+  "b-116": (ctx) => (ctx.isCombined ? r({ hitScaleBonus: 3 }) : NOOP),
+
+  // b-117 Citi Bomb: +2 Value AND +2 Hit Scale on combine. Dual-buff.
+  "b-117": (ctx) =>
+    ctx.isCombined ? r({ selfValueDelta: 2, hitScaleBonus: 2 }) : NOOP,
+
+  // b-118 Track Star: +5 if no combinations this round (mirror of p-46
+  // Pure Gas on the batter side).
+  "b-118": (ctx) => {
+    const anyCombined = ctx.hand.some((_, i) => !isCardUncombined(ctx, i));
+    return !anyCombined ? r({ selfValueDelta: 5 }) : NOOP;
+  },
+
+  // b-119 Quick Bat: pitcher's General cards each get -2 Value. The
+  // hand-transform layer mutates pitcher cards directly, so per-card hook
+  // stays a no-op (the deltas already land on the pitcher's baseValues).
+  "b-119": () => NOOP,
+
+  // b-120 Steal Home: runner-advance boost handled by resolveStep. Per-card
+  // hook is a no-op -- the bonus only fires after the at-bat resolves.
+  "b-120": () => NOOP,
+
+  // b-121 Catcher's Eye: information-only. derivePendingReveals queues a
+  // signatureShapes reveal for the batter side.
+  "b-121": () => NOOP,
+
+  // b-122 Pitch Caller: +5 if pitcher's base card is a BREAKING-BALL.
+  "b-122": (ctx) =>
+    ctx.opponentBaseCard?.tags?.includes("breaking-ball")
+      ? r({ selfValueDelta: 5 })
+      : NOOP,
+
+  // b-123 Future Captain: +1 to every OTHER card in your hand. Implemented
+  // as +N to b-123 itself where N = (handSize - 1), which keeps the bonus
+  // on b-123's pill without bleeding the buff back into the OTHER cards'
+  // mechanics. The visual reading "+1 to every other card" still holds at
+  // the head-to-head total: the team's score moves by exactly the same
+  // delta either way (+1 * (handSize - 1)).
+  "b-123": (ctx) => {
+    const otherCount = ctx.hand.length - 1;
+    return otherCount > 0 ? r({ selfValueDelta: otherCount }) : NOOP;
+  },
+
+  // b-124 Carita's Cannon: +6 if combined on BOTH sides (interior of group).
+  "b-124": (ctx) => {
+    if (ctx.indexInGroup > 0 && ctx.indexInGroup < ctx.group.length - 1) {
+      return r({ selfValueDelta: 6 });
+    }
+    return NOOP;
+  },
+
+  // b-125 Green Monster: hand-transform replaces the batter's diamonds with
+  // wildcards. Per-card hook stays a no-op -- the conversion already lands.
+  "b-125": () => NOOP,
+
+  // b-126 Lefty Mash: +3 if pitcher is right-handed. Mirror of p-37 Cy Young
+  // Heat (which reads `batterHandedness`). Switch hitters ("S") are not
+  // gated either way -- the bonus needs an explicitly right-handed pitcher.
+  "b-126": (ctx) => (ctx.pitcherHandedness === "R" ? r({ selfValueDelta: 3 }) : NOOP),
+
+  // b-127 Mr. Smile: if combined, the pitcher's lowest UNCOMBINED card has
+  // its mechanic nullified. Implemented by attaching the target card id
+  // through `nullifiedCardIds` in scoreBatter / scorePitcher pipelines --
+  // we surface it here via opponentTargetCardId for the reveal animator,
+  // but the silencing flag itself is set on the pitcher context in the
+  // store layer. Per-card hook leaves the math alone.
+  "b-127": () => NOOP,
+
+  // b-128 Switch-Cap: +2 Value AND +2 Hit Scale if pitcher is LEFTY.
+  // "Pitcher is LEFTY" -> opponent hand has a lefty-tagged card. Same read
+  // as b-79 Lefty Killer.
+  "b-128": (ctx) =>
+    handHasTag(ctx.opponentHand ?? [], "lefty")
+      ? r({ selfValueDelta: 2, hitScaleBonus: 2 })
+      : NOOP,
+
+  // b-129 Captain Lindor: +1 to every uncombined card you leave. Same
+  // attribution trick as b-123 -- credit the buff onto b-129 itself so the
+  // team total still moves by the right amount. Counts uncombined cards
+  // OTHER than b-129; if b-129 is itself uncombined we don't count it
+  // (you don't get to "leave yourself behind" as a buff target).
+  "b-129": (ctx) => {
+    const selfId = ctx.group[ctx.indexInGroup].id;
+    let n = 0;
+    for (let i = 0; i < ctx.hand.length; i++) {
+      if (ctx.hand[i].id === selfId) continue;
+      if (isCardUncombined(ctx, i)) n++;
+    }
+    return n > 0 ? r({ selfValueDelta: n }) : NOOP;
+  },
+
+  // b-130 Postseason Tuve: +5 if your team is losing or tied.
+  "b-130": (ctx) => (batterTeamLead(ctx) <= 0 ? r({ selfValueDelta: 5 }) : NOOP),
+
+  // b-131 Tiny Terror: +3 if your hand has 2 or more OTHER CLUTCH cards.
+  // Self-tagged clutch, so the threshold counts neighbors only.
+  "b-131": (ctx) => (countOtherHandTag(ctx, "clutch") >= 2 ? r({ selfValueDelta: 3 }) : NOOP),
+
+  // b-132 Champion's Heart: +1 per Run your team has scored this game.
+  // Reads from the running batter-team total via the helper -- doesn't
+  // care about the at-bat that's about to score (those runs land AFTER
+  // lock-in resolves).
+  "b-132": (ctx) => {
+    const runs = batterTeamRunsThisGame(ctx);
+    return runs > 0 ? r({ selfValueDelta: runs }) : NOOP;
+  },
+
+  // b-133 Jazz Hands: hand-transform conditionally swaps b-133's shapes to
+  // wildcard. Per-card hook is a no-op -- the wildcard form is already in
+  // the scoring data by the time effects evaluate.
+  "b-133": () => NOOP,
+
+  // b-134 Bronx Hustle: +5 Hit Scale if uncombined. The "and you win" gate
+  // is implicit in the Hit Scale ladder (it only fires when the batter
+  // wins head-to-head), so we don't need a separate win check.
+  "b-134": (ctx) => (!ctx.isCombined ? r({ hitScaleBonus: 5 }) : NOOP),
+
+  // b-135 Stolen Bag: extra runner placed in resolveStep. Per-card hook
+  // stays a no-op.
+  "b-135": () => NOOP,
 };
 
 export function applyCardEffect(card: CardDefinition, ctx: EffectContext): EffectResult {

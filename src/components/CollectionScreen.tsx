@@ -1,55 +1,9 @@
 import { ALL_CARDS, CardDefinition } from '../lib/cards';
 import { BATTERS, PITCHERS, MlbPlayer } from '../lib/players';
 import { ShapeHalf } from './CardGameOverlay';
-import { SHAPE_PITCH_LABEL, ShapeType } from './cardShapes';
 import { motion, AnimatePresence } from 'motion/react';
 import { X, Search, Users } from 'lucide-react';
 import { useMemo, useState } from 'react';
-
-/**
- * Phase 6 (M7): pitch-type legend rendered at the top of the collection
- * screen so the SQUARE/DIAMOND/CIRCLE/STAR shape language reads as Fastball /
- * Breaking Ball / Off-Speed / Specialty right next to the cards. The list is
- * ordered to mirror the strike-zone vocabulary (heat -> movement -> off-speed
- * -> out pitch) the card descriptions already use.
- */
-const PITCH_LEGEND_SHAPES: ShapeType[] = ['square', 'diamond', 'circle', 'star'];
-
-function PitchTypeLegend() {
-  return (
-    <div className="mb-10 p-4 rounded-xl bg-slate-900/70 border border-slate-800">
-      <div className="flex items-center gap-3 mb-3">
-        <h2 className="text-[11px] font-black text-slate-300 uppercase tracking-widest">
-          Pitch Type Legend
-        </h2>
-        <div className="h-px bg-slate-800 flex-1" />
-        <span className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
-          Shapes are pitches
-        </span>
-      </div>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        {PITCH_LEGEND_SHAPES.map((shape) => (
-          <div
-            key={shape}
-            className="relative h-16 rounded-lg bg-slate-800/60 border border-slate-700 flex items-center justify-between px-4"
-          >
-            <div className="relative w-8 h-12">
-              <ShapeHalf shape={shape} side="left" isConnected={false} compact />
-            </div>
-            <div className="text-right">
-              <div className="text-[9px] uppercase tracking-widest text-slate-500 font-bold leading-tight">
-                {shape}
-              </div>
-              <div className="text-sm font-black text-white leading-tight">
-                {SHAPE_PITCH_LABEL[shape]}
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
 
 const CollectionCard = ({ card }: { card: CardDefinition }) => {
   return (
@@ -244,8 +198,6 @@ export const CollectionScreen = ({ onClose }: { onClose: () => void }) => {
         </aside>
 
         <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
-          <PitchTypeLegend />
-
           {selectedPlayer && (
             <div className="mb-6 flex items-center gap-3 text-slate-400 text-sm">
               <span>Showing signature cards for</span>

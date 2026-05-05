@@ -1,5 +1,6 @@
-import { CardDefinition } from "./cards";
-import { canConnect } from "./connect";
+import { CardDefinition, TagLiteral } from "./cards";
+import { ShapeType } from "../components/cardShapes";
+import { canConnect, seamKey } from "./connect";
 import { applyCardEffect, applyOpponentTotalAdjustments, EffectContext, EffectResult } from "./cardEffects";
 
 export interface ScoringContext {
@@ -13,6 +14,13 @@ export interface ScoringContext {
   isFinalInning?: boolean;
   // Handedness of the at-bat batter, used by p-37 Cy Young Heat.
   batterHandedness?: "L" | "R" | "S";
+  /**
+   * Handedness of the active pitcher. Lives on the MlbPlayer record (not on
+   * the card), so the gameStore plumbs it through here for batter-side cards
+   * that key off the pitcher's hand: b-126 Lefty Mash (vs RHP), b-128
+   * Switch-Cap (already reads tags) etc.
+   */
+  pitcherHandedness?: "L" | "R" | "S";
   // Opposing player's hand (only the lock-in resolution needs this).
   opponentHand?: CardDefinition[];
   // Opposing player's locked base card (the highest-value or selected card).
@@ -46,6 +54,73 @@ export interface ScoringContext {
    */
   homeScore?: number;
   awayScore?: number;
+
+  /**
+   * User-affirmed connections, keyed by `seamKey(idA, idB)`. When provided,
+   * `buildGroups` ONLY chains adjacent cards whose seam is BOTH mechanically
+   * connectable (`canConnect`) AND in this set -- the user must explicitly
+   * forge a connection by dragging one card next to another for it to score
+   * as a chain.
+   *
+   * Undefined / null = legacy auto-connect: every mechanically-connectable
+   * adjacent pair chains. The pitcher hand uses this mode (the AI doesn't
+   * drag), as do all engine tests written before user agency existed.
+   */
+  affirmedSeams?: ReadonlySet<string> | null;
+
+  // ============ Phase 7 batter-expansion fields ============
+  /**
+   * b-105 Atlanta-LA Ring -- when set, the opponent's base card's per-card
+   * ability is treated as no-op (its base value still counts). Symmetric with
+   * `nullifiedCardIds` but indexed by "whichever card the opponent picks as
+   * base", which lockIn resolves at scoring time so b-105 doesn't have to
+   * peek into the pitcher's bestGroup ahead of time.
+   */
+  nullifyOpponentBaseMechanic?: boolean;
+  /**
+   * b-108 DH Threat -- list of tags whose carriers in the opponent hand have
+   * their abilities suppressed this round. Mirrors `nullifiedCardIds` but
+   * targeted by tag rather than by id, so `b-108: ["off-speed"]` silences
+   * every off-speed pitch the pitcher plays.
+   *
+   * Note: b-132 Champion's Heart reads runs from existing `homeScore`/
+   * `awayScore`/`half` and doesn't need a dedicated field.
+   */
+  nullifyOpponentTagMechanics?: ReadonlyArray<TagLiteral>;
+}
+
+/**
+ * Phase 7 helper: number of Runs the BATTER'S TEAM has scored this game,
+ * derived from the cumulative score going into this at-bat. Drives b-132
+ * Champion's Heart. Mirrors `batterTeamLead` -- "top" half = away batting,
+ * "bottom" half = home batting. Falls back to 0 when score isn't plumbed
+ * (engine works before gameStore is initialized in tests).
+ */
+export function batterTeamRunsThisGame(ctx: ScoringContext): number {
+  if (ctx.half === "bottom") return ctx.homeScore ?? 0;
+  return ctx.awayScore ?? 0;
+}
+
+/** Local helper: highest-baseValue card (or undefined for empty hand). */
+function highestValueCard(cards: CardDefinition[]): CardDefinition | undefined {
+  if (cards.length === 0) return undefined;
+  return cards.reduce((a, b) => (b.baseValue > a.baseValue ? b : a));
+}
+
+/**
+ * Phase 7 helper: number of distinct shapes appearing on any card in the hand
+ * (left or right side). Drives b-112 Switch Slasher. Wildcards count as their
+ * own "shape" -- they appear on the card visually as a unique slot, so the
+ * batter who plays a wildcard alongside a circle/diamond/star/square gets
+ * credit for the wildcard slot too.
+ */
+export function uniqueShapeCount(hand: CardDefinition[]): number {
+  const seen = new Set<ShapeType>();
+  for (const c of hand) {
+    seen.add(c.leftShape);
+    seen.add(c.rightShape);
+  }
+  return seen.size;
 }
 
 /**
@@ -136,7 +211,7 @@ const EMPTY_RESULT: ScoringResult = {
 export function scoreHand(cards: CardDefinition[], ctx: ScoringContext): ScoringResult {
   if (!cards || cards.length === 0) return EMPTY_RESULT;
 
-  const groups = buildGroups(cards);
+  const groups = buildGroups(cards, ctx.affirmedSeams ?? null);
 
   let bestGroup: CardDefinition[] = [];
   let maxValue = 0;
@@ -195,17 +270,35 @@ export function scoreHand(cards: CardDefinition[], ctx: ScoringContext): Scoring
   };
 }
 
-function buildGroups(cards: CardDefinition[]): CardDefinition[][] {
+/**
+ * Build connection groups by walking adjacent pairs and checking BOTH:
+ *   1. `canConnect(prev, curr)` -- the mechanic still has to allow it (shape
+ *      / wildcard / `noCombine` rules).
+ *   2. The user has affirmed this seam, when `affirmedSeams` is provided.
+ *
+ * `affirmedSeams === null` falls back to legacy auto-connect (any
+ * mechanically-eligible adjacent pair chains). This is what the pitcher hand
+ * uses and what the engine tests assume by default.
+ */
+function buildGroups(
+  cards: CardDefinition[],
+  affirmedSeams: ReadonlySet<string> | null,
+): CardDefinition[][] {
   const groups: CardDefinition[][] = [];
   if (cards.length === 0) return groups;
 
   let current: CardDefinition[] = [cards[0]];
   for (let i = 1; i < cards.length; i++) {
-    if (canConnect(cards[i - 1], cards[i])) {
-      current.push(cards[i]);
+    const prev = cards[i - 1];
+    const curr = cards[i];
+    const mechConnect = canConnect(prev, curr);
+    const userAffirmed =
+      affirmedSeams === null ? true : affirmedSeams.has(seamKey(prev.id, curr.id));
+    if (mechConnect && userAffirmed) {
+      current.push(curr);
     } else {
       groups.push(current);
-      current = [cards[i]];
+      current = [curr];
     }
   }
   groups.push(current);
@@ -242,6 +335,15 @@ function scoreGroup(group: CardDefinition[], ctx: ScoringContext, hand: CardDefi
 
   const isCombined = group.length > 1;
 
+  // The "self base card" of the hand currently being scored. b-105
+  // Atlanta-LA Ring sets `nullifyOpponentBaseMechanic` from the BATTER side --
+  // when that flag is on while we're scoring the PITCHER hand, the targeted
+  // card is the pitcher's own highest-value card (its base from the batter's
+  // POV). Computing it from `hand` keeps the silencer self-contained: the
+  // batter doesn't have to peek at the pitcher's bestGroup to figure out
+  // which card to nullify.
+  const selfBaseCard = highestValueCard(hand);
+
   for (let i = 0; i < group.length; i++) {
     const card = group[i];
     const effectCtx: EffectContext = {
@@ -255,8 +357,26 @@ function scoreGroup(group: CardDefinition[], ctx: ScoringContext, hand: CardDefi
     // value still counts). `card.disabled` is the round-level kill switch
     // spliced on by hand-transforms (b-23 Stolen Base Threat) -- it zeros the
     // baseValue too AND must NOOP the ability so the card is fully off.
+    //
+    // Phase 7 additions:
+    //  - `nullifyOpponentBaseMechanic` (b-105 Atlanta-LA Ring) suppresses the
+    //    opponent's BASE card mechanic. Only flagged when scoring the opponent
+    //    hand whose base matches `ctx.opponentBaseCard`.
+    //  - `nullifyOpponentTagMechanics` (b-108 DH Threat) suppresses every
+    //    opponent card whose tags overlap with the listed tags. Same shape as
+    //    `nullifiedCardIds` but tag-indexed.
+    const baseSilenced =
+      ctx.nullifyOpponentBaseMechanic === true &&
+      !!selfBaseCard &&
+      selfBaseCard.id === card.id;
+    const tagSilenced =
+      (ctx.nullifyOpponentTagMechanics?.length ?? 0) > 0 &&
+      (card.tags?.some((t) => ctx.nullifyOpponentTagMechanics!.includes(t)) ?? false);
     const isNullified =
-      (ctx.nullifiedCardIds?.has(card.id) ?? false) || card.disabled === true;
+      (ctx.nullifiedCardIds?.has(card.id) ?? false) ||
+      card.disabled === true ||
+      baseSilenced ||
+      tagSilenced;
     const effect: EffectResult = isNullified
       ? { selfValueDelta: 0, opponentValueDelta: 0, hitScaleBonus: 0, pitcherCombinedDelta: 0 }
       : applyCardEffect(card, effectCtx);

@@ -1,9 +1,10 @@
 import { motion, AnimatePresence } from 'motion/react';
 import { useMemo, useState } from 'react';
-import { useGameStore, USER_SIDE, type PendingReveal } from '../lib/gameStore';
+import { useGameStore, getUserSide, type PendingReveal } from '../lib/gameStore';
 import { canConnect } from '../lib/connect';
 import { Eye, X } from 'lucide-react';
 import type { CardDefinition } from '../lib/cards';
+import { SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, type ShapeType } from './cardShapes';
 
 /**
  * Renders the information-reveal queue. b-7 Soto Shuffle reveals the
@@ -12,9 +13,12 @@ import type { CardDefinition } from '../lib/cards';
  * layout. The overlay is always available while there are pending reveals --
  * it lives in the bottom-left as a stack of toggleable peek pills.
  *
- * Only reveals belonging to the user's seat (`USER_SIDE`) are surfaced --
- * showing opponent-side peeks would let the batter see what the pitcher is
- * "supposed" to know about their hand, breaking the fog-of-war.
+ * Only reveals belonging to the user's CURRENT seat
+ * (`getUserSide(state)`) are surfaced -- showing opponent-side peeks would
+ * let the user see what the AI is "supposed" to know about their hand,
+ * breaking the fog-of-war. When the half flips and the user changes
+ * roles, the previously hidden reveals on the new seat surface
+ * automatically.
  *
  * No state is mutated on view; the queue stays populated until the at-bat
  * resets so the player can re-open the peek if they want a second look.
@@ -24,14 +28,15 @@ export function InfoRevealOverlay() {
   const phase = useGameStore((s) => s.phase);
   const batterHand = useGameStore((s) => s.batterHand);
   const pitcherHand = useGameStore((s) => s.pitcherHand);
+  const userSide = useGameStore(getUserSide);
   const [openIdx, setOpenIdx] = useState<number | null>(null);
 
   // Filter to the user's seat. openIdx indexes the filtered list, so an
   // opponent-side reveal can never be opened even if its index would line up
   // with a user-side one in the unfiltered queue.
   const visibleReveals = useMemo(
-    () => pendingReveals.filter((r) => r.forSide === USER_SIDE),
-    [pendingReveals],
+    () => pendingReveals.filter((r) => r.forSide === userSide),
+    [pendingReveals, userSide],
   );
 
   if (phase !== 'selecting' || visibleReveals.length === 0) return null;
@@ -95,6 +100,7 @@ function RevealPanel({
   const cardsToShow = computeRevealedCards(reveal, batterHand, pitcherHand);
   const title = REVEAL_TITLES[reveal.reveal];
   const subtitle = REVEAL_SUBTITLES[reveal.reveal];
+  const isShapesOnly = reveal.reveal === 'signatureShapes';
 
   return (
     <motion.div
@@ -116,11 +122,53 @@ function RevealPanel({
         {cardsToShow.length === 0 && (
           <div className="text-[11px] text-slate-500 italic py-2">No cards to reveal.</div>
         )}
-        {cardsToShow.map((card, i) => (
-          <RevealedCard key={`${card.id}-${i}`} card={card} />
-        ))}
+        {cardsToShow.map((card, i) =>
+          isShapesOnly ? (
+            <SignatureShapeRow key={`${card.id}-${i}`} card={card} />
+          ) : (
+            <RevealedCard key={`${card.id}-${i}`} card={card} />
+          ),
+        )}
       </div>
     </motion.div>
+  );
+}
+
+/**
+ * b-121 Catcher's Eye row: shows ONLY the L/R shapes of an opponent
+ * signature card. No name, no team, no value -- the catcher knows what
+ * pitch shapes are coming, not who's throwing them or how strong each is.
+ */
+function SignatureShapeRow({ card }: { card: CardDefinition }) {
+  return (
+    <div className="flex items-center gap-3 bg-slate-800 border border-slate-700 rounded-md p-2">
+      <ShapeBadge shape={card.leftShape} />
+      <span className="text-[10px] uppercase tracking-widest text-slate-500">+</span>
+      <ShapeBadge shape={card.rightShape} />
+      <div className="ml-auto text-[9px] uppercase tracking-widest text-slate-500">Signature</div>
+    </div>
+  );
+}
+
+function ShapeBadge({ shape }: { shape: ShapeType }) {
+  const def = SHAPE_DEFAULTS[shape];
+  return (
+    <div
+      className="w-8 h-8 flex items-center justify-center"
+      aria-label={SHAPE_LABEL[shape]}
+      title={SHAPE_LABEL[shape]}
+    >
+      <div
+        style={{
+          width: 22 * def.baseScale,
+          height: 22 * def.baseScale,
+          backgroundColor: SHAPE_COLORS[shape],
+          borderRadius: def.borderRadius,
+          clipPath: def.clipPath,
+          transform: `rotate(${def.rotate}deg)`,
+        }}
+      />
+    </div>
   );
 }
 
@@ -143,12 +191,14 @@ const REVEAL_TITLES: Record<PendingReveal['reveal'], string> = {
   opponentHand: "Opponent's Full Hand",
   opponentUncombined: "Opponent's Uncombined Cards",
   opponentLayout: "Opponent's Layout",
+  signatureShapes: "Pitcher's Signature Shapes",
 };
 
 const REVEAL_SUBTITLES: Record<PendingReveal['reveal'], string> = {
   opponentHand: 'all 5 cards visible',
   opponentUncombined: 'cards that cannot connect',
   opponentLayout: 'current arrangement',
+  signatureShapes: 'shapes only -- no values',
 };
 
 function computeRevealedCards(
@@ -164,6 +214,13 @@ function computeRevealedCards(
       return opponentHand;
     case 'opponentUncombined':
       return uncombinedCards(opponentHand);
+    case 'signatureShapes':
+      // b-121 Catcher's Eye: only signature cards' shapes are visible. Filter
+      // out generals / disabled cards so the catcher's peek matches the
+      // description ("the Pitcher's signature shapes").
+      return opponentHand.filter(
+        (c) => c.abilityType === 'Signature' && !c.disabled,
+      );
   }
 }
 

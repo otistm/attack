@@ -2,13 +2,26 @@ import { create } from "zustand";
 import { CardDefinition } from "./cards";
 import { BATTERS, dealHand, MlbPlayer, PITCHERS } from "./players";
 import { HitOutcome, resolveHitScale, scoreHand, ScoringContext, ScoringResult } from "./scoring";
+import { canConnect, seamKey } from "./connect";
 import { applyCardEffect, EffectContext } from "./cardEffects";
 import { applyHandTransforms } from "./handTransforms";
 import { applyDealEffects } from "./dealEffects";
 import { applyResolveStep, PendingDebuff, RunnerSlot } from "./resolveStep";
 import type { ShapeType } from "../components/cardShapes";
+import {
+  aiBidAmount,
+  aiBidDecision,
+  aiNominate,
+  type DraftState,
+  initDraftState,
+  nominate as draftNominateFn,
+  passBid as draftPassFn,
+  placeBid as draftPlaceBidFn,
+} from "./draft";
 
 export type Half = "top" | "bottom";
+export type Team = "HOME" | "AWAY";
+export type Side = "Batting" | "Pitching";
 /**
  * `revealing` sits between `selecting` and `between-at-bats`. lockIn computes
  * the final outcome (and applies bases / runs / outs) but parks the phase here
@@ -17,7 +30,13 @@ export type Half = "top" | "bottom";
  * beats -- before transitioning to the resolved state. The destination phase
  * (between-at-bats or game-over) is stashed in `pendingResolvedPhase`.
  */
-export type Phase = "selecting" | "resolving" | "revealing" | "between-at-bats" | "game-over";
+export type Phase =
+  | "drafting"
+  | "selecting"
+  | "resolving"
+  | "revealing"
+  | "between-at-bats"
+  | "game-over";
 
 /**
  * One step of the lock-in reveal animation. The orchestrator in
@@ -55,7 +74,15 @@ export type ResolutionBeat =
       delta: number;
       label: string;
     }
-  | { kind: "guessPitchHit"; delta: number }
+  | {
+      kind: "guessPitchHit";
+      /** Always the b-65 card id. Carried so the reveal orchestrator can
+       *  light up the source card the same way other source-attributable
+       *  beats (selfModifier, targetedDebuff, aggregateDebuff) do -- the
+       *  player should SEE Guess Pitch fire, not just see a banner. */
+      sourceCardId: string;
+      delta: number;
+    }
   | {
       kind: "crossDebuff";
       affectedSide: "Batting" | "Pitching";
@@ -65,19 +92,27 @@ export type ResolutionBeat =
 export type Bases = [boolean, boolean, boolean]; // [1B, 2B, 3B]
 
 /**
- * Which side of the matchup the human player is sitting in. Today this is
- * always the batter -- the pitcher hand is dealt and resolved by the engine
- * with no AI assistance, so opponent-side prompts (p-56 Pinpoint Control)
- * silently no-op and opponent-side peeks (p-51 Veteran Savvy, p-59 Nasty
- * Slider) are never surfaced to the player. UI components import this to
- * filter `pendingChoices` and `pendingReveals` down to the user's seat,
- * preventing information leaks like the batter seeing what the pitcher
- * "knows" about their hand.
+ * Which side of the matchup the human player is currently in.
  *
- * Promote to a per-game store field once we add a pitcher-mode toggle or
- * head-to-head play.
+ * Derived from `userTeam` + `half`:
+ *  - AWAY team bats in the top, pitches in the bottom.
+ *  - HOME team bats in the bottom, pitches in the top.
+ *
+ * UI components and engine branches that used to read the `USER_SIDE`
+ * constant now select this through `useGameStore(getUserSide)` (or call
+ * `getUserSide(get())` from inside actions). The result drives:
+ *  - `PlayerChoiceModal` / `InfoRevealOverlay` filtering (the user only
+ *    ever sees prompts/peeks for the seat they're in).
+ *  - `CardGameOverlay` UI inversion (bottom strip belongs to whichever
+ *    role the user has this half).
+ *  - `CameraRig` pose selection (mirrored to behind-the-pitcher when on
+ *    defense).
+ *  - The naive AI policy in the engine for the OTHER seat.
  */
-export const USER_SIDE: "Batting" | "Pitching" = "Batting";
+export function getUserSide(s: { userTeam: Team; half: Half }): Side {
+  if (s.userTeam === "HOME") return s.half === "bottom" ? "Batting" : "Pitching";
+  return s.half === "top" ? "Batting" : "Pitching";
+}
 
 /**
  * Open question presented to the player after the hand is dealt and before
@@ -117,7 +152,16 @@ export type ResolvedChoice =
 /** Information-reveal request. Phase 1 stores the request; the overlay UI is wired in Phase 2. */
 export interface PendingReveal {
   forSide: "Batting" | "Pitching";
-  reveal: "opponentHand" | "opponentUncombined" | "opponentLayout";
+  /**
+   * Reveal kind:
+   *  - opponentHand:       full opponent hand (cards + values)
+   *  - opponentUncombined: opponent's currently-uncombined cards only
+   *  - opponentLayout:     opponent's hand ordering (left/right per slot)
+   *  - signatureShapes:    only the L/R shapes of opponent SIGNATURE cards.
+   *    (b-121 Catcher's Eye -- narrower than opponentHand, lets the catcher
+   *    plan around pitch shapes without seeing values or generals.)
+   */
+  reveal: "opponentHand" | "opponentUncombined" | "opponentLayout" | "signatureShapes";
   source: string;
 }
 
@@ -145,6 +189,15 @@ export interface GameState {
   outs: number;
   isFirstAtBatOfInning: boolean;
   totalInnings: number;
+
+  /**
+   * Which team the human player is on. Combined with `half` (via
+   * `getUserSide`) this decides whether the user is batting or pitching at
+   * any given moment, which drives UI inversion, the camera flip, and which
+   * seat the engine auto-plays. Persists across `reset()` unless the New
+   * Game picker explicitly reassigns it.
+   */
+  userTeam: Team;
 
   // Score.
   homeScore: number;
@@ -192,6 +245,23 @@ export interface GameState {
   pendingDebuffs: PendingDebuff[];
   /** Open player-choice prompts for the current at-bat. Defaults applied if unanswered. */
   pendingChoices: PendingChoice[];
+  /**
+   * Card id whose choice modal is currently open, or null if no modal is
+   * showing. Choices no longer auto-open the moment they're queued in
+   * `pendingChoices` -- the player has to actively trigger them via the
+   * "USE" pill on their hand strip. This gives the user agency over WHEN
+   * to commit a guess / shape change instead of blocking selection while
+   * the player is still arranging cards.
+   *
+   * Cleared by:
+   *  - `resolveChoice` once the player picks (the choice is also removed
+   *    from `pendingChoices`).
+   *  - `dismissChoice` if the player closes without picking (the choice
+   *    stays in `pendingChoices` so they can re-trigger it later).
+   *  - `lockIn`, `startNextAtBat`, `reset` -- the modal can't survive a
+   *    phase change.
+   */
+  activeChoiceCardId: string | null;
   /** Resolved choices keyed by cardId. See `ResolvedChoice` for shape variants. */
   resolvedChoices: Record<string, ResolvedChoice>;
   /** Information-reveal requests the UI should render this at-bat. */
@@ -204,6 +274,33 @@ export interface GameState {
    * cards. Reset every fresh at-bat.
    */
   pitcherTransformsImpactingBatter: string[];
+
+  /**
+   * Set of user-affirmed connection seams in the USER'S hand (whichever
+   * side they're playing this half -- batter when on offense, pitcher
+   * when on defense). Each entry is a `seamKey(idA, idB)` (cards.ts ids,
+   * lex-sorted). A seam is active in the UI and the scoring engine ONLY
+   * when the cards are currently adjacent, `canConnect` allows it, AND
+   * the seam id is in this set -- even two perfectly-mateable cards
+   * sitting next to each other do NOTHING until the player drags one
+   * onto the other.
+   *
+   * Why a Set instead of recomputing from layout: previously the engine
+   * auto-chained any adjacent canConnect pair, which playtest feedback
+   * called out as "no agency -- the deal solves itself". Routing
+   * connections through this set turns chain-building into a deliberate
+   * action.
+   *
+   * The AI's hand (the seat the user is NOT on) auto-connects on
+   * adjacency -- the AI has no drag UI, so we leave its scoring path on
+   * legacy semantics by passing `affirmedSeams: null` into its
+   * `ScoringContext`.
+   *
+   * Reset to an empty set on every fresh deal, on reset, on
+   * startNextAtBat, AND when the half flips and the user changes seats
+   * (a brand-new hand on the new role starts with NO connections).
+   */
+  affirmedSeams: ReadonlySet<string>;
 
   /**
    * Coin flips resolved at lock-in time for cards whose effect tosses (e.g.
@@ -236,9 +333,36 @@ export interface GameState {
    */
   pendingResolvedPhase: Phase | null;
 
+  /**
+   * Active draft state when `phase === "drafting"`. Null whenever the user
+   * isn't mid-draft -- e.g. during gameplay AND on first load (the initial
+   * game seed is dealt from the global pool so existing tests + the dev
+   * boot-up still work without touching the auction flow). Replaced wholesale
+   * by `startDraft` and cleared by `completeDraft`.
+   *
+   * The store actions (`draftNominate`, `draftBid`, `draftPass`, `draftAiTick`)
+   * are thin wrappers that thread this slice through the pure helpers in
+   * `./draft.ts`.
+   */
+  draft: DraftState | null;
+
   // Actions.
   reorderBatterHand: (cards: CardDefinition[]) => void;
   reorderPitcherHand: (cards: CardDefinition[]) => void;
+  /**
+   * Called by the BATTER strip on drag-end. Recomputes the
+   * `affirmedSeams` set against the current `batterHand` order:
+   *   1. Prunes seams that are no longer current adjacencies (the cards
+   *      moved apart) or that lost `canConnect` eligibility (e.g. a shape
+   *      transform after the user-affirmed it).
+   *   2. Adds the dragged card's NEW left/right adjacencies if those pairs
+   *      are mechanically connectable.
+   *
+   * The drop is the affirming gesture: even if the user picks up a card
+   * and drops it back in place without reordering, the new neighbors get
+   * affirmed so a "tap to confirm" workflow exists.
+   */
+  affirmDraggedCard: (cardId: string) => void;
   scoreBatter: () => ScoringResult;
   scorePitcher: () => ScoringResult;
   /**
@@ -264,8 +388,62 @@ export interface GameState {
    */
   completeReveal: () => void;
   startNextAtBat: () => void;
-  reset: () => void;
+  /**
+   * Reset to a fresh game. If `team` is provided, the user plays as that
+   * team for the new game; otherwise the existing `userTeam` is reused so
+   * the New Game button can carry the player's team across rematches.
+   */
+  reset: (team?: Team) => void;
+  setUserTeam: (team: Team) => void;
   resolveChoice: (cardId: string, value: ResolvedChoice) => void;
+  /**
+   * Open the choice modal for the given card. The card must currently
+   * have an entry in `pendingChoices` -- otherwise the call is a no-op
+   * (defensive: stale clicks after `lockIn` shouldn't pop a modal). Used
+   * by the per-card "USE" pill on the user's hand strip.
+   */
+  triggerChoice: (cardId: string) => void;
+  /**
+   * Close the active choice modal without resolving. The pending choice
+   * stays queued so the player can re-trigger it; only `lockIn` finalizes
+   * unresolved choices into "declined".
+   */
+  dismissChoice: () => void;
+
+  // ----- Draft (auction) actions -----
+
+  /**
+   * Replace the historical reset path: pick a team AND open the pre-game
+   * auction draft. Sets `phase = "drafting"` and seeds `draft` with a
+   * fresh DraftState (empty rosters, full pool, AI archetype rolled).
+   * The user is always the first nominator.
+   */
+  startDraft: (team: Team) => void;
+  /**
+   * Open an auction on the given player. No-op unless `phase === "drafting"`,
+   * the user is the current nominator, and the player is in the pool. The
+   * user implicitly opens at $1.
+   */
+  draftNominate: (playerId: string) => void;
+  /** Place a bid for the user side. No-op outside the bidding sub-phase. */
+  draftBid: (amount: number) => void;
+  /** Pass for the user side. May immediately resolve the auction. */
+  draftPass: () => void;
+  /**
+   * Drive the AI's turn (nominate / bid / pass) once. The DraftScreen calls
+   * this from a `useEffect` whenever it detects the AI is the current actor;
+   * the small artificial delay used by the UI is what produces the
+   * "AI considering..." pulse the player sees.
+   */
+  draftAiTick: () => void;
+  /**
+   * Move from completed draft to gameplay. Transitions `phase` from
+   * "drafting" to "selecting" and seeds the first at-bat using the drafted
+   * rosters (so the dealer pulls from `draft.roster.user.batters` etc.
+   * instead of the global pool). Idempotent: a no-op if the draft isn't
+   * complete or we're already in gameplay.
+   */
+  completeDraft: () => void;
 }
 
 export interface MatchupPreview {
@@ -283,6 +461,38 @@ export interface MatchupPreview {
    * without the pill itself silently jumping by N once they actually win.
    */
   batterHitScaleBonus: number;
+
+  // ============ Per-side ScoringResults on the same hand the pill uses ===
+  // The strip's per-card values, the "Best chain" subtitle, and the math
+  // breakdown all read from these so they can never desync from the pill.
+  // (Previously `CardGameOverlay` called `scoreBatter()` directly with the
+  //  unmutated hand while the pill went through `previewMatchup` with the
+  //  p-41 Sweeping Slider seam-break applied -- chain shown vs pill total
+  //  could disagree by several points, with no UI to reconcile.)
+
+  /** Full scoring result on the (possibly p-41-mutated) working batter hand. */
+  batterScoringResult: ScoringResult;
+  /** Full scoring result on the pitcher hand. */
+  pitcherScoringResult: ScoringResult;
+
+  // ============ Components of `batterDisplay` =============================
+  // pillTotal === chainSum + pitcherDelta + carryoverDelta + guessDelta.
+  // When any of the cross-side deltas is non-zero, the UI shows a math
+  // breakdown so the player can see WHY their visible card sum doesn't
+  // match the pill -- previously these effects (p-38 / p-50 / p-60 / p-72 /
+  // p-90 aggregate debuffs, cross-at-bat carryover, b-65 guess bonus) only
+  // moved the pill, never the per-card numbers.
+
+  /** Sum of the batter's best-chain card values (the visible chain total). */
+  batterChainSum: number;
+  /** Aggregate pitcher pressure on the batter's pill (typically negative). */
+  batterPitcherDelta: number;
+  /** Cross-at-bat debuff carryover applied to the batter's pill. */
+  batterCarryoverDelta: number;
+  /** b-65 Guess Pitch bonus applied at lock-in (0/1/4). */
+  batterGuessDelta: number;
+  /** True when b-9 Generational Discipline is in play (debuffs zeroed). */
+  batterIgnoresDebuffs: boolean;
 }
 
 function pickRandom<T>(arr: T[]): T {
@@ -311,6 +521,28 @@ function pushRecent(list: string[], id: string, limit: number): string[] {
   return next.slice(0, limit);
 }
 
+/**
+ * Resolve which drafted player pools should staff the next at-bat. The
+ * batting team's drafted batters fill the batter slot; the fielding team's
+ * drafted pitchers fill the pitcher slot. Returns empty pools when no
+ * draft has been completed -- `freshAtBat` then falls back to the global
+ * BATTERS / PITCHERS lists, preserving back-compat for tests and the
+ * INITIAL_AT_BAT seed.
+ */
+function rosterPoolsFor(s: { draft: DraftState | null; userTeam: Team; half: Half }): {
+  battersPool?: MlbPlayer[];
+  pitchersPool?: MlbPlayer[];
+} {
+  if (!s.draft || s.draft.phase !== "complete") return {};
+  const battingTeam: Team = s.half === "top" ? "AWAY" : "HOME";
+  const battingSide = battingTeam === s.userTeam ? "user" : "ai";
+  const fieldingSide = battingSide === "user" ? "ai" : "user";
+  return {
+    battersPool: s.draft.roster[battingSide].batters,
+    pitchersPool: s.draft.roster[fieldingSide].pitchers,
+  };
+}
+
 interface FreshAtBat {
   batter: MlbPlayer;
   pitcher: MlbPlayer;
@@ -337,9 +569,25 @@ interface FreshAtBat {
  * Also derives the pending choice/reveal queues from cards in either hand so
  * the eventual modal/peek UI knows what to ask about.
  */
-function freshAtBat(recent?: { batters?: string[]; pitchers?: string[] }): FreshAtBat {
-  const batter = pickAvoidingRecent(BATTERS, recent?.batters ?? []);
-  const pitcher = pickAvoidingRecent(PITCHERS, recent?.pitchers ?? []);
+/**
+ * Optional roster pools to draw from. After a completed draft, the store
+ * passes in the BATTING TEAM's drafted batters and the FIELDING TEAM's
+ * drafted pitchers so each at-bat is staffed from the team the user (or AI)
+ * actually built. When omitted, falls back to the full BATTERS / PITCHERS
+ * pool -- preserves the existing seed-deal-on-import flow and keeps tests
+ * that don't run a draft happy.
+ */
+interface FreshAtBatOptions {
+  recent?: { batters?: string[]; pitchers?: string[] };
+  battersPool?: MlbPlayer[];
+  pitchersPool?: MlbPlayer[];
+}
+
+function freshAtBat(opts: FreshAtBatOptions = {}): FreshAtBat {
+  const battersPool = opts.battersPool && opts.battersPool.length > 0 ? opts.battersPool : BATTERS;
+  const pitchersPool = opts.pitchersPool && opts.pitchersPool.length > 0 ? opts.pitchersPool : PITCHERS;
+  const batter = pickAvoidingRecent(battersPool, opts.recent?.batters ?? []);
+  const pitcher = pickAvoidingRecent(pitchersPool, opts.recent?.pitchers ?? []);
   const rawBatter = dealHand(batter);
   const rawPitcher = dealHand(pitcher);
 
@@ -413,13 +661,16 @@ function derivePendingChoices(
   return out;
 }
 
-function derivePendingReveals(
+export function derivePendingReveals(
   batterHand: CardDefinition[],
   pitcherHand: CardDefinition[],
 ): PendingReveal[] {
   const out: PendingReveal[] = [];
   if (batterHand.some((c) => c.id === "b-7")) {
     out.push({ forSide: "Batting", reveal: "opponentUncombined", source: "Soto Shuffle" });
+  }
+  if (batterHand.some((c) => c.id === "b-121")) {
+    out.push({ forSide: "Batting", reveal: "signatureShapes", source: "Catcher's Eye" });
   }
   if (pitcherHand.some((c) => c.id === "p-51")) {
     out.push({ forSide: "Pitching", reveal: "opponentHand", source: "Veteran Savvy" });
@@ -432,6 +683,15 @@ function derivePendingReveals(
 
 const INITIAL_AT_BAT = freshAtBat();
 
+// Boot the app straight into the draft. The placeholder at-bat above only
+// exists so the 3D scene has something to render behind the draft overlay
+// (and so the rest of the store can stay non-nullable on `batter` / `pitcher`).
+// The user picks players via the auction; `completeDraft` then re-deals the
+// real first at-bat from their drafted rosters. Without this default, the
+// player would briefly see the field for one frame before the draft mounted,
+// which read as a flash of the wrong screen.
+const INITIAL_DRAFT = initDraftState();
+
 export const useGameStore = create<GameState>((set, get) => ({
   inning: 1,
   half: "top",
@@ -439,11 +699,15 @@ export const useGameStore = create<GameState>((set, get) => ({
   isFirstAtBatOfInning: true,
   totalInnings: 9,
 
+  // Default AWAY preserves the historical "user bats in the top of the
+  // 1st" cadence -- existing tests and playtest muscle memory carry over.
+  userTeam: "AWAY",
+
   homeScore: 0,
   awayScore: 0,
   bases: [false, false, false],
 
-  phase: "selecting",
+  phase: "drafting",
   ...INITIAL_AT_BAT,
   atBatId: 1,
 
@@ -457,20 +721,70 @@ export const useGameStore = create<GameState>((set, get) => ({
 
   pendingDebuffs: [],
   resolvedChoices: {},
+  activeChoiceCardId: null,
   coinFlips: {},
+  // Fresh hand = zero affirmed connections. Even if the dealt order
+  // happens to put two mateable cards next to each other, they don't
+  // chain until the player drags one of them in place.
+  affirmedSeams: new Set<string>(),
   recentBatterIds: [INITIAL_AT_BAT.batter.id],
   recentPitcherIds: [INITIAL_AT_BAT.pitcher.id],
 
   revealScript: [],
   pendingResolvedPhase: null,
 
+  draft: INITIAL_DRAFT,
+
   reorderBatterHand: (cards) => set({ batterHand: cards }),
   reorderPitcherHand: (cards) => set({ pitcherHand: cards }),
+
+  affirmDraggedCard: (cardId) =>
+    set((s) => {
+      // Recompute against whichever hand the user is currently playing.
+      // When pitching, drags happen on the pitcher hand, so its seams
+      // are the ones that affirm/de-affirm.
+      const hand = getUserSide(s) === "Batting" ? s.batterHand : s.pitcherHand;
+      const idx = hand.findIndex((c) => c.id === cardId);
+      if (idx === -1) return {};
+
+      // Build the next set in two passes:
+      //   1. Carry over any previously-affirmed seams that are STILL valid
+      //      (still adjacent, still canConnect). Anything else falls off --
+      //      moved-apart cards lose their bond, even if the user re-adjacent
+      //      them later (re-adjacency is a fresh decision).
+      //   2. Affirm the dragged card's new left + right seams if those
+      //      neighbors mechanically connect.
+      const next = new Set<string>();
+      for (let i = 1; i < hand.length; i++) {
+        const a = hand[i - 1];
+        const b = hand[i];
+        const key = seamKey(a.id, b.id);
+        if (s.affirmedSeams.has(key) && canConnect(a, b)) {
+          next.add(key);
+        }
+      }
+      if (idx > 0) {
+        const left = hand[idx - 1];
+        const me = hand[idx];
+        if (canConnect(left, me)) next.add(seamKey(left.id, me.id));
+      }
+      if (idx < hand.length - 1) {
+        const me = hand[idx];
+        const right = hand[idx + 1];
+        if (canConnect(me, right)) next.add(seamKey(me.id, right.id));
+      }
+      return { affirmedSeams: next };
+    }),
 
   resolveChoice: (cardId, value) =>
     set((s) => {
       const remainingChoices = s.pendingChoices.filter((c) => c.cardId !== cardId);
       const resolvedChoices = { ...s.resolvedChoices, [cardId]: value };
+      // Always close the modal once the player commits -- the trigger pill
+      // for this card disappears in the same render because the choice is
+      // now in `resolvedChoices` and out of `pendingChoices`.
+      const activeChoiceCardId =
+        s.activeChoiceCardId === cardId ? null : s.activeChoiceCardId;
 
       // Modify-shape choices (b-12 Switch Hitter, p-56 Pinpoint Control):
       // the modal hands us {targetCardId, side, shape}. The player owns the
@@ -478,18 +792,18 @@ export const useGameStore = create<GameState>((set, get) => ({
       if (value.kind === "modifyShape") {
         const owningHandKey = cardId === "b-12" ? "batterHand" : cardId === "p-56" ? "pitcherHand" : null;
         if (!owningHandKey) {
-          return { resolvedChoices, pendingChoices: remainingChoices };
+          return { resolvedChoices, pendingChoices: remainingChoices, activeChoiceCardId };
         }
         const hand = s[owningHandKey];
         const idx = hand.findIndex((c) => c.id === value.targetCardId);
         if (idx === -1) {
           // Target not in the prompting player's hand -- ignore silently.
-          return { resolvedChoices, pendingChoices: remainingChoices };
+          return { resolvedChoices, pendingChoices: remainingChoices, activeChoiceCardId };
         }
         // b-12 only allows the player to retarget their own General cards;
         // refuse a sneaky signature pick that bypasses the modal's filter.
         if (cardId === "b-12" && hand[idx].abilityType !== "General Draw") {
-          return { resolvedChoices, pendingChoices: remainingChoices };
+          return { resolvedChoices, pendingChoices: remainingChoices, activeChoiceCardId };
         }
         const updated = [...hand];
         updated[idx] =
@@ -499,14 +813,31 @@ export const useGameStore = create<GameState>((set, get) => ({
         return {
           resolvedChoices,
           pendingChoices: remainingChoices,
+          activeChoiceCardId,
           [owningHandKey]: updated,
         };
       }
 
       // b-65 Guess Pitch (kind === "shape"): just record the answer; lockIn
       // applies the bonus during scoring.
-      return { resolvedChoices, pendingChoices: remainingChoices };
+      return { resolvedChoices, pendingChoices: remainingChoices, activeChoiceCardId };
     }),
+
+  triggerChoice: (cardId) =>
+    set((s) => {
+      // Defensive: only open the modal if this card actually has an open
+      // pending choice on the user's side. Stale clicks (e.g. a queued
+      // pointer event firing after lockIn cleared `pendingChoices`) become
+      // a no-op so we never strand the modal on a non-existent choice.
+      const userSide = getUserSide(s);
+      const exists = s.pendingChoices.some(
+        (c) => c.cardId === cardId && c.side === userSide,
+      );
+      if (!exists) return {};
+      return { activeChoiceCardId: cardId };
+    }),
+
+  dismissChoice: () => set({ activeChoiceCardId: null }),
 
   scoreBatter: () => {
     const s = get();
@@ -524,6 +855,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       outs: s.outs,
       isFinalInning: s.inning === s.totalInnings,
       batterHandedness: s.batter.handedness,
+      pitcherHandedness: s.pitcher.handedness,
       opponentHand: s.pitcherHand,
       opponentBaseCard: highestValueCard(s.pitcherHand),
       nullifiedCardIds: nullified,
@@ -533,12 +865,43 @@ export const useGameStore = create<GameState>((set, get) => ({
       half: s.half,
       homeScore: s.homeScore,
       awayScore: s.awayScore,
+      // Manual-chain mechanic: the user's side reads from `affirmedSeams`,
+      // the AI's side stays on legacy auto-connect (`null`). Branch on
+      // current seat -- when the user is pitching, the batter is the AI.
+      affirmedSeams: getUserSide(s) === "Batting" ? s.affirmedSeams : null,
     };
     return scoreHand(s.batterHand, ctx);
   },
 
   scorePitcher: () => {
     const s = get();
+    // Phase 7: batter-side cards that suppress pitcher mechanics this round.
+    //  - b-105 Atlanta-LA Ring: nullifies the pitcher's BASE card ability.
+    //  - b-108 DH Threat: nullifies any off-speed pitch ability.
+    //  - b-127 Mr. Smile: when combined, nullifies the pitcher's lowest
+    //    UNCOMBINED card. Adds an id to `nullifiedCardIds` (same channel
+    //    p-36 Ace's Command uses).
+    //
+    // All three flags only fire when the BATTER holds the card -- they're
+    // indexed off `s.batterHand` regardless of who the user is playing as, so
+    // the AI batter's b-105/b-108/b-127 still apply when the user is pitching.
+    const nullifyOpponentBaseMechanic = s.batterHand.some((c) => c.id === "b-105");
+    const offSpeedThreat = s.batterHand.some((c) => c.id === "b-108");
+    const nullifyOpponentTagMechanics = offSpeedThreat
+      ? (["off-speed"] as const)
+      : undefined;
+
+    const nullifiedSet = new Set<string>();
+    const batterAffirmed =
+      getUserSide(s) === "Batting" ? s.affirmedSeams : null;
+    if (
+      s.batterHand.some((c) => c.id === "b-127") &&
+      isCardCombinedInHand(s.batterHand, "b-127", batterAffirmed)
+    ) {
+      const target = lowestUncombinedInHand(s.pitcherHand, null);
+      if (target) nullifiedSet.add(target.id);
+    }
+
     const ctx: ScoringContext = {
       side: "Pitching",
       inning: s.inning,
@@ -546,14 +909,22 @@ export const useGameStore = create<GameState>((set, get) => ({
       outs: s.outs,
       isFinalInning: s.inning === s.totalInnings,
       batterHandedness: s.batter.handedness,
+      pitcherHandedness: s.pitcher.handedness,
       opponentHand: s.batterHand,
       opponentBaseCard: highestValueCard(s.batterHand),
+      nullifiedCardIds: nullifiedSet.size > 0 ? nullifiedSet : undefined,
       coinFlips: s.coinFlips,
       // Phase 6: live game-state triggers for runners / score / half.
       bases: s.bases,
       half: s.half,
       homeScore: s.homeScore,
       awayScore: s.awayScore,
+      // Phase 7 silencers (set above).
+      nullifyOpponentBaseMechanic,
+      nullifyOpponentTagMechanics,
+      // Mirror of scoreBatter: route affirmedSeams to whichever side
+      // the user is currently playing. AI keeps legacy auto-connect.
+      affirmedSeams: getUserSide(s) === "Pitching" ? s.affirmedSeams : null,
     };
     return scoreHand(s.pitcherHand, ctx);
   },
@@ -574,12 +945,27 @@ export const useGameStore = create<GameState>((set, get) => ({
         ? s.scoreBatter()
         : scoreHandFor(s, workingBatter, "Batting");
     const pitcherResult = s.scorePitcher();
-    const m = computeMatchup(s, batterResult, pitcherResult);
+    // Selection-phase preview: hide the guess-pitch bonus from the pill so
+    // the player doesn't get a free "did I guess right?" tell from the
+    // pitcher's still-face-down hand. lockIn calls computeMatchup with the
+    // default `revealsGuess: true` so the final score still reflects it.
+    const m = computeMatchup(s, batterResult, pitcherResult, /* revealsGuess */ false);
     return {
       batterDisplay: m.batterDisplay,
       pitcherDisplay: m.pitcherDisplay,
       batterWinning: m.batterWins,
       batterHitScaleBonus: m.batterHitScaleNet,
+      // The strip and "Best chain" / breakdown UI all key off the same
+      // ScoringResult that fed the pill -- when p-41 mutates the working
+      // hand, the per-card values, the bestGroup membership ring, and the
+      // pill total all stay in lockstep.
+      batterScoringResult: batterResult,
+      pitcherScoringResult: pitcherResult,
+      batterChainSum: m.batterChainSum,
+      batterPitcherDelta: m.batterPitcherDelta,
+      batterCarryoverDelta: m.batterCarryoverDelta,
+      batterGuessDelta: m.batterGuessDelta,
+      batterIgnoresDebuffs: m.batterIgnoresDebuffs,
     };
   },
 
@@ -681,6 +1067,10 @@ export const useGameStore = create<GameState>((set, get) => ({
       revealScript: script,
       runnerMoves: next.runnerMoves,
       pendingDebuffs: nextDebuffs,
+      // Phase change closes any modal the player left open. The choice is
+      // already snapshot into resolvedChoices (or auto-declined) by the
+      // scoring path -- the modal is just visual at this point.
+      activeChoiceCardId: null,
     });
   },
 
@@ -697,9 +1087,11 @@ export const useGameStore = create<GameState>((set, get) => ({
   startNextAtBat: () => {
     const s = get();
     if (s.phase === "game-over") return;
+    const pools = rosterPoolsFor(s);
     const ab = freshAtBat({
-      batters: s.recentBatterIds,
-      pitchers: s.recentPitcherIds,
+      recent: { batters: s.recentBatterIds, pitchers: s.recentPitcherIds },
+      battersPool: pools.battersPool,
+      pitchersPool: pools.pitchersPool,
     });
     set({
       ...ab,
@@ -714,7 +1106,11 @@ export const useGameStore = create<GameState>((set, get) => ({
       // isFirstAtBatOfInning gets set to false after the first at-bat of the half.
       isFirstAtBatOfInning: false,
       resolvedChoices: {},
+      activeChoiceCardId: null,
       coinFlips: {},
+      // Fresh hand -> zero affirmed connections. Player must re-forge any
+      // chain by dragging cards in place.
+      affirmedSeams: new Set<string>(),
       recentBatterIds: pushRecent(s.recentBatterIds, ab.batter.id, RECENT_BATTER_LIMIT),
       recentPitcherIds: pushRecent(s.recentPitcherIds, ab.pitcher.id, RECENT_PITCHER_LIMIT),
       revealScript: [],
@@ -722,7 +1118,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     });
   },
 
-  reset: () => {
+  reset: (team) => {
     const s = get();
     const ab = freshAtBat();
     set({
@@ -730,6 +1126,9 @@ export const useGameStore = create<GameState>((set, get) => ({
       half: "top",
       outs: 0,
       isFirstAtBatOfInning: true,
+      // Preserve the player's team across New Game unless they explicitly
+      // re-pick. Default keeps backward-compat for callers that pass nothing.
+      userTeam: team ?? s.userTeam,
       homeScore: 0,
       awayScore: 0,
       bases: [false, false, false],
@@ -745,11 +1144,167 @@ export const useGameStore = create<GameState>((set, get) => ({
       runnerMoves: [],
       pendingDebuffs: [],
       resolvedChoices: {},
+      activeChoiceCardId: null,
       coinFlips: {},
+      affirmedSeams: new Set<string>(),
       recentBatterIds: [ab.batter.id],
       recentPitcherIds: [ab.pitcher.id],
       revealScript: [],
       pendingResolvedPhase: null,
+      // `reset` is the legacy "play with random pools" path -- clear any
+      // active draft so freshAtBat falls back to the global lists.
+      draft: null,
+    });
+  },
+
+  setUserTeam: (team) => set({ userTeam: team }),
+
+  // ============ Draft (auction) actions ====================================
+
+  startDraft: (team) => {
+    const s = get();
+    // Re-deal a placeholder at-bat from the global pools so the 3D backdrop
+    // has SOMETHING idle to render behind the draft overlay. `completeDraft`
+    // will overwrite this with a real at-bat sourced from the drafted
+    // rosters, so this is purely scenery.
+    const ab = freshAtBat();
+    const draft = initDraftState();
+    // Full gameplay reset (matches `reset`) so leftover bases / scores /
+    // reveal scripts from a prior game can't bleed through the overlay.
+    // Without this, the backdrop visibly carried runners and a half-finished
+    // inning into a fresh draft.
+    set({
+      phase: "drafting",
+      userTeam: team,
+      draft,
+      inning: 1,
+      half: "top",
+      outs: 0,
+      isFirstAtBatOfInning: true,
+      homeScore: 0,
+      awayScore: 0,
+      bases: [false, false, false],
+      ...ab,
+      atBatId: s.atBatId + 1,
+      lastOutcome: null,
+      lastBatterScore: 0,
+      lastPitcherScore: 0,
+      lastResultMessage: "",
+      lastBatterCardModifiers: {},
+      lastPitcherCardModifiers: {},
+      runnerMoves: [],
+      pendingDebuffs: [],
+      resolvedChoices: {},
+      activeChoiceCardId: null,
+      coinFlips: {},
+      affirmedSeams: new Set<string>(),
+      recentBatterIds: [ab.batter.id],
+      recentPitcherIds: [ab.pitcher.id],
+      revealScript: [],
+      pendingResolvedPhase: null,
+    });
+  },
+
+  draftNominate: (playerId) => {
+    const s = get();
+    if (s.phase !== "drafting" || !s.draft) return;
+    if (s.draft.nominator !== "user") return;
+    const next = draftNominateFn(s.draft, playerId, "user");
+    if (next === s.draft) return;
+    set({ draft: next });
+  },
+
+  draftBid: (amount) => {
+    const s = get();
+    if (s.phase !== "drafting" || !s.draft) return;
+    const next = draftPlaceBidFn(s.draft, "user", amount);
+    if (next === s.draft) return;
+    set({ draft: next });
+  },
+
+  draftPass: () => {
+    const s = get();
+    if (s.phase !== "drafting" || !s.draft) return;
+    const next = draftPassFn(s.draft, "user");
+    if (next === s.draft) return;
+    set({ draft: next });
+  },
+
+  draftAiTick: () => {
+    const s = get();
+    if (s.phase !== "drafting" || !s.draft) return;
+    const d = s.draft;
+    if (d.phase === "complete") return;
+    if (d.phase === "nominating") {
+      if (d.nominator !== "ai") return;
+      const pick = aiNominate(d);
+      if (!pick) return;
+      const next = draftNominateFn(d, pick.id, "ai");
+      if (next === d) return;
+      set({ draft: next });
+      return;
+    }
+    if (d.phase === "bidding" && d.activeAuction) {
+      const auction = d.activeAuction;
+      // Only act when AI is the side facing the bid (not the high bidder).
+      if (auction.highBidder === "ai") return;
+      if (auction.passed.ai) return;
+      const decision = aiBidDecision(d);
+      if (decision === "raise") {
+        const amount = aiBidAmount(d);
+        const next = draftPlaceBidFn(d, "ai", amount);
+        if (next === d) return;
+        set({ draft: next });
+      } else {
+        const next = draftPassFn(d, "ai");
+        if (next === d) return;
+        set({ draft: next });
+      }
+    }
+  },
+
+  completeDraft: () => {
+    const s = get();
+    if (s.phase !== "drafting" || !s.draft) return;
+    if (s.draft.phase !== "complete") return;
+    // Seed the first at-bat from the drafted rosters.
+    const battingTeam: Team = s.half === "top" ? "AWAY" : "HOME";
+    const battingSide = battingTeam === s.userTeam ? "user" : "ai";
+    const fieldingSide = battingSide === "user" ? "ai" : "user";
+    const ab = freshAtBat({
+      battersPool: s.draft.roster[battingSide].batters,
+      pitchersPool: s.draft.roster[fieldingSide].pitchers,
+    });
+    set({
+      phase: "selecting",
+      ...ab,
+      atBatId: s.atBatId + 1,
+      inning: 1,
+      half: "top",
+      outs: 0,
+      isFirstAtBatOfInning: true,
+      homeScore: 0,
+      awayScore: 0,
+      bases: [false, false, false],
+      lastOutcome: null,
+      lastBatterScore: 0,
+      lastPitcherScore: 0,
+      lastResultMessage: "",
+      lastBatterCardModifiers: {},
+      lastPitcherCardModifiers: {},
+      runnerMoves: [],
+      pendingDebuffs: [],
+      resolvedChoices: {},
+      activeChoiceCardId: null,
+      coinFlips: {},
+      affirmedSeams: new Set<string>(),
+      recentBatterIds: [ab.batter.id],
+      recentPitcherIds: [ab.pitcher.id],
+      revealScript: [],
+      pendingResolvedPhase: null,
+      // Draft state stays in place AFTER completion -- gameplay reads
+      // `draft.roster` to pick the next batter/pitcher each at-bat. Cleared
+      // by `reset` or replaced by the next `startDraft`.
     });
   },
 }));
@@ -789,6 +1344,9 @@ function scoreHandFor(
     half: s.half,
     homeScore: s.homeScore,
     awayScore: s.awayScore,
+    // The user's seat reads from affirmedSeams; the AI's seat stays on
+    // legacy auto-connect (null = "any adjacent canConnect pair chains").
+    affirmedSeams: side === getUserSide(s) ? s.affirmedSeams : null,
   };
   return scoreHand(hand, ctx);
 }
@@ -856,6 +1414,17 @@ interface ComputedMatchup {
    * between preview and final" surprise.
    */
   batterHitScaleNet: number;
+  // Per-component breakdown of `batterTotal` so the UI can surface
+  // "chain + pitcher + carryover + guess = pill" math under the BATTER
+  // pill. These already exist inside computeMatchup as locals; lifting
+  // them onto the return type lets `previewMatchup` forward them to the
+  // UI without re-deriving (and without leaking the pillage of cross-side
+  // effects from per-card values).
+  batterChainSum: number;
+  batterPitcherDelta: number;
+  batterCarryoverDelta: number;
+  batterGuessDelta: number;
+  batterIgnoresDebuffs: boolean;
 }
 
 /**
@@ -1016,9 +1585,11 @@ export function buildRevealScript(
   }
 
   // (4) b-65 Guess Pitch +4 if the pitcher actually used the named shape.
+  // computeGuessPitchBonus already guarantees b-65 is in the batter hand
+  // when this returns non-zero, so attaching its id is safe.
   const guessBonus = computeGuessPitchBonus(s);
   if (guessBonus !== 0) {
-    beats.push({ kind: "guessPitchHit", delta: guessBonus });
+    beats.push({ kind: "guessPitchHit", sourceCardId: "b-65", delta: guessBonus });
   }
 
   // (5) Cross-at-bat debuffs (p-58 Strikeout Artist hangover, etc). These
@@ -1124,6 +1695,20 @@ function computeMatchup(
   s: GameState,
   batterResult: ScoringResult,
   pitcherResult: ScoringResult,
+  /**
+   * Whether the b-65 Guess Pitch bonus should fold into the live totals.
+   *
+   * `lockIn` and other "the answer is now known" callers leave this `true`
+   * so the bonus is baked into `lastBatterScore` and the reveal-script's
+   * `guessPitchHit` beat can tween it onto the pill in front of the player.
+   *
+   * `previewMatchup` (the selection-phase HUD) passes `false`. The bonus
+   * is computed from the pitcher's still-face-down hand, so revealing it
+   * during selection effectively SPOILS the guess: a +4 leaks "you nailed
+   * the pitch", a +1 leaks "you missed". The bonus belongs to the result
+   * phase, when the pitcher hand has already flipped.
+   */
+  revealsGuess: boolean = true,
 ): ComputedMatchup {
   const batterDebuffDelta = sumPendingDebuffs(s.pendingDebuffs, "Batting");
   const pitcherDebuffDelta = sumPendingDebuffs(s.pendingDebuffs, "Pitching");
@@ -1133,7 +1718,7 @@ function computeMatchup(
   const effPitcherHitScaleWall = batterIgnoresDebuffs ? 0 : pitcherResult.hitScaleBonus;
   const effBatterDebuffDelta = batterIgnoresDebuffs ? 0 : batterDebuffDelta;
 
-  const guessPitchBonus = computeGuessPitchBonus(s);
+  const guessPitchBonus = revealsGuess ? computeGuessPitchBonus(s) : 0;
 
   const batterTotal =
     batterResult.maxValue + effPitcherOpponentMod + effBatterDebuffDelta + guessPitchBonus;
@@ -1175,6 +1760,11 @@ function computeMatchup(
     batterDisplay,
     pitcherDisplay: pitcherTotal,
     batterHitScaleNet,
+    batterChainSum: batterResult.maxValue,
+    batterPitcherDelta: effPitcherOpponentMod,
+    batterCarryoverDelta: effBatterDebuffDelta,
+    batterGuessDelta: guessPitchBonus,
+    batterIgnoresDebuffs,
   };
 }
 
@@ -1183,6 +1773,71 @@ function computeMatchup(
 function highestValueCard(hand: CardDefinition[]): CardDefinition | null {
   if (!hand || hand.length === 0) return null;
   return hand.reduce((a, b) => (b.baseValue > a.baseValue ? b : a));
+}
+
+/**
+ * Phase 7 helper: builds connection groups using the same "canConnect AND
+ * affirmedSeams" rule the scoring engine uses, then reports whether the
+ * named card ended up in a multi-card group. Used by b-127 Mr. Smile to
+ * gate its pitcher silencing on actual combine status (mirrors the way
+ * `scoreHand` picks `bestGroup`).
+ */
+function isCardCombinedInHand(
+  hand: CardDefinition[],
+  cardId: string,
+  affirmedSeams: ReadonlySet<string> | null,
+): boolean {
+  if (!hand.some((c) => c.id === cardId)) return false;
+  let group: CardDefinition[] = [hand[0]];
+  for (let i = 1; i < hand.length; i++) {
+    const prev = hand[i - 1];
+    const curr = hand[i];
+    const mechConnect = canConnect(prev, curr);
+    const userAffirmed =
+      affirmedSeams === null ? true : affirmedSeams.has(seamKey(prev.id, curr.id));
+    if (mechConnect && userAffirmed) {
+      group.push(curr);
+    } else {
+      if (group.length > 1 && group.some((c) => c.id === cardId)) return true;
+      group = [curr];
+    }
+  }
+  return group.length > 1 && group.some((c) => c.id === cardId);
+}
+
+/**
+ * Phase 7 helper: lowest-baseValue card in the hand whose seam group has size
+ * 1 (i.e. uncombined). Drives b-127's silencing target. Disabled cards are
+ * skipped so the silence can't be wasted on a card that's already neutralized
+ * by another effect (b-23, p-36 etc.).
+ */
+function lowestUncombinedInHand(
+  hand: CardDefinition[],
+  affirmedSeams: ReadonlySet<string> | null,
+): CardDefinition | null {
+  if (hand.length === 0) return null;
+  const groups: CardDefinition[][] = [];
+  let current: CardDefinition[] = [hand[0]];
+  for (let i = 1; i < hand.length; i++) {
+    const prev = hand[i - 1];
+    const curr = hand[i];
+    const mechConnect = canConnect(prev, curr);
+    const userAffirmed =
+      affirmedSeams === null ? true : affirmedSeams.has(seamKey(prev.id, curr.id));
+    if (mechConnect && userAffirmed) {
+      current.push(curr);
+    } else {
+      groups.push(current);
+      current = [curr];
+    }
+  }
+  groups.push(current);
+  const singletons = groups
+    .filter((g) => g.length === 1)
+    .map((g) => g[0])
+    .filter((c) => !c.disabled);
+  if (singletons.length === 0) return null;
+  return singletons.reduce((a, b) => (b.baseValue < a.baseValue ? b : a));
 }
 
 interface OutcomeApplyResult {
@@ -1208,7 +1863,13 @@ function nextMoveId(): string {
 function applyOutcome(
   s: GameState,
   outcome: HitOutcome,
-  resolveDelta: { outsAdjustment: number; removeRunnerHint: RunnerSlot | null; forceRunFromThird: boolean },
+  resolveDelta: {
+    outsAdjustment: number;
+    removeRunnerHint: RunnerSlot | null;
+    forceRunFromThird: boolean;
+    runnerAdvanceBoost: number;
+    extraRunnerOn: RunnerSlot | null;
+  },
 ): OutcomeApplyResult {
   let { inning, half, outs, homeScore, awayScore, totalInnings } = s;
   let bases: Bases = [...s.bases] as Bases;
@@ -1216,13 +1877,17 @@ function applyOutcome(
 
   // Advance runners by N bases. Returns the new bases array and runs scored,
   // and records each runner's logical journey so the 3D scene can animate it.
-  const advance = (steps: number) => {
+  // `runnerBoost` is added on top of `steps` ONLY for existing runners (b-120
+  // Steal Home -- the batter still takes the natural N bases). Boost is 0 for
+  // every outcome except b-120's combine+win path.
+  const advance = (steps: number, runnerBoost: number = 0) => {
     let runs = 0;
     const newBases: boolean[] = [false, false, false, false]; // last slot = home (scoring)
+    const existingRunnerSteps = steps + Math.max(0, runnerBoost);
     // Existing runners.
     for (let b = 0; b < 3; b++) {
       if (bases[b]) {
-        const dest = b + 1 + steps;
+        const dest = b + 1 + existingRunnerSteps;
         const fromSlot = BASE_INDEX_TO_SLOT[b]; // bases[0] = 1B, etc.
         const toSlot = dest >= 4 ? "scored" : BASE_INDEX_TO_SLOT[dest - 1];
         runnerMoves.push({ id: nextMoveId(), from: fromSlot, to: toSlot, kind: "runner" });
@@ -1245,6 +1910,7 @@ function applyOutcome(
   };
 
   let runs = 0;
+  const runnerBoost = resolveDelta.runnerAdvanceBoost ?? 0;
   switch (outcome) {
     case "out":
       outs += 1 + Math.max(0, resolveDelta.outsAdjustment);
@@ -1257,17 +1923,39 @@ function applyOutcome(
       }
       break;
     case "single":
-      runs = advance(1);
+      runs = advance(1, runnerBoost);
       break;
     case "double":
-      runs = advance(2);
+      runs = advance(2, runnerBoost);
       break;
     case "triple":
-      runs = advance(3);
+      runs = advance(3, runnerBoost);
       break;
     case "homerun":
-      runs = advance(4);
+      runs = advance(4, runnerBoost);
       break;
+  }
+
+  // b-135 Stolen Bag: drop an additional runner on the named base after the
+  // natural outcome resolves. If the slot is already occupied (e.g. a single
+  // already left a runner on 1B) the bag is silently spent -- no double
+  // stacking. Only fires when the resolve step requested it (gated on win).
+  if (resolveDelta.extraRunnerOn) {
+    const idx =
+      resolveDelta.extraRunnerOn === "first"
+        ? 0
+        : resolveDelta.extraRunnerOn === "second"
+          ? 1
+          : 2;
+    if (!bases[idx]) {
+      const slot = BASE_INDEX_TO_SLOT[idx];
+      runnerMoves.push({ id: nextMoveId(), from: "home", to: slot, kind: "runner" });
+      bases = [
+        idx === 0 ? true : bases[0],
+        idx === 1 ? true : bases[1],
+        idx === 2 ? true : bases[2],
+      ] as Bases;
+    }
   }
 
   // p-75 Pickoff Move: if the resolve step asked us to erase a runner, do it

@@ -1,20 +1,22 @@
 import { useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { useGameStore, USER_SIDE } from '../lib/gameStore';
+import { useGameStore, getUserSide } from '../lib/gameStore';
 import { ALL_CARDS, CardDefinition } from '../lib/cards';
 import type { PendingChoice, ResolvedChoice } from '../lib/gameStore';
-import { SHAPE_COLORS, SHAPE_DEFAULTS, ShapeType } from './cardShapes';
+import { SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeType } from './cardShapes';
 
 /**
- * Modal that surfaces pending player-choice questions queued by the engine
- * (b-12 Switch Hitter, b-65 Guess Pitch, p-56 Pinpoint Control). Shows one
- * question at a time -- when the player resolves it, gameStore.resolveChoice
- * mutates state and the next pending choice (if any) takes over.
+ * Modal that surfaces a player-choice question queued by the engine (b-12
+ * Switch Hitter, b-65 Guess Pitch, p-56 Pinpoint Control). The modal is
+ * NOT auto-opened anymore -- choices stay queued in `pendingChoices` and
+ * the player has to actively trigger them via the per-card "USE" pill on
+ * their hand strip. That sets `activeChoiceCardId`, which this component
+ * subscribes to.
  *
- * Only choices belonging to the user's seat (`USER_SIDE`) are surfaced.
- * Opponent-side choices (e.g. p-56 Pinpoint Control while the user bats) are
- * suppressed and silently default to "AI declined" -- showing them would let
- * the batter both see and trigger the pitcher's strategic moves.
+ * Only choices belonging to the user's CURRENT seat (`getUserSide(state)`,
+ * derived from `userTeam` + `half`) are surfaced. The opposite seat's
+ * prompts are suppressed and silently default to "AI declined" -- showing
+ * them would let the player both see and trigger the AI's strategic moves.
  *
  * `pickShape` choices that carry a `targets` list render the multi-step
  * wizard: pick which of YOUR cards to modify, pick which side, pick the new
@@ -24,16 +26,24 @@ export function PlayerChoiceModal() {
   const pendingChoices = useGameStore((s) => s.pendingChoices);
   const phase = useGameStore((s) => s.phase);
   const resolveChoice = useGameStore((s) => s.resolveChoice);
+  const dismissChoice = useGameStore((s) => s.dismissChoice);
+  const activeChoiceCardId = useGameStore((s) => s.activeChoiceCardId);
   const batterHand = useGameStore((s) => s.batterHand);
   const pitcherHand = useGameStore((s) => s.pitcherHand);
+  const userSide = useGameStore(getUserSide);
 
-  // Restrict the visible queue to the user's seat. We still call resolveChoice
-  // by cardId, so the engine path is unchanged for any opponent-side prompt
-  // we might decide to auto-resolve via AI later.
-  const userChoice = useMemo(
-    () => pendingChoices.find((c) => c.side === USER_SIDE) ?? null,
-    [pendingChoices],
-  );
+  // Match the open modal to its queued choice. Filtering by side is a
+  // double-belt-and-braces: triggerChoice already validates the cardId is
+  // user-side, but if state ever drifts (e.g. half-flip mid-modal), this
+  // keeps an opponent's prompt from rendering.
+  const userChoice = useMemo(() => {
+    if (!activeChoiceCardId) return null;
+    return (
+      pendingChoices.find(
+        (c) => c.cardId === activeChoiceCardId && c.side === userSide,
+      ) ?? null
+    );
+  }, [pendingChoices, userSide, activeChoiceCardId]);
 
   const open = phase === 'selecting' && userChoice !== null;
   const choice = userChoice;
@@ -47,6 +57,7 @@ export function PlayerChoiceModal() {
           batterHand={batterHand}
           pitcherHand={pitcherHand}
           onResolve={(value) => resolveChoice(choice.cardId, value)}
+          onDismiss={dismissChoice}
         />
       )}
     </AnimatePresence>
@@ -58,9 +69,15 @@ interface ChoicePanelProps {
   batterHand: CardDefinition[];
   pitcherHand: CardDefinition[];
   onResolve: (value: ResolvedChoice) => void;
+  /**
+   * Close the modal without resolving. The choice stays in `pendingChoices`
+   * so the player can re-trigger it from the "USE" pill, or let it expire
+   * to "declined" by clicking Lock In.
+   */
+  onDismiss: () => void;
 }
 
-function ChoicePanel({ choice, batterHand, pitcherHand, onResolve }: ChoicePanelProps) {
+function ChoicePanel({ choice, batterHand, pitcherHand, onResolve, onDismiss }: ChoicePanelProps) {
   const card = ALL_CARDS.find((c) => c.id === choice.cardId);
   const promptCopy = PROMPTS[choice.type] ?? 'Make a choice';
 
@@ -79,25 +96,49 @@ function ChoicePanel({ choice, batterHand, pitcherHand, onResolve }: ChoicePanel
   const isModifyShape = choice.type === 'pickShape' && targetCards.length > 0;
 
   return (
+    // Anchored just above the batter hand strip (bottom-0, h-80 = 320px) so
+    // the player's eyes don't have to travel from the modal at the top of
+    // the screen all the way back down to their cards to compare. The
+    // panel's bottom edge sits at `pb-80` (320px = the top edge of the
+    // hand strip) so the BATTER score pill rendered inside the strip stays
+    // visible directly below the modal. The backdrop still clips at
+    // `bottom-72` so the cards themselves stay un-dimmed and interactive.
     <motion.div
-      className="absolute inset-0 z-50 flex items-center justify-center pointer-events-auto px-4"
+      className="absolute inset-0 z-50 flex items-end justify-center pointer-events-none px-4 pb-80"
       initial={{ opacity: 0 }}
       animate={{ opacity: 1, transition: { duration: 0.2 } }}
       exit={{ opacity: 0, transition: { duration: 0.18 } }}
     >
+      {/* Click anywhere on the backdrop = dismiss without resolving. The
+          backdrop is the same scrim that already dims the field; making it
+          interactive saves the player from hunting for the X when they
+          decide they don't want to commit yet. */}
       <motion.div
-        className="absolute inset-0 bg-slate-950/70 backdrop-blur-sm"
+        className="absolute inset-x-0 top-0 bottom-72 bg-slate-950/55 pointer-events-auto"
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         exit={{ opacity: 0 }}
+        onClick={onDismiss}
       />
       <motion.div
-        className="relative bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-xl p-6"
-        initial={{ scale: 0.85, y: 20, opacity: 0 }}
-        animate={{ scale: 1, y: 0, opacity: 1, transition: { type: 'spring', stiffness: 240, damping: 22 } }}
-        exit={{ scale: 0.85, y: 20, opacity: 0, transition: { duration: 0.16 } }}
+        className="relative bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-md p-5 pointer-events-auto"
+        // With the panel anchored above the hand, "rise into view from
+        // just below" reads more naturally than "drop in from above".
+        initial={{ scale: 0.92, y: 16, opacity: 0 }}
+        animate={{ scale: 1, y: 0, opacity: 1, transition: { type: 'spring', stiffness: 260, damping: 22 } }}
+        exit={{ scale: 0.92, y: 16, opacity: 0, transition: { duration: 0.16 } }}
       >
-        <div className="flex items-center gap-3 mb-3">
+        {/* Close (X) in the corner. Same semantics as the backdrop click:
+            dismiss without resolving, leaving the choice triggerable again
+            from the "USE" pill on the card. */}
+        <button
+          onClick={onDismiss}
+          aria-label="Close"
+          className="absolute top-2.5 right-2.5 w-7 h-7 rounded-full text-slate-500 hover:text-white hover:bg-slate-800 flex items-center justify-center text-base font-bold leading-none transition-colors"
+        >
+          ×
+        </button>
+        <div className="flex items-center gap-3 mb-2 pr-8">
           <div className={`text-[10px] uppercase font-black tracking-widest text-white px-2 py-1 rounded ${card?.color ?? 'bg-slate-700'}`}>
             {choice.side}
           </div>
@@ -105,8 +146,8 @@ function ChoicePanel({ choice, batterHand, pitcherHand, onResolve }: ChoicePanel
             {card?.abilityType === 'General Draw' ? 'General' : 'Signature'}
           </div>
         </div>
-        <h2 className="text-xl font-black text-white leading-tight mb-1">{card?.name}</h2>
-        <p className="text-xs text-slate-400 leading-relaxed mb-4">{card?.description}</p>
+        <h2 className="text-lg font-black text-white leading-tight mb-1">{card?.name}</h2>
+        <p className="text-xs text-slate-400 leading-relaxed mb-3">{card?.description}</p>
 
         {isModifyShape ? (
           <ModifyShapePanel
@@ -137,6 +178,10 @@ function ChoicePanel({ choice, batterHand, pitcherHand, onResolve }: ChoicePanel
   );
 }
 
+// Prompts speak the same vocabulary the cards do: SHAPES. An earlier pass
+// tried to alias each shape to a pitch type, but the user's BATTER cards
+// also have shapes, so calling the player's own circles "Off-Speed" was
+// confusing -- the batter isn't pitching anything.
 const PROMPTS: Record<PendingChoice['type'], string> = {
   guessShape: 'Name a shape — if the pitcher uses it, +4 Value',
   pickShape: 'Pick a card to modify',
@@ -328,15 +373,17 @@ function SelectedCardBanner({ card, highlight }: { card: CardDefinition; highlig
 }
 
 function SideButton({ label, shape, onClick }: { label: string; shape: ShapeType; onClick: () => void }) {
+  const shapeName = SHAPE_LABEL[shape];
   return (
     <button
       onClick={onClick}
+      title={shapeName}
       className="bg-slate-800 hover:bg-slate-700 active:scale-95 rounded-lg border border-slate-700 hover:border-amber-400 px-4 py-3 flex items-center justify-between transition-all"
     >
       <div className="flex flex-col items-start">
         <span className="text-[10px] uppercase font-black text-amber-400 tracking-widest">{label}</span>
         <span className="text-[9px] uppercase font-bold text-slate-500 tracking-wide mt-0.5">
-          currently {shape}
+          currently {shapeName}
         </span>
       </div>
       <ShapeMini shape={shape} large />
@@ -396,11 +443,13 @@ function ShapeOptionRow({ options, onPick }: { options: ShapeType[]; onPick: (va
 }
 
 function ShapeButton({ shape, onClick }: { shape: ShapeType; onClick: () => void }) {
+  const shapeName = SHAPE_LABEL[shape];
   if (shape === 'none' || shape === 'wildcard') {
     return (
       <button
         onClick={onClick}
-        className="aspect-square bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 hover:border-slate-500 flex flex-col items-center justify-center gap-1 transition-colors"
+        title={shapeName}
+        className="aspect-square bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 hover:border-slate-500 flex items-center justify-center transition-colors"
       >
         <span className="text-[10px] uppercase font-black text-slate-300 tracking-wider">{shape}</span>
       </button>
@@ -411,6 +460,7 @@ function ShapeButton({ shape, onClick }: { shape: ShapeType; onClick: () => void
   return (
     <button
       onClick={onClick}
+      title={shapeName}
       className="aspect-square bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 hover:border-amber-400 flex flex-col items-center justify-center gap-1 transition-colors group"
     >
       <div
