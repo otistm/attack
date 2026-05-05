@@ -100,7 +100,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 8,
     "leftShape": "square",
     "rightShape": "diamond",
-    "description": "If combined on either side, +4 Value.",
+    "description": "If combined, +4 Value.",
     "color": "bg-emerald-500",
     "tags": ["power-hitter", "veteran"]
   },
@@ -169,7 +169,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 6,
     "leftShape": "square",
     "rightShape": "diamond",
-    "description": "If you win, +5 Value.",
+    "description": "+5 Hit Scale (your hit goes further when you win).",
     "color": "bg-emerald-500",
     "tags": ["power-hitter", "lefty", "veteran"],
     "handedness": "L"
@@ -353,7 +353,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 6,
     "leftShape": "diamond",
     "rightShape": "circle",
-    "description": "If combined on both sides, base value becomes 12.",
+    "description": "If this card is between two combined neighbors, base value becomes 12.",
     "color": "bg-emerald-500",
     "tags": ["power-hitter", "lefty", "clutch", "veteran"]
   },
@@ -995,7 +995,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 7,
     "leftShape": "circle",
     "rightShape": "square",
-    "description": "If combined on both sides and you win, +15 Hit Scale.",
+    "description": "If this card is between two combined neighbors and you win, +15 Hit Scale.",
     "color": "bg-amber-500",
     "tags": ["power-hitter"]
   },
@@ -1242,7 +1242,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 3,
     "leftShape": "square",
     "rightShape": "circle",
-    "description": "Automatically erases one base runner if you win the round.",
+    "description": "+2 Value vs SPEEDSTER batters. Automatically erases one base runner if you win the round.",
     "color": "bg-violet-500"
   },
   {
@@ -1827,7 +1827,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 8,
     "leftShape": "circle",
     "rightShape": "diamond",
-    "description": "If combined on both sides, +6 Value.",
+    "description": "If this card is between two combined neighbors, +6 Value.",
     "color": "bg-emerald-500",
     "tags": ["power-hitter", "lefty"],
     "handedness": "L"

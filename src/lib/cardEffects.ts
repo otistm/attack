@@ -1,11 +1,12 @@
 import { CardDefinition, TagLiteral } from "./cards";
 import { ShapeType } from "../components/cardShapes";
-import { canConnect } from "./connect";
+import { canConnect, seamKey } from "./connect";
 import type { ScoringContext } from "./scoring";
 import {
   batterTeamLead,
   batterTeamRunsThisGame,
   runnersOnCount,
+  scoreHand,
   uniqueShapeCount,
 } from "./scoring";
 
@@ -92,7 +93,8 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // (opponentBaseCard) so the reveal animator always has a card to point at.
   "b-2": (ctx) => {
     const target =
-      highestUncombinedInHand(ctx.opponentHand ?? []) ?? ctx.opponentBaseCard;
+      highestUncombinedInHand(ctx.opponentHand ?? [], ctx.opponentAffirmedSeams ?? null) ??
+      ctx.opponentBaseCard;
     return r({ opponentValueDelta: -2, opponentTargetCardId: target?.id });
   },
 
@@ -165,7 +167,10 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // flat `pitcherCombinedDelta` aggregate is the sum of the breakdown so the
   // head-to-head math in `lockIn` keeps the same shape.
   "b-17": (ctx) => {
-    const oppGroups = buildGroupsFor(ctx.opponentHand ?? []);
+    const oppGroups = buildGroupsFor(
+      ctx.opponentHand ?? [],
+      ctx.opponentAffirmedSeams ?? null,
+    );
     const combined = oppGroups.flatMap((g) => (g.length > 1 ? g : []));
     if (combined.length === 0) return r({ pitcherCombinedDelta: 0 });
     const debuffs = combined.map((c) => ({ targetCardId: c.id, delta: -2 }));
@@ -240,7 +245,9 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     return r({ selfValueDelta: circles });
   },
 
-  // b-30 Laser Show: opponent's base card halved (resolve-step plumbing).
+  // b-30 Laser Show: opponent's base card halved. Fires here in the
+  // scoring effect (per-card opponentValueDelta against the opponent's
+  // base card) -- there's no resolve-step hook for this card.
   "b-30": (ctx) => {
     if (!ctx.opponentBaseCard) return NOOP;
     const half = Math.floor(ctx.opponentBaseCard.baseValue / 2);
@@ -293,7 +300,10 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // p-40 Wheeler's Workhorse: +1 per card the batter combines.
   "p-40": (ctx) => {
     if (!ctx.opponentHand) return NOOP;
-    const combinedCount = countCombinedCards(ctx.opponentHand);
+    const combinedCount = countCombinedCards(
+      ctx.opponentHand,
+      ctx.opponentAffirmedSeams ?? null,
+    );
     return r({ selfValueDelta: combinedCount });
   },
 
@@ -333,7 +343,10 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // p-50 Devastating Slider: -6 if batter combines 3 cards.
   "p-50": (ctx) => {
     if (!ctx.opponentHand) return NOOP;
-    const longestCombo = longestRunIn(ctx.opponentHand);
+    const longestCombo = longestRunIn(
+      ctx.opponentHand,
+      ctx.opponentAffirmedSeams ?? null,
+    );
     return longestCombo >= 3 ? r({ opponentValueDelta: -6 }) : NOOP;
   },
 
@@ -353,10 +366,31 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   },
 
   // p-53 Splitter: value becomes equal to batter's highest combined total.
+  // "Combined total" = the batter's bestGroup maxValue (i.e. effective
+  // total after all modifiers like b-20 Showman doubling). Computing it
+  // from raw baseValue sums (the previous implementation) silently
+  // undershot whenever the batter ran any in-group buff. We re-score the
+  // opponent hand under a side-flipped context so we get the same
+  // maxValue scoring.scoreHand would derive at lock-in. Recursion is
+  // bounded: only pitcher cards carry the "p-53" id, so the recursive
+  // scoreHand call (on the batter hand) never re-enters this effect.
   "p-53": (ctx) => {
-    if (!ctx.opponentHand) return NOOP;
-    const oppGroups = buildGroupsFor(ctx.opponentHand);
-    const oppMax = Math.max(0, ...oppGroups.map((g) => g.reduce((a, c) => a + c.baseValue, 0)));
+    if (!ctx.opponentHand || ctx.opponentHand.length === 0) return NOOP;
+    const oppCtx: ScoringContext = {
+      ...ctx,
+      side: ctx.side === "Batting" ? "Pitching" : "Batting",
+      opponentHand: ctx.hand,
+      opponentBaseCard: highestValueCard(ctx.hand) ?? null,
+      affirmedSeams: ctx.opponentAffirmedSeams ?? null,
+      opponentAffirmedSeams: ctx.affirmedSeams ?? null,
+      // Silencers attached to OUR ctx targeted us (or our base card from
+      // the opponent's POV). They don't flip into the recursive call.
+      nullifiedCardIds: undefined,
+      nullifyOpponentBaseMechanic: undefined,
+      nullifyOpponentTagMechanics: undefined,
+    };
+    const oppResult = scoreHand(ctx.opponentHand, oppCtx);
+    const oppMax = Math.max(0, oppResult.maxValue);
     const card = ctx.group[ctx.indexInGroup];
     return r({ selfValueDelta: oppMax - card.baseValue });
   },
@@ -377,7 +411,8 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // p-57 The Japanese Ace: +4 if batter uses no combinations.
   "p-57": (ctx) => {
     if (!ctx.opponentHand) return NOOP;
-    const anyCombined = ctx.opponentHand.some((_, i) => !isCardUncombinedAt(ctx.opponentHand!, i));
+    const oppSeams = ctx.opponentAffirmedSeams ?? null;
+    const anyCombined = ctx.opponentHand.some((_, i) => !isCardUncombinedAt(ctx.opponentHand!, i, oppSeams));
     return !anyCombined ? r({ selfValueDelta: 4 }) : NOOP;
   },
 
@@ -436,7 +471,11 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-68 Steal Sign: per-side wildcard via canConnect.
   "b-68": () => NOOP,
 
-  // b-69 Sacrifice Fly: scores runner from 3rd if combined and you lose (resolve-step).
+  // b-69 Sacrifice Fly: scores the runner from 3rd when the batter loses
+  // the at-bat (the rest of the runners hold). Implemented in
+  // resolveStep.ts; the per-card hook stays a no-op here. Earlier drafts
+  // also required b-69 to be combined, but Phase 4 dropped the combine
+  // gate so the card is more often relevant.
   "b-69": () => NOOP,
 
   // b-70 The Sweet Spot: +15 Hit Scale when combined on BOTH sides (Phase 4
@@ -458,10 +497,12 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // running through the per-card effect registry.
   "b-71": () => NOOP,
 
-  // b-72 Walk-Off Swing: +1 per CLUTCH card in your hand. Counts itself, so
-  // a solo b-72 still pays out +1; the synergy reward kicks in when other
-  // clutch cards (b-65 Guess Pitch, b-69 Sacrifice Fly, b-71 Manager's
-  // Challenge, Mookie/Harper/Witt signatures) ride along.
+  // b-72 Walk-Off Swing: +1 per OTHER CLUTCH card in your hand. b-72 is
+  // itself tagged CLUTCH so we exclude self -- a solo b-72 pays nothing,
+  // the synergy reward kicks in when other clutch cards (b-65 Guess
+  // Pitch, b-69 Sacrifice Fly, b-71 Manager's Challenge, Mookie / Harper /
+  // Witt signatures) ride along. Matches `cards.ts` description: "+1
+  // Value for each OTHER CLUTCH card in your hand."
   "b-72": (ctx) => {
     const clutch = countOtherHandTag(ctx, "clutch");
     return clutch > 0 ? r({ selfValueDelta: clutch }) : NOOP;
@@ -814,7 +855,7 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // Wheeler's Workhorse on the batter side; counts the batter's own combined
   // cards (incl. b-113 if it's combined too).
   "b-113": (ctx) => {
-    const combined = countCombinedCards(ctx.hand);
+    const combined = countCombinedCards(ctx.hand, ctx.affirmedSeams ?? null);
     return combined > 0 ? r({ selfValueDelta: combined }) : NOOP;
   },
 
@@ -1016,49 +1057,88 @@ export function applyOpponentTotalAdjustments(
 // ============ helpers ============
 
 function isCardUncombined(ctx: EffectContext, indexInHand: number): boolean {
-  const groups = buildGroupsFor(ctx.hand);
+  const groups = buildGroupsFor(ctx.hand, ctx.affirmedSeams ?? null);
   for (const g of groups) {
     if (g.length === 1 && g[0].id === ctx.hand[indexInHand].id) return true;
   }
   return false;
 }
 
-function isCardUncombinedAt(hand: CardDefinition[], indexInHand: number): boolean {
-  const groups = buildGroupsFor(hand);
+function isCardUncombinedAt(
+  hand: CardDefinition[],
+  indexInHand: number,
+  affirmedSeams: ReadonlySet<string> | null = null,
+): boolean {
+  const groups = buildGroupsFor(hand, affirmedSeams);
   for (const g of groups) {
     if (g.length === 1 && g[0].id === hand[indexInHand].id) return true;
   }
   return false;
 }
 
-function buildGroupsFor(cards: CardDefinition[]): CardDefinition[][] {
+/**
+ * Mirrors `scoring.buildGroups`: chains adjacent cards by `canConnect` AND
+ * (when `affirmedSeams` is non-null) requires the seam to be in the affirmed
+ * set. Pass `null` for legacy auto-connect (the AI / opponent's hand when
+ * the user is not on that side).
+ *
+ * Used by the combo-aware helpers below; the previous implementation
+ * unconditionally auto-connected, which silently disagreed with scoring
+ * whenever the user left a mechanically-legal seam unaffirmed.
+ */
+function buildGroupsFor(
+  cards: CardDefinition[],
+  affirmedSeams: ReadonlySet<string> | null = null,
+): CardDefinition[][] {
   const groups: CardDefinition[][] = [];
   if (cards.length === 0) return groups;
   let cur: CardDefinition[] = [cards[0]];
   for (let i = 1; i < cards.length; i++) {
-    if (canConnect(cards[i - 1], cards[i])) cur.push(cards[i]);
-    else {
+    const prev = cards[i - 1];
+    const curr = cards[i];
+    const mechConnect = canConnect(prev, curr);
+    const userAffirmed =
+      affirmedSeams === null ? true : affirmedSeams.has(seamKey(prev.id, curr.id));
+    if (mechConnect && userAffirmed) {
+      cur.push(curr);
+    } else {
       groups.push(cur);
-      cur = [cards[i]];
+      cur = [curr];
     }
   }
   groups.push(cur);
   return groups;
 }
 
+/**
+ * Highest-baseValue card. Tie-breaker: lexicographically smallest id so
+ * reordering the hand doesn't change which card "wins" the tie -- mirrors
+ * the rule in gameStore / scoring.
+ */
 function highestValueCard(cards: CardDefinition[]): CardDefinition | undefined {
   if (cards.length === 0) return undefined;
-  return cards.reduce((a, b) => (b.baseValue > a.baseValue ? b : a));
+  return cards.reduce((a, b) => {
+    if (b.baseValue > a.baseValue) return b;
+    if (b.baseValue === a.baseValue && b.id < a.id) return b;
+    return a;
+  });
 }
 
 /**
  * Highest-value UNCOMBINED card in the given hand, or undefined if every card
  * is part of a multi-card group. Used by b-2 Judge's Chamber so the visual
  * attribution matches the description ("opponent's highest single card").
+ *
+ * When inspecting the OPPONENT hand from inside an effect, callers should
+ * pass `ctx.opponentAffirmedSeams ?? null` so the singleton detection
+ * matches how the opponent's hand will actually be grouped at scoring time.
  */
-function highestUncombinedInHand(hand: CardDefinition[]): CardDefinition | undefined {
+function highestUncombinedInHand(
+  hand: CardDefinition[],
+  affirmedSeams: ReadonlySet<string> | null = null,
+): CardDefinition | undefined {
   if (hand.length === 0) return undefined;
-  const groups = buildGroupsFor(hand);
+  const groups = buildGroupsFor(hand, affirmedSeams);
   const singles = groups.filter((g) => g.length === 1).map((g) => g[0]);
   return highestValueCard(singles);
 }
@@ -1072,15 +1152,21 @@ function countShapesInHand(hand: CardDefinition[], shape: ShapeType): number {
   return n;
 }
 
-function countCombinedCards(hand: CardDefinition[]): number {
-  const groups = buildGroupsFor(hand);
+function countCombinedCards(
+  hand: CardDefinition[],
+  affirmedSeams: ReadonlySet<string> | null = null,
+): number {
+  const groups = buildGroupsFor(hand, affirmedSeams);
   let combined = 0;
   for (const g of groups) if (g.length > 1) combined += g.length;
   return combined;
 }
 
-function longestRunIn(hand: CardDefinition[]): number {
-  const groups = buildGroupsFor(hand);
+function longestRunIn(
+  hand: CardDefinition[],
+  affirmedSeams: ReadonlySet<string> | null = null,
+): number {
+  const groups = buildGroupsFor(hand, affirmedSeams);
   return Math.max(0, ...groups.map((g) => g.length));
 }
 

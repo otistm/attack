@@ -262,6 +262,7 @@ const CardItem = ({
   valueOverride,
   highlightTone,
   dragActive = false,
+  tutorialRegions = false,
 }: {
   card: CardDefinition;
   isConnectedLeft: boolean;
@@ -294,6 +295,12 @@ const CardItem = ({
    * Reorder.Group re-evaluates seams underneath the dragged card.
    */
   dragActive?: boolean;
+  /**
+   * When true, the card's value, shape connectors, and ability hover panel
+   * each get a `data-tutorial="card-{value,shapes,ability}"` attribute so
+   * the Learn-to-Play overlay can spotlight them individually.
+   */
+  tutorialRegions?: boolean;
 }) => {
   // While the player is dragging, freeze ALL non-dragged cards' connection
   // state to "not connected" so we don't trigger margin shifts (8px <-> 0px),
@@ -412,6 +419,7 @@ const CardItem = ({
 
   return (
     <motion.div
+      data-tutorial={tutorialRegions ? 'card-shapes' : undefined}
       className={`
         relative ${sz.card} ${cardBgClass} border-2 group
         flex flex-col items-center justify-center cursor-grab active:cursor-grabbing
@@ -461,6 +469,7 @@ const CardItem = ({
           orchestrator pins the value with a fresh key to celebrate beats),
           but plain modifier changes during selection now update silently. */}
       <motion.div
+        data-tutorial={tutorialRegions ? 'card-value' : undefined}
         key={valueOverride !== undefined ? `override-${valueOverride}` : 'live'}
         initial={
           valueOverride !== undefined
@@ -509,7 +518,7 @@ export const CardGameOverlay = () => {
   const phase = useGameStore((s) => s.phase);
   const lockIn = useGameStore((s) => s.lockIn);
   const startNextAtBat = useGameStore((s) => s.startNextAtBat);
-  const reset = useGameStore((s) => s.reset);
+  const setShowStartScreen = useGameStore((s) => s.setShowStartScreen);
   const lastOutcome = useGameStore((s) => s.lastOutcome);
   const lastBatterScore = useGameStore((s) => s.lastBatterScore);
   const lastPitcherScore = useGameStore((s) => s.lastPitcherScore);
@@ -748,15 +757,17 @@ export const CardGameOverlay = () => {
             compact
             banner={aiBanner}
           />
-          <FlipPitcherStrip
-            hand={aiHand}
-            modifiers={aiModifiers}
-            revealed={!isSelecting}
-            atBatId={atBatId}
-            compact
-            valueOverrides={aiValueOverrides}
-            highlightTones={aiHighlights}
-          />
+          <div data-tutorial="opponent-hand">
+            <FlipPitcherStrip
+              hand={aiHand}
+              modifiers={aiModifiers}
+              revealed={!isSelecting}
+              atBatId={atBatId}
+              compact
+              valueOverrides={aiValueOverrides}
+              highlightTones={aiHighlights}
+            />
+          </div>
         </div>
       </motion.div>
 
@@ -821,40 +832,46 @@ export const CardGameOverlay = () => {
             />
           )}
 
-          <HandStrip
-            hand={userHand}
-            onReorder={reorderUser}
-            modifiers={userModifiers}
-            disabled={!isSelecting}
-            atBatId={atBatId}
-            direction="bottom"
-            valueOverrides={userValueOverrides}
-            highlightTones={userHighlights}
-            // Manual-connection mechanic: only seams the player has dragged
-            // into place chain. We pass affirmedSeams in EVERY phase so the
-            // visible chain art always matches what the engine actually
-            // scored at lock-in -- showing legacy auto-connect during the
-            // reveal would surface ghost chains the engine didn't credit.
-            // The drag-end action only fires during selection; outside
-            // that we leave `onAffirmConnections` undefined so even if
-            // Reorder.Item somehow fires a stale drag, nothing mutates.
-            // `affirmedSeams` and `affirmDraggedCard` both target the
-            // current user-side hand (gameStore branches on getUserSide).
-            affirmedSeams={affirmedSeams}
-            onAffirmConnections={isSelecting ? affirmDraggedCard : undefined}
-            // Per-card "USE" pill plumbing. Only enable the pill during
-            // selection -- once the swing locks in, the modal can't
-            // resolve anyway. The pill auto-hides per-card once the
-            // choice leaves `userPendingChoiceIds` (resolved or expired).
-            pendingChoiceIds={isSelecting ? userPendingChoiceIds : undefined}
-            activeChoiceCardId={activeChoiceCardId}
-            onTriggerChoice={isSelecting ? triggerChoice : undefined}
-          />
+          <div data-tutorial="user-hand">
+            <HandStrip
+              hand={userHand}
+              onReorder={reorderUser}
+              modifiers={userModifiers}
+              disabled={!isSelecting}
+              atBatId={atBatId}
+              direction="bottom"
+              valueOverrides={userValueOverrides}
+              highlightTones={userHighlights}
+              // Manual-connection mechanic: only seams the player has dragged
+              // into place chain. We pass affirmedSeams in EVERY phase so the
+              // visible chain art always matches what the engine actually
+              // scored at lock-in -- showing legacy auto-connect during the
+              // reveal would surface ghost chains the engine didn't credit.
+              // The drag-end action only fires during selection; outside
+              // that we leave `onAffirmConnections` undefined so even if
+              // Reorder.Item somehow fires a stale drag, nothing mutates.
+              // `affirmedSeams` and `affirmDraggedCard` both target the
+              // current user-side hand (gameStore branches on getUserSide).
+              affirmedSeams={affirmedSeams}
+              onAffirmConnections={isSelecting ? affirmDraggedCard : undefined}
+              // Per-card "USE" pill plumbing. Only enable the pill during
+              // selection -- once the swing locks in, the modal can't
+              // resolve anyway. The pill auto-hides per-card once the
+              // choice leaves `userPendingChoiceIds` (resolved or expired).
+              pendingChoiceIds={isSelecting ? userPendingChoiceIds : undefined}
+              activeChoiceCardId={activeChoiceCardId}
+              onTriggerChoice={isSelecting ? triggerChoice : undefined}
+              // Mark the FIRST card so the tutorial overlay can spotlight
+              // distinct regions (value, shapes, ability hover panel).
+              tutorialFirstCard={true}
+            />
+          </div>
 
           <AnimatePresence mode="wait">
             {isSelecting && (
               <motion.button
                 key="lockin"
+                data-tutorial="lock-in"
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: 10 }}
@@ -881,7 +898,7 @@ export const CardGameOverlay = () => {
                   </button>
                 ) : (
                   <button
-                    onClick={() => reset()}
+                    onClick={() => setShowStartScreen(true)}
                     className="px-10 py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-bold rounded-full shadow-lg uppercase tracking-wider text-sm transition-all hover:scale-105 active:scale-95"
                   >
                     New Game
@@ -2067,6 +2084,14 @@ interface HandStripProps {
    * provided.
    */
   onTriggerChoice?: (cardId: string) => void;
+  /**
+   * When true, the FIRST card in this strip gets `data-tutorial-card="true"`
+   * plus `data-tutorial="card-{value,shapes,ability}"` markers on its
+   * value, shape-connector, and hover-panel regions. The Learn-to-Play
+   * overlay uses these for region-specific spotlights. Other strips
+   * (opponent, reveal-only) leave this off.
+   */
+  tutorialFirstCard?: boolean;
 }
 
 const HandStrip = ({
@@ -2084,6 +2109,7 @@ const HandStrip = ({
   pendingChoiceIds,
   activeChoiceCardId,
   onTriggerChoice,
+  tutorialFirstCard = false,
 }: HandStripProps) => {
   // Signature cards fly in from the screen edge they belong to (pitcher drops
   // from above, batter rises up from below); general-draw cards then sweep in
@@ -2235,6 +2261,7 @@ const HandStrip = ({
                   ? () => onTriggerChoice(card.id)
                   : undefined
               }
+              tutorialRegions={tutorialFirstCard && index === 0}
             />
           );
         })}
@@ -2297,6 +2324,13 @@ interface HandCardProps {
    * actual pending choice -- otherwise the pill is suppressed entirely.
    */
   onTriggerChoice?: () => void;
+  /**
+   * When true, region-specific `data-tutorial` attributes are added to
+   * this card so the Learn-to-Play overlay can spotlight value, shape
+   * connectors, and the ability hover panel individually. Only the FIRST
+   * card in the user's hand strip flips this flag.
+   */
+  tutorialRegions?: boolean;
 }
 
 /**
@@ -2328,6 +2362,7 @@ const HandCard = ({
   hasPendingChoice = false,
   isChoiceActive = false,
   onTriggerChoice,
+  tutorialRegions = false,
 }: HandCardProps) => {
   useEffect(() => {
     onEntryPlayed(card.id);
@@ -2383,6 +2418,7 @@ const HandCard = ({
         valueOverride={valueOverride}
         highlightTone={highlightTone}
         dragActive={dragActive}
+        tutorialRegions={tutorialRegions}
       />
       {hasPendingChoice && onTriggerChoice && (
         <UseAbilityPill

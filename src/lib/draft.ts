@@ -67,6 +67,14 @@ export interface DraftState {
   nominator: DraftSide;
   log: DraftLogEntry[];
   phase: DraftPhase;
+  /**
+   * Set to true when the engine had to mark the draft "complete" without
+   * finishing both rosters because neither side could legally nominate AND
+   * deterministic recovery (force-fill across roles) couldn't make progress.
+   * The UI can surface this as a soft warning instead of silently shipping
+   * an undersized roster into the game phase.
+   */
+  deadlocked?: boolean;
 }
 
 // ----- constants ------------------------------------------------------------
@@ -381,6 +389,94 @@ export function initDraftState(
 }
 
 /**
+ * Fisher-Yates shuffle using the seeded RNG. Returns a fresh array; doesn't
+ * mutate the input. Pulled out so quick-match builds are deterministic in
+ * tests when called with a fixed seed.
+ */
+function shuffleWithRng<T>(items: readonly T[], rng: () => number): T[] {
+  const out = items.slice();
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+/**
+ * Build a "Quick Match" draft state -- the auction-skipping lane. Both sides
+ * get a randomly-shuffled 7 batters / 3 pitchers and `phase` lands on
+ * "complete" so the gameplay layer treats it identically to an auction that
+ * just finished. The leftover players stay in `pool` so any code that reads
+ * the pool for diagnostics behaves the same as the auction path.
+ *
+ * `log` is populated with one `forced-fill` entry per drafted player so
+ * downstream UI (which iterates the log to render team rosters) sees a
+ * symmetric shape. Reusing the existing `forced-fill` reason avoids widening
+ * the union; price 0 reflects that no auction took place.
+ *
+ * Pure function -- consume the returned state from a store action and let
+ * the gameplay layer perform the at-bat seeding.
+ */
+export function buildQuickMatchDraft(
+  seed: number = Math.floor(Math.random() * 1_000_000),
+): DraftState {
+  const rng = makeRng(seed);
+  const aiArchetype = ARCHETYPES[Math.floor(rng() * ARCHETYPES.length)];
+  const requirements = { ...DEFAULT_REQUIREMENTS };
+
+  const batters = shuffleWithRng(BATTERS, rng);
+  const pitchers = shuffleWithRng(PITCHERS, rng);
+
+  const userBatters = batters.slice(0, requirements.batters);
+  const aiBatters = batters.slice(
+    requirements.batters,
+    requirements.batters * 2,
+  );
+  const userPitchers = pitchers.slice(0, requirements.pitchers);
+  const aiPitchers = pitchers.slice(
+    requirements.pitchers,
+    requirements.pitchers * 2,
+  );
+
+  const drafted = new Set<string>([
+    ...userBatters.map((p) => p.id),
+    ...aiBatters.map((p) => p.id),
+    ...userPitchers.map((p) => p.id),
+    ...aiPitchers.map((p) => p.id),
+  ]);
+  const remainingPool = [...BATTERS, ...PITCHERS].filter(
+    (p) => !drafted.has(p.id),
+  );
+
+  // Build a symmetric log: alternate user/ai per slot, batters first, then
+  // pitchers. Mirrors the order the auction path tends to produce.
+  const log: DraftLogEntry[] = [];
+  for (let i = 0; i < requirements.batters; i++) {
+    log.push({ player: userBatters[i], winner: "user", price: 0, reason: "forced-fill" });
+    log.push({ player: aiBatters[i], winner: "ai", price: 0, reason: "forced-fill" });
+  }
+  for (let i = 0; i < requirements.pitchers; i++) {
+    log.push({ player: userPitchers[i], winner: "user", price: 0, reason: "forced-fill" });
+    log.push({ player: aiPitchers[i], winner: "ai", price: 0, reason: "forced-fill" });
+  }
+
+  return {
+    pool: remainingPool,
+    budget: { user: STARTING_BUDGET, ai: STARTING_BUDGET },
+    roster: {
+      user: { batters: userBatters, pitchers: userPitchers },
+      ai: { batters: aiBatters, pitchers: aiPitchers },
+    },
+    requirements,
+    aiArchetype,
+    activeAuction: null,
+    nominator: "user",
+    log,
+    phase: "complete",
+  };
+}
+
+/**
  * Open an auction. Validates ownership of the turn, the player being in the
  * pool, and that at least one side can bid. The nominator implicitly opens at
  * $1 -- if both sides can't bid (or the only-bidder is the nominator and the
@@ -504,14 +600,84 @@ function advanceAfterAward(state: DraftState): DraftState {
   return s;
 }
 
+/**
+ * Public recovery shim used by the store's `draftAiTick` when the AI is
+ * nominating but `eligiblePoolForSide` is empty for it (no legal pick).
+ *
+ * The normal `ensureValidNominator` only runs after every auction award;
+ * if the AI's first tick lands in this stalled state (e.g. mid-draft when
+ * the AI is suddenly priced out of every remaining nominee), the autopilot
+ * would loop on `aiNominate -> null` forever. Calling this from the tick
+ * promotes nomination to the user (or runs deadlock recovery) so the UI
+ * always has SOMETHING to do next.
+ */
+export function repairDraftStall(state: DraftState): DraftState {
+  return ensureValidNominator(state);
+}
+
 function ensureValidNominator(state: DraftState): DraftState {
   if (state.phase !== "nominating") return state;
   if (canNominate(state, state.nominator)) return state;
   const other = otherSide(state.nominator);
   if (canNominate(state, other)) return { ...state, nominator: other };
-  // Nobody can nominate -> we're done. Force-fill should have caught this,
-  // but as a defensive backstop we mark complete.
+  // Neither side can legally open an auction. If rosters are STILL unfilled
+  // (e.g. one side already at slot cap, the other side flush but only the
+  // wrong role left in pool), do not silently flip to "complete" -- that
+  // ships an undersized roster into the game phase. Try a deterministic
+  // deadlock recovery first; fall through to a flagged complete only if
+  // the pool genuinely can't satisfy the open slots.
+  if (!isDraftComplete(state)) {
+    return resolveDeadlock(state);
+  }
   return { ...state, phase: "complete" };
+}
+
+/**
+ * Final-resort recovery when force-fill couldn't make progress under normal
+ * solvency rules and neither side can nominate. Force-assigns the cheapest
+ * pool players that match each side's open role slots at $1 (or $0 if the
+ * side is broke) until either rosters are full or the pool runs out.
+ *
+ * If the pool can't satisfy the remaining slots (data-level deadlock), the
+ * state is marked `deadlocked: true` so the UI / store can detect it.
+ */
+function resolveDeadlock(state: DraftState): DraftState {
+  let s = state;
+  const sides: DraftSide[] = ["user", "ai"];
+  let progressed = true;
+  while (progressed && !isDraftComplete(s)) {
+    progressed = false;
+    for (const side of sides) {
+      const slots = totalSlotsRemaining(s.roster[side], s.requirements);
+      if (slots === 0) continue;
+      const pick = cheapestEligiblePoolPick(s, side);
+      if (!pick) continue;
+      const charge = Math.min(1, Math.max(0, s.budget[side]));
+      s = {
+        ...s,
+        roster: { ...s.roster, [side]: addToRoster(s.roster[side], pick) },
+        pool: s.pool.filter((p) => p.id !== pick.id),
+        budget: {
+          ...s.budget,
+          [side]: Math.max(0, s.budget[side] - charge),
+        },
+        log: [
+          ...s.log,
+          { player: pick, winner: side, price: charge, reason: "forced-fill" },
+        ],
+      };
+      progressed = true;
+    }
+  }
+  if (isDraftComplete(s)) return { ...s, phase: "complete" };
+  if (typeof console !== "undefined") {
+    console.warn("[draft] deadlock: pool cannot satisfy remaining slots", {
+      userSlotsRemaining: totalSlotsRemaining(s.roster.user, s.requirements),
+      aiSlotsRemaining: totalSlotsRemaining(s.roster.ai, s.requirements),
+      poolSize: s.pool.length,
+    });
+  }
+  return { ...s, phase: "complete", deadlocked: true };
 }
 
 function canNominate(state: DraftState, side: DraftSide): boolean {

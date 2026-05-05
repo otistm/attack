@@ -54,19 +54,59 @@ export const PITCHERS = PLAYERS.filter((p) => p.role === "Pitcher");
 const cardsById: Record<string, CardDefinition> = {};
 for (const c of ALL_CARDS) cardsById[c.id] = c;
 
+// Module-load assertion: every player's signatureCardIds must resolve to a
+// real CardDefinition. Previously a typo'd id silently dropped via
+// `.filter(Boolean)` in `dealHand`, leaving that player with a 4-card hand
+// (3 sig + 2 general) becoming 4 cards (2 sig + 2 general) -- breaking the
+// implicit "5 cards per hand" invariant the rest of the engine relies on.
+// This throws at startup so a data drift surfaces immediately instead of
+// limping into the game with an under-sized hand.
+for (const p of PLAYERS) {
+  for (const id of p.signatureCardIds) {
+    if (!cardsById[id]) {
+      throw new Error(
+        `players.ts: ${p.id} (${p.name}) references signatureCardId "${id}" which does not exist in ALL_CARDS.`,
+      );
+    }
+  }
+  if (p.signatureCardIds.length !== 3) {
+    throw new Error(
+      `players.ts: ${p.id} must have exactly 3 signatureCardIds, got ${p.signatureCardIds.length}.`,
+    );
+  }
+}
+
 const GENERAL_BATTING = ALL_CARDS.filter((c) => c.type === "Batting" && c.abilityType === "General Draw");
 const GENERAL_PITCHING = ALL_CARDS.filter((c) => c.type === "Pitching" && c.abilityType === "General Draw");
+
+/** Expected hand size for a fresh at-bat. */
+const EXPECTED_HAND_SIZE = 5;
 
 /**
  * Build a 5-card hand for an at-bat: the player's 3 signature cards plus 2 random
  * cards drawn from the corresponding general pool. Uses a seeded RNG so the same
  * (player, seed) pair produces the same hand for a given inning.
+ *
+ * Throws if the player's data is broken (missing signature card, empty
+ * pool); silently shrinking the hand was previously a flaky failure mode.
  */
 export function dealHand(player: MlbPlayer, seed = Math.floor(Math.random() * 1_000_000)): CardDefinition[] {
-  const signatures = player.signatureCardIds.map((id) => cardsById[id]).filter(Boolean);
+  const signatures = player.signatureCardIds.map((id) => cardsById[id]);
+  if (signatures.some((c) => !c)) {
+    const missing = player.signatureCardIds.filter((id) => !cardsById[id]);
+    throw new Error(
+      `dealHand: ${player.id} (${player.name}) has unresolved signatureCardIds [${missing.join(", ")}].`,
+    );
+  }
   const generalPool = player.role === "Batter" ? GENERAL_BATTING : GENERAL_PITCHING;
   const generals = pickRandomTwo(generalPool, seed);
-  return [...signatures, ...generals];
+  const hand = [...signatures, ...generals];
+  if (hand.length !== EXPECTED_HAND_SIZE) {
+    throw new Error(
+      `dealHand: produced ${hand.length}-card hand for ${player.id} (expected ${EXPECTED_HAND_SIZE}). General pool size = ${generalPool.length}.`,
+    );
+  }
+  return hand;
 }
 
 function pickRandomTwo<T>(pool: T[], seed: number): T[] {

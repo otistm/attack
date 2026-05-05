@@ -68,6 +68,21 @@ export interface ScoringContext {
    */
   affirmedSeams?: ReadonlySet<string> | null;
 
+  /**
+   * The OPPONENT side's affirmed seams -- used by effect helpers that need
+   * to inspect the opponent's combo state (e.g. p-50 The Sweep counting the
+   * opponent's longest chain, b-127 Mr. Smile silencing an uncombined
+   * pitcher card). When the user is on side X, the opponent (AI) always
+   * uses null/auto-connect; when the user is on the opposite side, the
+   * opponent IS the user and this field carries the user's seams so
+   * combo-aware effects agree with how scoring would group that hand.
+   *
+   * Without this, helpers that called `buildGroupsFor(opponentHand)` saw a
+   * different chain layout than scoring would, and side X effects keyed off
+   * "is the opponent's b-foo combined?" silently disagreed with reality.
+   */
+  opponentAffirmedSeams?: ReadonlySet<string> | null;
+
   // ============ Phase 7 batter-expansion fields ============
   /**
    * b-105 Atlanta-LA Ring -- when set, the opponent's base card's per-card
@@ -101,10 +116,18 @@ export function batterTeamRunsThisGame(ctx: ScoringContext): number {
   return ctx.awayScore ?? 0;
 }
 
-/** Local helper: highest-baseValue card (or undefined for empty hand). */
+/**
+ * Local helper: highest-baseValue card (or undefined for empty hand).
+ * Tie-breaker: lexicographically smallest card id, so reordering the hand
+ * doesn't change which card "wins" the tie.
+ */
 function highestValueCard(cards: CardDefinition[]): CardDefinition | undefined {
   if (cards.length === 0) return undefined;
-  return cards.reduce((a, b) => (b.baseValue > a.baseValue ? b : a));
+  return cards.reduce((a, b) => {
+    if (b.baseValue > a.baseValue) return b;
+    if (b.baseValue === a.baseValue && b.id < a.id) return b;
+    return a;
+  });
 }
 
 /**
@@ -224,12 +247,60 @@ export function scoreHand(cards: CardDefinition[], ctx: ScoringContext): Scoring
   const cardModifiers: Record<string, CardModifier> = {};
   const log: string[] = [];
 
+  // Tie-break ordering when two groups end up with the same `totalValue`.
+  // Previously the engine kept the FIRST group it saw (strict `>`), which
+  // discarded ancillary effects (hitScaleBonus, opponentModifier, forced
+  // outcomes) of any equally-strong group encountered later. The explicit
+  // ordering below picks the chain that's strictly more useful at the same
+  // value -- larger Hit Scale bonus first, then bigger opponent debuff,
+  // then a stronger forced outcome (homerun > single), then the longer
+  // chain (more visible "best combo" attribution), then the leftmost
+  // chain as a deterministic fallback.
+  const FORCED_RANK: Record<NonNullable<ScoringResult["forcedOutcome"]>, number> = {
+    homerun: 2,
+    single: 1,
+  };
+  let bestRank: {
+    totalValue: number;
+    hitScaleBonus: number;
+    opponentDebuff: number;
+    forcedRank: number;
+    length: number;
+  } | null = null;
+
   for (const group of groups) {
     const groupResult = scoreGroup(group, ctx, cards);
 
     Object.assign(cardModifiers, groupResult.cardModifiers);
 
-    if (groupResult.totalValue > maxValue || bestGroup.length === 0) {
+    const candidate = {
+      totalValue: groupResult.totalValue,
+      hitScaleBonus: groupResult.hitScaleBonus,
+      // opponentModifier is signed (negative = bigger debuff = better).
+      // Compare on the magnitude of damage to the opponent.
+      opponentDebuff: -groupResult.opponentModifier,
+      forcedRank: groupResult.forcedOutcome ? FORCED_RANK[groupResult.forcedOutcome] : 0,
+      length: group.length,
+    };
+
+    const beats =
+      bestRank === null ||
+      candidate.totalValue > bestRank.totalValue ||
+      (candidate.totalValue === bestRank.totalValue && candidate.hitScaleBonus > bestRank.hitScaleBonus) ||
+      (candidate.totalValue === bestRank.totalValue &&
+        candidate.hitScaleBonus === bestRank.hitScaleBonus &&
+        candidate.opponentDebuff > bestRank.opponentDebuff) ||
+      (candidate.totalValue === bestRank.totalValue &&
+        candidate.hitScaleBonus === bestRank.hitScaleBonus &&
+        candidate.opponentDebuff === bestRank.opponentDebuff &&
+        candidate.forcedRank > bestRank.forcedRank) ||
+      (candidate.totalValue === bestRank.totalValue &&
+        candidate.hitScaleBonus === bestRank.hitScaleBonus &&
+        candidate.opponentDebuff === bestRank.opponentDebuff &&
+        candidate.forcedRank === bestRank.forcedRank &&
+        candidate.length > bestRank.length);
+
+    if (beats) {
       maxValue = groupResult.totalValue;
       bestGroup = group;
       opponentModifier = groupResult.opponentModifier;
@@ -241,6 +312,7 @@ export function scoreHand(cards: CardDefinition[], ctx: ScoringContext): Scoring
       // contract: only the BEST group's effects fire, so only its targeted
       // debuffs survive into the public ScoringResult.
       targetedOpponentDebuffs = groupResult.targetedOpponentDebuffs;
+      bestRank = candidate;
     }
 
     log.push(...groupResult.log);
@@ -280,7 +352,7 @@ export function scoreHand(cards: CardDefinition[], ctx: ScoringContext): Scoring
  * mechanically-eligible adjacent pair chains). This is what the pitcher hand
  * uses and what the engine tests assume by default.
  */
-function buildGroups(
+export function buildGroups(
   cards: CardDefinition[],
   affirmedSeams: ReadonlySet<string> | null,
 ): CardDefinition[][] {
@@ -392,7 +464,15 @@ function scoreGroup(group: CardDefinition[], ctx: ScoringContext, hand: CardDefi
     hitScaleBonus += effect.hitScaleBonus;
     pitcherCombinedDelta += effect.pitcherCombinedDelta;
     if (effect.pitcherWinsTies) pitcherWinsTies = true;
-    if (effect.forcedOutcome && !forcedOutcome) forcedOutcome = effect.forcedOutcome;
+    // forcedOutcome precedence: when two cards in the same group both want
+    // to force, prefer the stronger result (homerun > single) instead of
+    // taking whichever appeared first in iteration order. Equal-strength
+    // duplicates fall through to the existing first-wins behavior.
+    if (effect.forcedOutcome) {
+      const existingRank = forcedOutcome === "homerun" ? 2 : forcedOutcome === "single" ? 1 : 0;
+      const incomingRank = effect.forcedOutcome === "homerun" ? 2 : 1;
+      if (incomingRank > existingRank) forcedOutcome = effect.forcedOutcome;
+    }
     if (effect.log) log.push(...effect.log);
 
     // Attribution: a single source card can target the opponent in two ways.

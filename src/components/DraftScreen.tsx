@@ -34,8 +34,16 @@
  * thinking" delay; logic layer is untouched, just reskinned.
  */
 import { AnimatePresence, motion, useMotionValue, useTransform, animate } from 'motion/react';
-import { useEffect, useMemo, useState } from 'react';
-import { Coins, Crown, Hammer, Sparkles, Zap } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ChevronLeft,
+  ChevronRight,
+  Coins,
+  Crown,
+  Hammer,
+  Sparkles,
+  Zap,
+} from 'lucide-react';
 import {
   type ActiveAuction,
   ARCHETYPE_LABEL,
@@ -391,20 +399,24 @@ function Dugout({
 
       <BigBudgetTile budget={budget} lowOnBudget={lowOnBudget} />
 
-      <div className="px-3 py-1 text-[9px] uppercase tracking-[0.2em] text-slate-400 font-mono flex items-center justify-between border-b border-white/5">
+      <div className="px-3 py-1.5 text-[10px] uppercase tracking-[0.15em] font-mono flex items-center justify-between border-b border-white/5">
         <span>
-          <span className="text-slate-200 font-black">
+          <span className="text-slate-100 font-black tabular-nums">
             {draft.requirements.batters - slotBatter}
           </span>
-          <span className="text-slate-500">/{draft.requirements.batters}</span>
-          {' '}BAT
+          <span className="text-slate-500 tabular-nums">
+            /{draft.requirements.batters}
+          </span>
+          <span className="text-slate-300 ml-1">BAT</span>
         </span>
         <span>
-          <span className="text-slate-200 font-black">
+          <span className="text-slate-100 font-black tabular-nums">
             {draft.requirements.pitchers - slotPitcher}
           </span>
-          <span className="text-slate-500">/{draft.requirements.pitchers}</span>
-          {' '}PIT
+          <span className="text-slate-500 tabular-nums">
+            /{draft.requirements.pitchers}
+          </span>
+          <span className="text-slate-300 ml-1">PIT</span>
         </span>
       </div>
 
@@ -582,20 +594,75 @@ function PoolGrid({
     [draft],
   );
 
-  const sorted = useMemo(() => {
-    const tierRank: Record<PlayerTier, number> = {
-      ELITE: 0,
-      STAR: 1,
-      SOLID: 2,
-      FILLER: 3,
-    };
-    return [...draft.pool].sort((a, b) => {
+  // Optional team filter. `null` = all teams (default). Surfaces the
+  // pool as a focused list when set; this is the primary "browse by
+  // team" affordance now that the grid is single-column.
+  const [teamFilter, setTeamFilter] = useState<string | null>(null);
+
+  // Tier-then-signature sort, applied INSIDE each team group below. The
+  // top-level grouping is the team itself, so the rendered output is
+  // "team header A, team A players sorted by tier, team header B, ...".
+  const tierRank: Record<PlayerTier, number> = useMemo(
+    () => ({ ELITE: 0, STAR: 1, SOLID: 2, FILLER: 3 }),
+    [],
+  );
+  const sortPlayers = (list: MlbPlayer[]) =>
+    [...list].sort((a, b) => {
       const ta = tierRank[playerTier(a)];
       const tb = tierRank[playerTier(b)];
       if (ta !== tb) return ta - tb;
       return playerSignatureValue(b) - playerSignatureValue(a);
     });
+
+  // Build the team-grouped view. We retain a stable team order based on
+  // each team's BEST remaining player (highest signature value within
+  // the highest-available tier) so marquee names rise to the top of
+  // the pool without us hardcoding a team ranking.
+  const teamGroups = useMemo(() => {
+    const byTeam = new Map<string, MlbPlayer[]>();
+    for (const p of draft.pool) {
+      const list = byTeam.get(p.team);
+      if (list) list.push(p);
+      else byTeam.set(p.team, [p]);
+    }
+    const groups = Array.from(byTeam.entries()).map(([team, players]) => {
+      const sorted = sortPlayers(players);
+      // Score = best player's tier rank * -1000 + best signature value.
+      // Lower tier rank (= ELITE) wins; high signature value breaks ties.
+      const top = sorted[0];
+      const score =
+        -tierRank[playerTier(top)] * 1000 + playerSignatureValue(top);
+      return { team, players: sorted, score };
+    });
+    groups.sort((a, b) => {
+      if (a.score !== b.score) return b.score - a.score;
+      return a.team.localeCompare(b.team);
+    });
+    return groups;
+    // sortPlayers + tierRank are stable across renders.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft.pool]);
+
+  // Filter pills enumerate every team currently represented in the
+  // pool, sorted alphabetically. Picking one collapses the rendered
+  // groups down to a single section.
+  const allTeamsInPool = useMemo(
+    () => teamGroups.map((g) => g.team).sort((a, b) => a.localeCompare(b)),
+    [teamGroups],
+  );
+
+  // If the user filtered to a team that subsequently emptied (its last
+  // player got drafted), drop the filter so the pool re-shows everyone
+  // instead of an empty section.
+  useEffect(() => {
+    if (teamFilter && !allTeamsInPool.includes(teamFilter)) {
+      setTeamFilter(null);
+    }
+  }, [teamFilter, allTeamsInPool]);
+
+  const visibleGroups = teamFilter
+    ? teamGroups.filter((g) => g.team === teamFilter)
+    : teamGroups;
 
   const lastPick = draft.log[draft.log.length - 1];
 
@@ -627,35 +694,343 @@ function PoolGrid({
         {lastPick && <RecapPill entry={lastPick} />}
       </header>
 
+      <TeamFilterBar
+        teams={allTeamsInPool}
+        active={teamFilter}
+        onPick={setTeamFilter}
+      />
+
       <div className="flex-1 overflow-auto px-3 py-3">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <AnimatePresence initial={false}>
-            {sorted.map((p) => {
-              let disabledReason: string | null = null;
-              if (draft.phase === 'bidding') {
-                disabledReason = 'Auction in progress';
-              } else if (!isUserNominator) {
-                disabledReason = 'Opponent is on the clock';
-              } else if (!eligibleForUser.has(p.id)) {
-                disabledReason =
-                  p.role === 'Batter'
-                    ? 'No batter slot left or budget too low'
-                    : 'No pitcher slot left or budget too low';
-              }
-              return (
-                <PoolCell
-                  key={p.id}
-                  player={p}
-                  clickable={isUserNominator && eligibleForUser.has(p.id)}
-                  onClick={() => draftNominate(p.id)}
-                  disabledReason={disabledReason}
-                />
-              );
-            })}
-          </AnimatePresence>
+        <div className="flex flex-col gap-4">
+          {visibleGroups.map((group) => (
+            <TeamSection
+              key={group.team}
+              team={group.team}
+              players={group.players}
+              draft={draft}
+              isUserNominator={isUserNominator}
+              eligibleForUser={eligibleForUser}
+              onNominate={(id) => draftNominate(id)}
+            />
+          ))}
         </div>
       </div>
     </section>
+  );
+}
+
+/**
+ * Horizontal team-tile bar that scopes the pool to a single team.
+ * The "All" tile at the leading edge restores the full grouped view.
+ * Only renders teams that still have at least one undrafted player,
+ * so the bar shrinks naturally as the pool drains.
+ *
+ * The tiles are intentionally large: this is now the *primary* team
+ * affordance in the draft screen (we removed the per-team banners
+ * inside the player list), so the row reads as a proper strip of
+ * team identities rather than a row of disposable pills. Each team
+ * tile fills with that team's primary color and shows the 3-letter
+ * code in the same big white drop-shadowed type used on player
+ * nameplates, which makes the strip act as a visual team key.
+ *
+ * Inactive team tiles ride a 40% black overlay so the bar reads as a
+ * "muted lineup of teams" by default; selecting one drops the
+ * overlay so the chosen team's color comes through at full
+ * saturation, plus an emerald ring + glow to confirm the selection.
+ */
+function TeamFilterBar({
+  teams,
+  active,
+  onPick,
+}: {
+  teams: string[];
+  active: string | null;
+  onPick: (team: string | null) => void;
+}) {
+  // The tile strip is now flanked by big chevron arrow buttons
+  // instead of a native horizontal scrollbar. The rationale:
+  //   - 30 team tiles overflow most viewports horizontally; a
+  //     scrollbar at this height looks odd and is easy to miss.
+  //   - Big arrows are an obvious affordance ("there are more teams
+  //     this way") and are click-friendly on touch as well.
+  //
+  // Scroll-edge state is tracked so the arrow on each side can dim
+  // (and become non-interactive) when there's nothing left to scroll
+  // to. The state recomputes on container scroll, on window resize,
+  // and whenever the team list itself changes (teams disappear from
+  // the bar as they get fully drafted).
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+
+  const updateScrollState = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    setCanScrollLeft(el.scrollLeft > 1);
+    setCanScrollRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 1);
+  }, []);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    updateScrollState();
+    el.addEventListener('scroll', updateScrollState, { passive: true });
+    window.addEventListener('resize', updateScrollState);
+    return () => {
+      el.removeEventListener('scroll', updateScrollState);
+      window.removeEventListener('resize', updateScrollState);
+    };
+  }, [updateScrollState]);
+
+  // Re-check after the tile list (teams) changes — drafting the last
+  // player on a team removes its tile, which can suddenly make the
+  // strip fit the viewport and disable the right arrow.
+  useEffect(() => {
+    updateScrollState();
+  }, [teams.length, updateScrollState]);
+
+  const scrollByDirection = (dir: 1 | -1) => {
+    const el = scrollRef.current;
+    if (!el) return;
+    // Move by ~80% of the visible width so a click "pages" the strip
+    // forward while keeping a tile or two of context overlap. Floor
+    // at 120px so the jump still feels snappy on narrow viewports.
+    const delta = Math.max(120, el.clientWidth - 80);
+    el.scrollBy({ left: dir * delta, behavior: 'smooth' });
+  };
+
+  if (teams.length === 0) return null;
+  return (
+    <div className="px-3 py-2 border-b border-amber-300/10 bg-black/20">
+      <div className="flex items-center gap-2">
+        <ScrollArrow
+          direction="left"
+          disabled={!canScrollLeft}
+          onClick={() => scrollByDirection(-1)}
+        />
+        {/* Padding inside the scroll container is critical: setting
+         * `overflow-x: auto` makes the browser treat this element as
+         * a clip context on BOTH axes (you can't have one axis scroll
+         * and the other visible). Without internal padding, the
+         * active pill's emerald ring + outer glow render right at the
+         * box edge and get clipped at the top/bottom/start/end. The
+         * `py-2 px-1` here (matched to the active pill's reduced
+         * shadow blur of 6px + 2px ring = 8px of outward visual)
+         * gives the selection effect room to render inside the clip
+         * box. */}
+        <div
+          ref={scrollRef}
+          className="flex-1 overflow-x-auto flex items-center gap-2 scroll-smooth py-2 px-1 [&::-webkit-scrollbar]:hidden"
+          style={{ scrollbarWidth: 'none' }}
+        >
+          <FilterPill
+            team={null}
+            active={active === null}
+            onClick={() => onPick(null)}
+          />
+          {teams.map((t) => (
+            <FilterPill
+              key={t}
+              team={t}
+              active={active === t}
+              onClick={() => onPick(t)}
+            />
+          ))}
+        </div>
+        <ScrollArrow
+          direction="right"
+          disabled={!canScrollRight}
+          onClick={() => scrollByDirection(1)}
+        />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Big chevron button used to page the team-tile strip. Sized to the
+ * same height as the tiles themselves so the row reads as one
+ * coherent control. Greys out (and stops responding) when the strip
+ * has nothing to scroll to in that direction.
+ */
+function ScrollArrow({
+  direction,
+  disabled,
+  onClick,
+}: {
+  direction: 'left' | 'right';
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  const Icon = direction === 'left' ? ChevronLeft : ChevronRight;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={direction === 'left' ? 'Scroll teams left' : 'Scroll teams right'}
+      className={`shrink-0 w-9 h-12 rounded-lg flex items-center justify-center transition-colors ${
+        disabled
+          ? 'bg-slate-900/40 text-slate-700 ring-1 ring-slate-800/60 cursor-not-allowed'
+          : 'bg-slate-800 text-slate-200 ring-1 ring-slate-700 hover:bg-slate-700 hover:text-amber-200 hover:ring-amber-400/50 cursor-pointer shadow-[0_2px_4px_rgba(0,0,0,0.3)]'
+      }`}
+    >
+      <Icon className="w-5 h-5" strokeWidth={3} />
+    </button>
+  );
+}
+
+function FilterPill({
+  team,
+  active,
+  onClick,
+}: {
+  team: string | null;
+  active: boolean;
+  onClick: () => void;
+}) {
+  // The "All" tile is intentionally distinct from team tiles: no
+  // team color, slightly narrower, neutral slate background. It reads
+  // as a "reset to default" affordance at the start of the strip.
+  if (team === null) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        className={`group shrink-0 flex items-center justify-center w-14 h-12 rounded-lg text-[12px] font-black uppercase tracking-widest transition-colors ${
+          active
+            ? 'bg-emerald-400/25 text-emerald-100 ring-2 ring-emerald-300/70 shadow-[0_0_6px_rgba(52,211,153,0.5)]'
+            : 'bg-slate-800/80 text-slate-300 hover:bg-slate-700 ring-1 ring-slate-700/60'
+        }`}
+        title="Show players from every team"
+      >
+        All
+      </button>
+    );
+  }
+  const tp = teamPalette(team);
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`group shrink-0 relative flex items-center justify-center w-16 h-12 rounded-lg overflow-hidden text-base font-black uppercase tracking-tight transition-shadow ${
+        active
+          ? 'ring-2 ring-emerald-300/80 shadow-[0_0_6px_rgba(52,211,153,0.6)]'
+          : 'ring-1 ring-slate-700/60 hover:ring-slate-500'
+      }`}
+      style={{
+        background: `linear-gradient(135deg, ${tp.primary} 0%, ${tp.primary} 55%, ${tp.secondary} 100%)`,
+      }}
+      title={`Show only ${team} players`}
+    >
+      {/* Inactive overlay dims the team color so a row of 30 teams
+          doesn't drown the eye. Hover lifts the overlay slightly to
+          preview the team's full color before clicking. */}
+      <div
+        className={`absolute inset-0 pointer-events-none transition-colors ${
+          active
+            ? 'bg-transparent'
+            : 'bg-slate-950/40 group-hover:bg-slate-950/15'
+        }`}
+      />
+      <span className="relative z-10 text-white drop-shadow-[0_1px_2px_rgba(0,0,0,0.85)]">
+        {team}
+      </span>
+    </button>
+  );
+}
+
+/**
+ * One team's section in the pool view: a colored team-banner header
+ * stacked above its sorted player rows. Acts as a visual divider when
+ * the pool is unfiltered and as the sole content when a filter is on.
+ */
+function TeamSection({
+  team,
+  players,
+  draft,
+  isUserNominator,
+  eligibleForUser,
+  onNominate,
+}: {
+  team: string;
+  players: MlbPlayer[];
+  draft: DraftState;
+  isUserNominator: boolean;
+  eligibleForUser: Set<string>;
+  onNominate: (playerId: string) => void;
+}) {
+  // Visual team grouping is now carried entirely by the larger team
+  // tiles in the filter bar plus each row's own team-colored gradient
+  // and small team code. The previous per-team banner header was
+  // pulling its weight only as a label; once the filter pills became
+  // the dominant team affordance, the banner became vertical noise
+  // that pushed players further down the scroll. We keep the
+  // `TeamSection` as a structural wrapper (so AnimatePresence can
+  // still scope per team) but render no header.
+  //
+  // Slots-remaining is pre-computed once per render so the per-cell
+  // disabled-chip resolution doesn't re-walk the roster N times.
+  const userBatSlotsLeft = slotsRemainingForRole(
+    draft.roster.user,
+    draft.requirements,
+    'Batter',
+  );
+  const userPitSlotsLeft = slotsRemainingForRole(
+    draft.roster.user,
+    draft.requirements,
+    'Pitcher',
+  );
+  // Suppress unused-warning under no-unused-vars: `team` is intentionally
+  // accepted (the parent keys this section by it) even though we no
+  // longer paint a header.
+  void team;
+  return (
+    <div>
+      <div className="flex flex-col gap-2.5">
+        <AnimatePresence initial={false}>
+          {players.map((p) => {
+            // Decide both the verbose tooltip reason AND the short
+            // inline chip that surfaces *why* a card can't be clicked.
+            // Per-player reasons (POSITION FULL / OVER BUDGET) get a
+            // chip; global reasons (opponent is on the clock, auction
+            // mid-flight) don't, because the page header already
+            // communicates them and chip-spamming every row would be
+            // noise.
+            let disabledReason: string | null = null;
+            let disabledChip: string | null = null;
+            if (draft.phase === 'bidding') {
+              disabledReason = 'Auction in progress';
+            } else if (!isUserNominator) {
+              disabledReason = 'Opponent is on the clock';
+            } else if (!eligibleForUser.has(p.id)) {
+              const slotsLeft =
+                p.role === 'Batter' ? userBatSlotsLeft : userPitSlotsLeft;
+              if (slotsLeft === 0) {
+                disabledReason =
+                  p.role === 'Batter'
+                    ? 'Batter slots are full'
+                    : 'Pitcher slots are full';
+                disabledChip = 'POSITION FULL';
+              } else {
+                disabledReason = 'Not enough budget left for this player';
+                disabledChip = 'OVER BUDGET';
+              }
+            }
+            return (
+              <PoolCell
+                key={p.id}
+                player={p}
+                clickable={isUserNominator && eligibleForUser.has(p.id)}
+                onClick={() => onNominate(p.id)}
+                disabledReason={disabledReason}
+                disabledChip={disabledChip}
+              />
+            );
+          })}
+        </AnimatePresence>
+      </div>
+    </div>
   );
 }
 
@@ -664,11 +1039,13 @@ function PoolCell({
   clickable,
   onClick,
   disabledReason,
+  disabledChip,
 }: {
   player: MlbPlayer;
   clickable: boolean;
   onClick?: () => void;
   disabledReason: string | null;
+  disabledChip: string | null;
 }) {
   const tier = playerTier(player);
   const tierStyle = TIER_STYLE[tier];
@@ -678,6 +1055,17 @@ function PoolCell({
     () => player.signatureCardIds.map((id) => CARDS_BY_ID[id]).filter(Boolean),
     [player],
   );
+  // Cells live inside a TeamSection that already shows the team logo
+  // and color in its banner header, so the per-row team badge was
+  // redundant. The team-colored gradient stripe across the nameplate
+  // still cues team identity per row.
+  //
+  // We also drop `tierStyle.glow` from the static state on purpose:
+  // when 5+ ELITE/STAR cards stack vertically, their halos bleed into
+  // each other. The tier ring color (`tierStyle.ring`) already carries
+  // the tier signal; the soft glow now only fires on hover via
+  // `tierStyle.hoverGlow`, which feels like a focal pop instead of
+  // ambient noise.
   return (
     <motion.button
       type="button"
@@ -687,49 +1075,66 @@ function PoolCell({
       exit={{ opacity: 0, scale: 0.85 }}
       onClick={clickable ? onClick : undefined}
       disabled={!clickable}
-      whileHover={clickable ? { y: -3, scale: 1.015 } : undefined}
+      whileHover={clickable ? { y: -2 } : undefined}
       whileTap={clickable ? { scale: 0.99 } : undefined}
       transition={{ type: 'spring', stiffness: 300, damping: 22 }}
       title={
         disabledReason ?? `${player.name} (${player.team}) — click to put on the block`
       }
-      className={`group relative rounded-xl overflow-hidden text-left bg-gradient-to-b from-slate-900 to-slate-950 ring-2 transition-all flex flex-col ${
+      className={`group relative rounded-xl overflow-hidden text-left bg-gradient-to-b from-slate-900 to-slate-950 ring-2 transition-colors flex flex-col ${
         clickable
           ? `${tierStyle.ring} ${tierStyle.hoverGlow} cursor-pointer`
-          : 'ring-slate-700/50 opacity-80 cursor-not-allowed'
-      } ${tierStyle.glow}`}
+          : 'ring-slate-700/50 opacity-60 saturate-50 cursor-not-allowed'
+      }`}
     >
-      {/* Player nameplate strip across the top */}
+      {/* Player nameplate strip across the top.
+       *
+       * The team banners that used to sit above each section are gone
+       * (replaced by the larger team-tile filter bar at the top of the
+       * pool), so the per-row nameplate now carries the team-code
+       * label itself. The 3-letter code is rendered as compact white
+       * text on the team-colored stripe; combined with the gradient
+       * color it doubles as the row's team identity.
+       */}
       <div
-        className="relative flex items-center gap-2 px-3 py-2 text-white"
+        className="relative flex items-center gap-3 px-3 py-2 text-white"
         style={{
           background: `linear-gradient(110deg, ${tp.primary} 0%, ${tp.primary} 60%, ${tp.secondary} 100%)`,
         }}
       >
-        <span
-          className="w-8 h-8 rounded-full flex items-center justify-center text-[9px] font-black tracking-tight ring-2 ring-white/60 shrink-0 shadow-md"
-          style={{ background: tp.secondary }}
-        >
-          {player.team}
-        </span>
         <div className="min-w-0 flex-1">
-          <div className="text-[8px] uppercase tracking-[0.3em] opacity-80 leading-none font-black">
-            {firstName(player)}
+          <div className="text-[9px] uppercase tracking-[0.3em] opacity-80 leading-none font-black flex items-center gap-2">
+            <span className="text-[11px] tracking-tight opacity-95">
+              {player.team}
+            </span>
+            <span className="opacity-50">·</span>
+            <span>{firstName(player)}</span>
           </div>
-          <div className="text-base font-black uppercase italic skew-x-[-3deg] leading-tight tracking-tight truncate">
+          <div className="text-lg font-black uppercase italic skew-x-[-3deg] leading-tight tracking-tight truncate">
             {lastName(player)}
           </div>
         </div>
-        <span className="shrink-0 text-[9px] uppercase tracking-[0.2em] opacity-90 font-black">
-          {player.role === 'Batter' ? 'Bat' : 'Pit'}
+        <span className="shrink-0 text-[10px] uppercase tracking-[0.25em] opacity-90 font-black">
+          {player.role === 'Batter' ? 'Batter' : 'Pitcher'}
         </span>
       </div>
-      {/* Tag chips (1 row max, very compact) */}
-      <div className="px-2 pt-1.5 pb-1 flex flex-wrap gap-1">
+      {/* Inline ineligibility chip + tag chips. The reason chip leads
+          the row when the cell is disabled for a per-player reason
+          (full role slots, over budget) so the user understands why
+          the cell is unclickable without having to hover for a tooltip. */}
+      <div className="px-2.5 pt-2 pb-1 flex flex-wrap gap-1">
+        {disabledChip && (
+          <span
+            className="text-[10px] uppercase tracking-[0.15em] px-2 py-0.5 bg-rose-500/20 ring-1 ring-rose-400/50 text-rose-200 rounded-sm font-black"
+            title={disabledReason ?? undefined}
+          >
+            {disabledChip}
+          </span>
+        )}
         {[...tagSet].slice(0, 4).map((t) => (
           <span
             key={t}
-            className="text-[8px] uppercase tracking-tight px-1.5 py-0.5 bg-slate-800 ring-1 ring-slate-700 text-slate-300 rounded-sm font-bold"
+            className="text-[10px] uppercase tracking-tight px-2 py-0.5 bg-slate-800 ring-1 ring-slate-700 text-slate-300 rounded-sm font-bold"
             title={TAG_BLURB[t] ?? t}
           >
             {t}
@@ -737,7 +1142,7 @@ function PoolCell({
         ))}
       </div>
       {/* Three ability cards laid out side by side */}
-      <div className="flex gap-1.5 px-2 pb-2 pt-1">
+      <div className="flex gap-2 px-2.5 pb-2.5 pt-1.5">
         {cards.map((c) => (
           <MiniAbilityCard key={c.id} card={c} tierAccent={tierStyle.hex} />
         ))}
@@ -764,15 +1169,15 @@ function MiniAbilityCard({
 }) {
   return (
     <div
-      className="flex-1 min-w-0 rounded-md bg-gradient-to-b from-amber-50 to-amber-100 ring-1 ring-amber-700/20 shadow-sm flex flex-col p-1.5 text-slate-900 leading-tight"
+      className="flex-1 min-w-0 rounded-md bg-gradient-to-b from-amber-50 to-amber-100 ring-1 ring-amber-700/20 shadow-sm flex flex-col p-2 text-slate-900 leading-tight"
       title={`${card.name} (${card.baseValue}) — ${card.description}`}
     >
-      <div className="flex items-start gap-1 mb-0.5">
-        <div className="text-[8px] font-black uppercase italic skew-x-[-3deg] line-clamp-2 flex-1 leading-[1.1]">
+      <div className="flex items-start gap-1.5 mb-1">
+        <div className="text-[11px] font-black uppercase italic skew-x-[-3deg] line-clamp-2 flex-1 leading-[1.1]">
           {card.name}
         </div>
         <span
-          className="shrink-0 px-1 rounded text-[9px] font-mono font-black tabular-nums leading-tight text-white"
+          className="shrink-0 px-1.5 rounded text-[12px] font-mono font-black tabular-nums leading-tight text-white"
           style={{
             background: tierAccent,
             textShadow: '0 1px 1px rgba(0,0,0,0.35)',
@@ -781,7 +1186,7 @@ function MiniAbilityCard({
           {card.baseValue}
         </span>
       </div>
-      <div className="text-[7.5px] leading-[1.2] text-slate-700 line-clamp-5 flex-1">
+      <div className="text-[11px] leading-[1.25] text-slate-700 line-clamp-5 flex-1">
         {card.description}
       </div>
     </div>

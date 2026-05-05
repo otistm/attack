@@ -12,12 +12,15 @@ import {
   aiBidAmount,
   aiBidDecision,
   aiNominate,
+  buildQuickMatchDraft,
   type DraftState,
   initDraftState,
   nominate as draftNominateFn,
   passBid as draftPassFn,
   placeBid as draftPlaceBidFn,
+  repairDraftStall,
 } from "./draft";
+import { TUTORIAL_STEPS } from "./tutorialSteps";
 
 export type Half = "top" | "bottom";
 export type Team = "HOME" | "AWAY";
@@ -120,19 +123,38 @@ export function getUserSide(s: { userTeam: Team; half: Half }): Side {
  * resolves via `resolveChoice`. Unanswered choices simply drop their effect
  * (the engine treats them as "the player declined").
  *
- * - `guessShape`: pick one shape (b-65 Guess Pitch).
- * - `pickShape`: full 3-step picker (target card + side + shape).
- *   `targets` enumerates the eligible card IDs in the prompting player's hand.
- * - `pickGeneral` / `pickConnection`: reserved for later phases.
+ * Discriminated by `type`:
+ *   - `guessShape`: pick one shape (b-65 Guess Pitch). Options are typed as
+ *     `ShapeType[]` so the modal can render shape buttons without casts.
+ *   - `pickShape`: full 3-step picker (target card + side + shape).
+ *     `targets` enumerates the eligible card IDs in the prompting player's
+ *     hand. Options are typed as `ShapeType[]`.
+ *   - `pickGeneral` / `pickConnection`: reserved for later phases. Options
+ *     are arbitrary string IDs (card ids / seam keys); the modal must NOT
+ *     forward these to the shape-resolved path without validation.
  */
-export interface PendingChoice {
-  cardId: string;
-  side: "Batting" | "Pitching";
-  type: "guessShape" | "pickShape" | "pickGeneral" | "pickConnection";
-  options?: string[];
-  /** Eligible target card IDs for `pickShape` (modify-shape wizard). */
-  targets?: string[];
-}
+export type PendingChoice =
+  | {
+      cardId: string;
+      side: "Batting" | "Pitching";
+      type: "guessShape";
+      options: ShapeType[];
+    }
+  | {
+      cardId: string;
+      side: "Batting" | "Pitching";
+      type: "pickShape";
+      options: ShapeType[];
+      /** Eligible target card IDs for the modify-shape wizard. */
+      targets: string[];
+    }
+  | {
+      cardId: string;
+      side: "Batting" | "Pitching";
+      type: "pickGeneral" | "pickConnection";
+      options: string[];
+      targets?: string[];
+    };
 
 /**
  * Structured payload the modal hands back to `resolveChoice`. The discriminator
@@ -168,18 +190,46 @@ export interface PendingReveal {
 export type { PendingDebuff } from "./resolveStep";
 
 /**
- * Logical slot a runner sits on. 'scored' means they crossed home and should
- * exit the field. Used to drive baserunning animations between at-bats.
+ * Logical slot a runner sits on. `'scored'` means they crossed home and
+ * should exit the field. `'out'` means they were retired without scoring
+ * (used for pickoffs so the 3D scene doesn't animate a removed runner
+ * across the plate as if they had scored). Used to drive baserunning
+ * animations between at-bats.
  */
-export type BaseSlot = "home" | "first" | "second" | "third" | "scored";
+export type BaseSlot = "home" | "first" | "second" | "third" | "scored" | "out";
+
+/**
+ * Per-base runner identity, indexed identically to `Bases` (1B, 2B, 3B). A
+ * `null` slot means either nobody is on that base, or the slot is occupied
+ * by an "extra runner" spawned from a card effect (e.g. b-135 Stolen Bag)
+ * for which there is no specific drafted player to credit. The boolean
+ * `bases` array remains the source of truth for occupancy in gameplay
+ * logic; `baseRunners` is parallel display data for showing each runner's
+ * name above their head in the 3D scene.
+ */
+export type BaseRunners = [
+  MlbPlayer | null,
+  MlbPlayer | null,
+  MlbPlayer | null,
+];
 
 export interface RunnerMove {
   /** Stable id for the move – used as the React key for the animated runner. */
   id: string;
   from: BaseSlot;
   to: BaseSlot;
-  /** 'batter' moves originate at home, 'runner' moves originate on a base. */
-  kind: "batter" | "runner";
+  /**
+   * 'batter' moves originate at home; 'runner' moves originate on a base;
+   * 'pickoff' moves are runners removed off-base WITHOUT scoring.
+   */
+  kind: "batter" | "runner" | "pickoff";
+  /**
+   * The player making this move, when known. Carries the moving player's
+   * name into the 3D scene so the animated runner can label themselves
+   * mid-travel. `null` for phantom additions like b-135 Stolen Bag where
+   * the runner doesn't correspond to a specific drafted player.
+   */
+  player: MlbPlayer | null;
 }
 
 export interface GameState {
@@ -203,6 +253,13 @@ export interface GameState {
   homeScore: number;
   awayScore: number;
   bases: Bases;
+  /**
+   * Parallel to `bases` — when `bases[i]` is true, `baseRunners[i]` may
+   * carry the `MlbPlayer` who is on that base. Used by the 3D scene to
+   * label runners with their drafted-player names. May be `null` even
+   * when `bases[i]` is true (phantom runners spawned by card effects).
+   */
+  baseRunners: BaseRunners;
 
   // Current at-bat.
   phase: Phase;
@@ -395,6 +452,36 @@ export interface GameState {
    */
   reset: (team?: Team) => void;
   setUserTeam: (team: Team) => void;
+
+  // ----- Start Game screen visibility -----
+  /**
+   * The pre-game lane chooser (auction vs quick match) renders when this
+   * is true and `phase !== "drafting"`. Owned by the store so any component
+   * can open it -- e.g. the game-over button. Closed automatically by
+   * `startDraft` and `startQuickMatch` once the player commits.
+   */
+  showStartScreen: boolean;
+  setShowStartScreen: (open: boolean) => void;
+
+  // ----- Learn-to-Play tutorial -----
+  /**
+   * When true, the `TutorialOverlay` renders a step-by-step walkthrough on
+   * top of a fresh Quick Match. The overlay's backdrop captures clicks so
+   * the engine effectively pauses while a step is up; `lockIn` and
+   * `startNextAtBat` short-circuit while this is true (the only exception
+   * is the FINAL step, where `lockIn` clears the flag and resolves the
+   * at-bat normally so the tutorial dissolves into live play).
+   *
+   * Cleared by every game-state-resetting action (`reset`, `startDraft`,
+   * `startQuickMatch`) so tutorial state can never bleed into a real game.
+   */
+  tutorialActive: boolean;
+  /** 0-based index into `TUTORIAL_STEPS`. */
+  tutorialStepIndex: number;
+  startTutorial: () => void;
+  tutorialNext: () => void;
+  tutorialPrev: () => void;
+  tutorialExit: () => void;
   resolveChoice: (cardId: string, value: ResolvedChoice) => void;
   /**
    * Open the choice modal for the given card. The card must currently
@@ -419,6 +506,15 @@ export interface GameState {
    * The user is always the first nominator.
    */
   startDraft: (team: Team) => void;
+  /**
+   * "Quick Match" lane -- skip the auction. Builds a `DraftState` with
+   * randomized 7-batter / 3-pitcher rosters for both sides (phase already
+   * "complete") and drops straight into `phase = "selecting"`. The
+   * gameplay layer reads `s.draft.roster` for every at-bat exactly the
+   * same way it does after a finished auction, so once this lands, the
+   * downstream flow is indistinguishable from the auction path.
+   */
+  startQuickMatch: (team: Team) => void;
   /**
    * Open an auction on the given player. No-op unless `phase === "drafting"`,
    * the user is the current nominator, and the player is in the pool. The
@@ -616,7 +712,7 @@ function derivePendingChoices(
   batterHand: CardDefinition[],
   pitcherHand: CardDefinition[],
 ): PendingChoice[] {
-  const SHAPE_OPTIONS = ["circle", "diamond", "square", "star"];
+  const SHAPE_OPTIONS: ShapeType[] = ["circle", "diamond", "square", "star"];
   const out: PendingChoice[] = [];
 
   // b-12 Switch Hitter: change the shape of one of YOUR General cards.
@@ -683,14 +779,18 @@ export function derivePendingReveals(
 
 const INITIAL_AT_BAT = freshAtBat();
 
-// Boot the app straight into the draft. The placeholder at-bat above only
-// exists so the 3D scene has something to render behind the draft overlay
-// (and so the rest of the store can stay non-nullable on `batter` / `pitcher`).
-// The user picks players via the auction; `completeDraft` then re-deals the
-// real first at-bat from their drafted rosters. Without this default, the
-// player would briefly see the field for one frame before the draft mounted,
-// which read as a flash of the wrong screen.
-const INITIAL_DRAFT = initDraftState();
+// Boot the app into a quiescent "selecting" phase with the placeholder
+// at-bat above sitting idle behind the StartGameScreen. The start screen
+// (gated by `showStartScreen`) renders on top until the player picks a
+// lane (auction or quick match), at which point the appropriate action
+// (`startDraft` or `startQuickMatch`) takes over and replaces the
+// placeholder at-bat with one drawn from the actual rosters.
+//
+// Booting at "selecting" rather than "drafting" means we don't open the
+// auction overlay before the player has even chosen the lane. `draft`
+// stays null until a lane action populates it -- gameplay code already
+// tolerates a null draft (falls back to the global player pool via
+// `rosterPoolsFor`), so the scene behind the start screen renders fine.
 
 export const useGameStore = create<GameState>((set, get) => ({
   inning: 1,
@@ -706,10 +806,22 @@ export const useGameStore = create<GameState>((set, get) => ({
   homeScore: 0,
   awayScore: 0,
   bases: [false, false, false],
+  baseRunners: [null, null, null],
 
-  phase: "drafting",
+  phase: "selecting",
   ...INITIAL_AT_BAT,
   atBatId: 1,
+
+  // The lane chooser is up by default on first boot. Closes when the
+  // player commits via `startDraft` / `startQuickMatch`; reopens from the
+  // game-over screen via `setShowStartScreen(true)`.
+  showStartScreen: true,
+
+  // Tutorial defaults to off. Activated by `startTutorial()` (called
+  // immediately after `startQuickMatch('AWAY')` from the Learn to Play
+  // button on the StartGameScreen).
+  tutorialActive: false,
+  tutorialStepIndex: 0,
 
   lastOutcome: null,
   lastBatterScore: 0,
@@ -733,7 +845,11 @@ export const useGameStore = create<GameState>((set, get) => ({
   revealScript: [],
   pendingResolvedPhase: null,
 
-  draft: INITIAL_DRAFT,
+  // Empty until the player picks a lane on the StartGameScreen. Auction
+  // path: `startDraft` populates with `initDraftState()` and the user
+  // builds it via the auction. Quick-match path: `startQuickMatch`
+  // populates with `buildQuickMatchDraft()` and skips straight to play.
+  draft: null,
 
   reorderBatterHand: (cards) => set({ batterHand: cards }),
   reorderPitcherHand: (cards) => set({ pitcherHand: cards }),
@@ -869,6 +985,12 @@ export const useGameStore = create<GameState>((set, get) => ({
       // the AI's side stays on legacy auto-connect (`null`). Branch on
       // current seat -- when the user is pitching, the batter is the AI.
       affirmedSeams: getUserSide(s) === "Batting" ? s.affirmedSeams : null,
+      // The OPPOSITE seat's seams: when the user is batting, the pitcher
+      // (AI) uses null/auto-connect; when the user is pitching, the
+      // batter (AI) uses null. Effects keyed off opponent combo state
+      // (b-2, p-50, p-57, ...) read from this so combo detection on the
+      // opponent's hand matches the seam set scoring will actually use.
+      opponentAffirmedSeams: getUserSide(s) === "Pitching" ? s.affirmedSeams : null,
     };
     return scoreHand(s.batterHand, ctx);
   },
@@ -898,7 +1020,13 @@ export const useGameStore = create<GameState>((set, get) => ({
       s.batterHand.some((c) => c.id === "b-127") &&
       isCardCombinedInHand(s.batterHand, "b-127", batterAffirmed)
     ) {
-      const target = lowestUncombinedInHand(s.pitcherHand, null);
+      // M3 fix: pass the SAME affirmedSeams that scorePitcher will use to
+      // group the pitcher hand. Previously this used `null` (auto-connect),
+      // which could mark a card "uncombined" here that scorePitcher would
+      // then group into a chain -- silencing the wrong card.
+      const pitcherAffirmed =
+        getUserSide(s) === "Pitching" ? s.affirmedSeams : null;
+      const target = lowestUncombinedInHand(s.pitcherHand, pitcherAffirmed);
       if (target) nullifiedSet.add(target.id);
     }
 
@@ -925,6 +1053,8 @@ export const useGameStore = create<GameState>((set, get) => ({
       // Mirror of scoreBatter: route affirmedSeams to whichever side
       // the user is currently playing. AI keeps legacy auto-connect.
       affirmedSeams: getUserSide(s) === "Pitching" ? s.affirmedSeams : null,
+      // Opposite seat's seams (see scoreBatter for rationale).
+      opponentAffirmedSeams: getUserSide(s) === "Batting" ? s.affirmedSeams : null,
     };
     return scoreHand(s.pitcherHand, ctx);
   },
@@ -972,6 +1102,31 @@ export const useGameStore = create<GameState>((set, get) => ({
   lockIn: () => {
     const sBefore = get();
     if (sBefore.phase !== "selecting") return;
+    // Tutorial gate: while the walkthrough is active, lockIn is a no-op
+    // EXCEPT on the very last step (the interactive "Press Lock In" beat).
+    // On that step, lockIn implicitly dismisses the tutorial and then
+    // resolves the at-bat normally, so the walkthrough dissolves into
+    // live play without a separate confirmation.
+    if (sBefore.tutorialActive) {
+      const isFinalStep =
+        sBefore.tutorialStepIndex >= TUTORIAL_STEPS.length - 1;
+      if (!isFinalStep) return;
+      set({ tutorialActive: false, tutorialStepIndex: 0 });
+    }
+    // Invariant guard: lockIn requires non-empty hands on both sides.
+    // Empty hands would silently produce empty `bestGroup`s and many
+    // resolveStep / scoring effects would no-op against `false`. We
+    // surface the violation in dev so a corruption upstream is caught
+    // early instead of resolving as a bizarre stalemate.
+    if (sBefore.batterHand.length === 0 || sBefore.pitcherHand.length === 0) {
+      if (typeof console !== "undefined") {
+        console.error("[lockIn] aborting: empty hand", {
+          batter: sBefore.batterHand.length,
+          pitcher: sBefore.pitcherHand.length,
+        });
+      }
+      return;
+    }
 
     // Coin flips resolve at lock-in (b-22 Power/Speed Threat). We populate
     // the store BEFORE any scoring call so scoreBatter / scoreHandFor pick
@@ -1004,11 +1159,16 @@ export const useGameStore = create<GameState>((set, get) => ({
 
     const m = computeMatchup(s, batterResult, pitcherResult);
 
-    // Hit Scale ladder: only fires when the batter wins. forcedOutcome short-
-    // circuits the ladder entirely (b-22 Walk-Off etc.).
+    // Hit Scale ladder: only fires when the batter wins. Batter-side
+    // `forcedOutcome` (b-11, b-63, b-22 Walk-Off, ...) is gated on a win so
+    // the batter can't lose the matchup and still record a hit. Pitcher-side
+    // `forcedOutcome` (p-79 Intentional Walk) is honored when the pitcher
+    // "wins" -- it forces a single (the IBB walk) instead of an out.
     let outcome: HitOutcome;
-    if (batterResult.forcedOutcome) {
+    if (batterResult.forcedOutcome && m.batterWins) {
       outcome = batterResult.forcedOutcome;
+    } else if (pitcherResult.forcedOutcome && !m.batterWins) {
+      outcome = pitcherResult.forcedOutcome;
     } else if (!m.batterWins) {
       outcome = "out";
     } else {
@@ -1087,6 +1247,11 @@ export const useGameStore = create<GameState>((set, get) => ({
   startNextAtBat: () => {
     const s = get();
     if (s.phase === "game-over") return;
+    // Defensive: while the tutorial is active, never advance the at-bat.
+    // The linear walkthrough doesn't reach this codepath (it ends at the
+    // first lockIn, which clears tutorialActive before falling through),
+    // but a stray external call from a debug action shouldn't sneak past.
+    if (s.tutorialActive) return;
     const pools = rosterPoolsFor(s);
     const ab = freshAtBat({
       recent: { batters: s.recentBatterIds, pitchers: s.recentPitcherIds },
@@ -1103,8 +1268,13 @@ export const useGameStore = create<GameState>((set, get) => ({
       lastBatterCardModifiers: {},
       lastPitcherCardModifiers: {},
       runnerMoves: [],
-      // isFirstAtBatOfInning gets set to false after the first at-bat of the half.
-      isFirstAtBatOfInning: false,
+      // Preserve `isFirstAtBatOfInning` from the snapshot. `applyOutcome` sets
+      // this flag to true on the third out (i.e. the first at-bat of the
+      // newly-flipped half is still pending here), and lockIn -> normal at-bat
+      // flow leaves it false. Forcing it to false unconditionally was a bug
+      // that broke leadoff effects (b-13 Leadoff Magic, etc.) for every half
+      // after the first.
+      isFirstAtBatOfInning: s.isFirstAtBatOfInning,
       resolvedChoices: {},
       activeChoiceCardId: null,
       coinFlips: {},
@@ -1132,6 +1302,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       homeScore: 0,
       awayScore: 0,
       bases: [false, false, false],
+      baseRunners: [null, null, null],
       phase: "selecting",
       ...ab,
       atBatId: s.atBatId + 1,
@@ -1154,10 +1325,40 @@ export const useGameStore = create<GameState>((set, get) => ({
       // `reset` is the legacy "play with random pools" path -- clear any
       // active draft so freshAtBat falls back to the global lists.
       draft: null,
+      // Tutorial state never survives a fresh game.
+      tutorialActive: false,
+      tutorialStepIndex: 0,
     });
   },
 
   setUserTeam: (team) => set({ userTeam: team }),
+
+  setShowStartScreen: (open) => set({ showStartScreen: open }),
+
+  startTutorial: () => set({ tutorialActive: true, tutorialStepIndex: 0 }),
+
+  tutorialNext: () => {
+    const s = get();
+    if (!s.tutorialActive) return;
+    const next = s.tutorialStepIndex + 1;
+    if (next >= TUTORIAL_STEPS.length) {
+      // Reached the end without going through the interactive lock-in
+      // exit (defensive -- the final step shouldn't expose Next, but if
+      // it ever does, fall through to a clean dismiss).
+      set({ tutorialActive: false, tutorialStepIndex: 0 });
+      return;
+    }
+    set({ tutorialStepIndex: next });
+  },
+
+  tutorialPrev: () => {
+    const s = get();
+    if (!s.tutorialActive) return;
+    if (s.tutorialStepIndex === 0) return;
+    set({ tutorialStepIndex: s.tutorialStepIndex - 1 });
+  },
+
+  tutorialExit: () => set({ tutorialActive: false, tutorialStepIndex: 0 }),
 
   // ============ Draft (auction) actions ====================================
 
@@ -1184,6 +1385,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       homeScore: 0,
       awayScore: 0,
       bases: [false, false, false],
+      baseRunners: [null, null, null],
       ...ab,
       atBatId: s.atBatId + 1,
       lastOutcome: null,
@@ -1202,6 +1404,65 @@ export const useGameStore = create<GameState>((set, get) => ({
       recentPitcherIds: [ab.pitcher.id],
       revealScript: [],
       pendingResolvedPhase: null,
+      // Player committed to a lane -- the start screen has done its job.
+      showStartScreen: false,
+      // Auction draft is never wrapped in a tutorial.
+      tutorialActive: false,
+      tutorialStepIndex: 0,
+    });
+  },
+
+  startQuickMatch: (team) => {
+    const s = get();
+    const draft = buildQuickMatchDraft();
+    // Same seeding as `completeDraft` -- batting team is determined by
+    // the half (top = AWAY) and `userTeam`. The Quick Match path is
+    // designed to be indistinguishable from a finished auction once we
+    // reach gameplay, so we mirror every reset field `completeDraft`
+    // sets, just with `phase: "selecting"` directly (no drafting beat
+    // in between).
+    const battingTeam: Team = "AWAY"; // half === "top" on a fresh game
+    const battingSide = battingTeam === team ? "user" : "ai";
+    const fieldingSide = battingSide === "user" ? "ai" : "user";
+    const ab = freshAtBat({
+      battersPool: draft.roster[battingSide].batters,
+      pitchersPool: draft.roster[fieldingSide].pitchers,
+    });
+    set({
+      phase: "selecting",
+      userTeam: team,
+      draft,
+      inning: 1,
+      half: "top",
+      outs: 0,
+      isFirstAtBatOfInning: true,
+      homeScore: 0,
+      awayScore: 0,
+      bases: [false, false, false],
+      baseRunners: [null, null, null],
+      ...ab,
+      atBatId: s.atBatId + 1,
+      lastOutcome: null,
+      lastBatterScore: 0,
+      lastPitcherScore: 0,
+      lastResultMessage: "",
+      lastBatterCardModifiers: {},
+      lastPitcherCardModifiers: {},
+      runnerMoves: [],
+      pendingDebuffs: [],
+      resolvedChoices: {},
+      activeChoiceCardId: null,
+      coinFlips: {},
+      affirmedSeams: new Set<string>(),
+      recentBatterIds: [ab.batter.id],
+      recentPitcherIds: [ab.pitcher.id],
+      revealScript: [],
+      pendingResolvedPhase: null,
+      showStartScreen: false,
+      // Tutorial-cleared by default; the "Learn to Play" entry point
+      // re-arms it via `startTutorial()` immediately after this call.
+      tutorialActive: false,
+      tutorialStepIndex: 0,
     });
   },
 
@@ -1238,7 +1499,16 @@ export const useGameStore = create<GameState>((set, get) => ({
     if (d.phase === "nominating") {
       if (d.nominator !== "ai") return;
       const pick = aiNominate(d);
-      if (!pick) return;
+      if (!pick) {
+        // AI has no legal nomination right now (eligible pool empty for
+        // its side). Without recovery, the autopilot would loop on this
+        // tick forever. `repairDraftStall` either hands nomination to the
+        // user (if they have legal picks) or runs deadlock recovery /
+        // marks the draft complete with a `deadlocked` flag.
+        const repaired = repairDraftStall(d);
+        if (repaired !== d) set({ draft: repaired });
+        return;
+      }
       const next = draftNominateFn(d, pick.id, "ai");
       if (next === d) return;
       set({ draft: next });
@@ -1286,6 +1556,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       homeScore: 0,
       awayScore: 0,
       bases: [false, false, false],
+      baseRunners: [null, null, null],
       lastOutcome: null,
       lastBatterScore: 0,
       lastPitcherScore: 0,
@@ -1311,8 +1582,13 @@ export const useGameStore = create<GameState>((set, get) => ({
 
 /**
  * Score a hand using the same context the store would build, but with an
- * arbitrary card list substituted in. Used by lockIn when p-41 Sweeping
- * Slider mutates the batter hand mid-resolution.
+ * arbitrary card list substituted in. Used by lockIn / previewMatchup when
+ * p-41 Sweeping Slider mutates the batter hand mid-resolution.
+ *
+ * Must mirror EVERY field that `scoreBatter` / `scorePitcher` populate, or
+ * the substituted-hand path will silently drop effects (e.g. p-41 was
+ * dropping `pitcherHandedness`, which broke b-126 Lefty Mash on the
+ * mutation path while preview/normal-path still showed it).
  */
 function scoreHandFor(
   s: GameState,
@@ -1321,12 +1597,40 @@ function scoreHandFor(
 ): ScoringResult {
   const isBatting = side === "Batting";
   const opponent = isBatting ? s.pitcherHand : s.batterHand;
-  const aceCommand = isBatting && s.pitcherHand.some((c) => c.id === "p-36");
   const nullified = new Set<string>();
-  if (aceCommand) {
-    const top = highestValueCard(hand);
-    if (top) nullified.add(top.id);
+
+  if (isBatting) {
+    // p-36 Ace's Command: nullify the mechanic of the batter's highest card.
+    if (s.pitcherHand.some((c) => c.id === "p-36")) {
+      const top = highestValueCard(hand);
+      if (top) nullified.add(top.id);
+    }
+  } else {
+    // Mirror scorePitcher: b-127 Mr. Smile silences the lowest UNCOMBINED
+    // pitcher card when b-127 itself is combined. We pass the same affirmed
+    // seams the pitcher hand would actually be scored under so the silence
+    // target matches the player's manual chain (M3).
+    const batterAffirmed =
+      getUserSide(s) === "Batting" ? s.affirmedSeams : null;
+    if (
+      s.batterHand.some((c) => c.id === "b-127") &&
+      isCardCombinedInHand(s.batterHand, "b-127", batterAffirmed)
+    ) {
+      const pitcherAffirmed =
+        getUserSide(s) === "Pitching" ? s.affirmedSeams : null;
+      const target = lowestUncombinedInHand(hand, pitcherAffirmed);
+      if (target) nullified.add(target.id);
+    }
   }
+
+  // Pitching-side silencers carried by the BATTER hand.
+  const nullifyOpponentBaseMechanic =
+    !isBatting && s.batterHand.some((c) => c.id === "b-105");
+  const offSpeedThreat = !isBatting && s.batterHand.some((c) => c.id === "b-108");
+  const nullifyOpponentTagMechanics = offSpeedThreat
+    ? (["off-speed"] as const)
+    : undefined;
+
   const ctx: ScoringContext = {
     side,
     inning: s.inning,
@@ -1334,9 +1638,10 @@ function scoreHandFor(
     outs: s.outs,
     isFinalInning: s.inning === s.totalInnings,
     batterHandedness: s.batter.handedness,
+    pitcherHandedness: s.pitcher.handedness,
     opponentHand: opponent,
     opponentBaseCard: highestValueCard(opponent),
-    nullifiedCardIds: nullified,
+    nullifiedCardIds: nullified.size > 0 ? nullified : undefined,
     coinFlips: s.coinFlips,
     // Phase 6: keep state-trigger context aligned with the live store
     // values so probe scores (p-41 Sweeping Slider) see the same world.
@@ -1344,9 +1649,12 @@ function scoreHandFor(
     half: s.half,
     homeScore: s.homeScore,
     awayScore: s.awayScore,
+    nullifyOpponentBaseMechanic: nullifyOpponentBaseMechanic || undefined,
+    nullifyOpponentTagMechanics,
     // The user's seat reads from affirmedSeams; the AI's seat stays on
     // legacy auto-connect (null = "any adjacent canConnect pair chains").
     affirmedSeams: side === getUserSide(s) ? s.affirmedSeams : null,
+    opponentAffirmedSeams: side !== getUserSide(s) ? s.affirmedSeams : null,
   };
   return scoreHand(hand, ctx);
 }
@@ -1679,10 +1987,49 @@ function findAggregateSource(
 function applySweepingSliderMutation(s: GameState): CardDefinition[] {
   if (!s.pitcherHand.some((c) => c.id === "p-41")) return s.batterHand;
   const probe = s.scoreBatter();
-  const target = probe.bestGroup.length > 1 ? probe.bestGroup[0] : null;
-  if (!target) return s.batterHand;
-  return s.batterHand.map((c) =>
-    c.id === target.id
+  if (probe.bestGroup.length <= 1) return s.batterHand;
+
+  // Candidate seams to break: every "right seam" of every multi-card group
+  // in the original scoring (the cards whose `rightNoCombine` we'd toggle).
+  // Iterating across ALL multi-card groups (not just the current best)
+  // matters when breaking the current best group merely promotes a tied or
+  // close-second group to win -- in that case we want to evaluate breaks
+  // from BOTH groups and pick whichever drives the post-mutation `maxValue`
+  // lower. Without this, the slider could pick a seam that did almost
+  // nothing while a different seam would have been strictly stronger.
+  const seamCandidates: CardDefinition[] = [];
+  for (const group of probe.groups) {
+    if (group.length <= 1) continue;
+    for (let i = 0; i < group.length - 1; i++) seamCandidates.push(group[i]);
+  }
+  if (seamCandidates.length === 0) return s.batterHand;
+
+  let bestMutated: CardDefinition[] | null = null;
+  let bestPostMax = Infinity;
+
+  for (const target of seamCandidates) {
+    const mutated = s.batterHand.map((c) =>
+      c.id === target.id
+        ? {
+            ...c,
+            combineConstraint: { ...(c.combineConstraint ?? {}), rightNoCombine: true },
+          }
+        : c,
+    );
+    // Score the mutated hand under the same context the eventual lock-in
+    // will use. Lower post-mutation maxValue == stronger slider effect.
+    const probeAfter = scoreHandFor(s, mutated, "Batting");
+    if (probeAfter.maxValue < bestPostMax) {
+      bestPostMax = probeAfter.maxValue;
+      bestMutated = mutated;
+    }
+  }
+
+  // Fallback: every candidate produced the same maxValue (rare, but
+  // possible if the seam doesn't actually impact a chain). Stick with the
+  // legacy behavior: break the first seam of the original best group.
+  return bestMutated ?? s.batterHand.map((c) =>
+    c.id === probe.bestGroup[0].id
       ? {
           ...c,
           combineConstraint: { ...(c.combineConstraint ?? {}), rightNoCombine: true },
@@ -1770,9 +2117,21 @@ function computeMatchup(
 
 // ============ helpers ============
 
+/**
+ * Highest-baseValue card in `hand`. Tie-breaker is the lexicographically
+ * smallest card id, NOT positional -- the previous "first card with max
+ * value" rule meant the player could change which card got nullified
+ * (e.g. by p-36 Ace's Command) by simply reordering their hand. Picking
+ * by id keeps the result stable across reorders so the rule is
+ * predictable for the player.
+ */
 function highestValueCard(hand: CardDefinition[]): CardDefinition | null {
   if (!hand || hand.length === 0) return null;
-  return hand.reduce((a, b) => (b.baseValue > a.baseValue ? b : a));
+  return hand.reduce((a, b) => {
+    if (b.baseValue > a.baseValue) return b;
+    if (b.baseValue === a.baseValue && b.id < a.id) return b;
+    return a;
+  });
 }
 
 /**
@@ -1845,6 +2204,13 @@ interface OutcomeApplyResult {
   half: Half;
   outs: number;
   bases: Bases;
+  /**
+   * Runner identities aligned to `bases`. Always returned alongside `bases`
+   * so callers can blanket-spread the result and keep the two arrays
+   * synchronized. A `null` slot can mean "empty" or "phantom runner from
+   * a card effect"; consumers must read `bases[i]` for occupancy.
+   */
+  baseRunners: BaseRunners;
   homeScore: number;
   awayScore: number;
   isFirstAtBatOfInning: boolean;
@@ -1873,6 +2239,11 @@ function applyOutcome(
 ): OutcomeApplyResult {
   let { inning, half, outs, homeScore, awayScore, totalInnings } = s;
   let bases: Bases = [...s.bases] as Bases;
+  // Mirror of `bases` carrying the actual MlbPlayer per occupied slot.
+  // Mutated in lockstep so the 3D scene's name labels track the same
+  // events as the gameplay logic. `null` is permitted for phantom
+  // additions like b-135 Stolen Bag (no specific drafted player).
+  let baseRunners: BaseRunners = [...s.baseRunners] as BaseRunners;
   const runnerMoves: RunnerMove[] = [];
 
   // Advance runners by N bases. Returns the new bases array and runs scored,
@@ -1883,6 +2254,7 @@ function applyOutcome(
   const advance = (steps: number, runnerBoost: number = 0) => {
     let runs = 0;
     const newBases: boolean[] = [false, false, false, false]; // last slot = home (scoring)
+    const newBaseRunners: (MlbPlayer | null)[] = [null, null, null, null];
     const existingRunnerSteps = steps + Math.max(0, runnerBoost);
     // Existing runners.
     for (let b = 0; b < 3; b++) {
@@ -1890,9 +2262,20 @@ function applyOutcome(
         const dest = b + 1 + existingRunnerSteps;
         const fromSlot = BASE_INDEX_TO_SLOT[b]; // bases[0] = 1B, etc.
         const toSlot = dest >= 4 ? "scored" : BASE_INDEX_TO_SLOT[dest - 1];
-        runnerMoves.push({ id: nextMoveId(), from: fromSlot, to: toSlot, kind: "runner" });
-        if (dest >= 4) runs++;
-        else newBases[dest] = true;
+        const movingPlayer = baseRunners[b];
+        runnerMoves.push({
+          id: nextMoveId(),
+          from: fromSlot,
+          to: toSlot,
+          kind: "runner",
+          player: movingPlayer,
+        });
+        if (dest >= 4) {
+          runs++;
+        } else {
+          newBases[dest] = true;
+          newBaseRunners[dest] = movingPlayer;
+        }
       }
     }
     // The batter takes their own bases.
@@ -1901,11 +2284,26 @@ function applyOutcome(
       // Out path doesn't reach here (advance only called for hits).
     } else {
       const toSlot: BaseSlot = batterDest >= 4 ? "scored" : BASE_INDEX_TO_SLOT[batterDest - 1];
-      runnerMoves.push({ id: nextMoveId(), from: "home", to: toSlot, kind: "batter" });
-      if (batterDest >= 4) runs++;
-      else newBases[batterDest] = true;
+      runnerMoves.push({
+        id: nextMoveId(),
+        from: "home",
+        to: toSlot,
+        kind: "batter",
+        player: s.batter,
+      });
+      if (batterDest >= 4) {
+        runs++;
+      } else {
+        newBases[batterDest] = true;
+        newBaseRunners[batterDest] = s.batter;
+      }
     }
     bases = [newBases[1], newBases[2], newBases[3]] as Bases;
+    baseRunners = [
+      newBaseRunners[1],
+      newBaseRunners[2],
+      newBaseRunners[3],
+    ] as BaseRunners;
     return runs;
   };
 
@@ -1917,8 +2315,15 @@ function applyOutcome(
       // b-69 Sacrifice Fly: even though the batter is out, the runner from
       // 3rd scores. Other runners hold.
       if (resolveDelta.forceRunFromThird && bases[2]) {
-        runnerMoves.push({ id: nextMoveId(), from: "third", to: "scored", kind: "runner" });
+        runnerMoves.push({
+          id: nextMoveId(),
+          from: "third",
+          to: "scored",
+          kind: "runner",
+          player: baseRunners[2],
+        });
         bases = [bases[0], bases[1], false] as Bases;
+        baseRunners = [baseRunners[0], baseRunners[1], null] as BaseRunners;
         runs += 1;
       }
       break;
@@ -1940,6 +2345,11 @@ function applyOutcome(
   // natural outcome resolves. If the slot is already occupied (e.g. a single
   // already left a runner on 1B) the bag is silently spent -- no double
   // stacking. Only fires when the resolve step requested it (gated on win).
+  //
+  // The phantom runner has no specific drafted player attached, so the
+  // RunnerMove and baseRunners slot both record `null`. The 3D label
+  // renderer treats null as "anonymous" and falls back to a generic
+  // "RUNNER" tag.
   if (resolveDelta.extraRunnerOn) {
     const idx =
       resolveDelta.extraRunnerOn === "first"
@@ -1949,17 +2359,27 @@ function applyOutcome(
           : 2;
     if (!bases[idx]) {
       const slot = BASE_INDEX_TO_SLOT[idx];
-      runnerMoves.push({ id: nextMoveId(), from: "home", to: slot, kind: "runner" });
+      runnerMoves.push({
+        id: nextMoveId(),
+        from: "home",
+        to: slot,
+        kind: "runner",
+        player: null,
+      });
       bases = [
         idx === 0 ? true : bases[0],
         idx === 1 ? true : bases[1],
         idx === 2 ? true : bases[2],
       ] as Bases;
+      // baseRunners stays null for this phantom slot (already null since
+      // we only enter this branch when the slot was unoccupied).
     }
   }
 
   // p-75 Pickoff Move: if the resolve step asked us to erase a runner, do it
-  // here so the change persists into the next at-bat.
+  // here so the change persists into the next at-bat. Uses the dedicated
+  // `pickoff` kind / `out` slot so the 3D scene and any analytics that key
+  // off `to: "scored"` don't mistakenly count this as a run.
   if (resolveDelta.removeRunnerHint) {
     const idx =
       resolveDelta.removeRunnerHint === "first"
@@ -1969,12 +2389,23 @@ function applyOutcome(
           : 2;
     if (bases[idx]) {
       const slot = BASE_INDEX_TO_SLOT[idx];
-      runnerMoves.push({ id: nextMoveId(), from: slot, to: "scored", kind: "runner" });
+      runnerMoves.push({
+        id: nextMoveId(),
+        from: slot,
+        to: "out",
+        kind: "pickoff",
+        player: baseRunners[idx],
+      });
       bases = [
         idx === 0 ? false : bases[0],
         idx === 1 ? false : bases[1],
         idx === 2 ? false : bases[2],
       ] as Bases;
+      baseRunners = [
+        idx === 0 ? null : baseRunners[0],
+        idx === 1 ? null : baseRunners[1],
+        idx === 2 ? null : baseRunners[2],
+      ] as BaseRunners;
     }
   }
 
@@ -1984,23 +2415,65 @@ function applyOutcome(
   let isFirstAtBatOfInning = false;
   let phase: Phase = "between-at-bats";
 
+  // ============ Half / inning advancement & end-of-game ============
+  //
+  // Walk-off: home team takes the lead at any point during the bottom of
+  // the final inning (or any extra-inning bottom half). Game ends
+  // immediately, mid-inning, with fewer than three outs allowed.
+  const isFinalOrLater = inning >= totalInnings;
+  if (half === "bottom" && isFinalOrLater && homeScore > awayScore) {
+    return {
+      inning,
+      half,
+      outs,
+      bases,
+      baseRunners,
+      homeScore,
+      awayScore,
+      isFirstAtBatOfInning,
+      phase: "game-over",
+      runnerMoves,
+    };
+  }
+
   if (outs >= 3) {
     // Side retired; flip half-inning, reset outs/bases.
     outs = 0;
     bases = [false, false, false];
+    baseRunners = [null, null, null];
     isFirstAtBatOfInning = true;
     if (half === "top") {
       half = "bottom";
+      // Skip the bottom of the final (or extra) inning when the home team
+      // already leads after the visitors have batted -- the home team's
+      // lead is mathematically safe and standard baseball ends the game.
+      if (isFinalOrLater && homeScore > awayScore) {
+        phase = "game-over";
+      }
     } else {
       half = "top";
       inning += 1;
-    }
-    if (inning > totalInnings) {
-      phase = "game-over";
+      // Past regulation: end ONLY when the score is decided. Tied games
+      // continue into extras (each pair of half-innings until somebody
+      // leads after the bottom completes / the home team walks off above).
+      if (inning > totalInnings && homeScore !== awayScore) {
+        phase = "game-over";
+      }
     }
   }
 
-  return { inning, half, outs, bases, homeScore, awayScore, isFirstAtBatOfInning, phase, runnerMoves };
+  return {
+    inning,
+    half,
+    outs,
+    bases,
+    baseRunners,
+    homeScore,
+    awayScore,
+    isFirstAtBatOfInning,
+    phase,
+    runnerMoves,
+  };
 }
 
 function formatOutcome(outcome: HitOutcome, batter: number, pitcher: number, batterName: string): string {

@@ -22,3 +22,231 @@
   scrollbar-width: thin;
   scrollbar-color: #475569 #1e293b;
 }
+
+/* ---------------------------------------------------------------------------
+ * Start Game screen
+ *
+ * Reusable styles for `StartGameScreen.tsx`. All names are prefixed with
+ * `dugout-` so they don't collide with future Tailwind v4 utilities or
+ * component-scoped class names. The `dugout-stadium-bg` / `dugout-light-beam`
+ * pair recreates the stadium-floodlight ambience without dropping in any
+ * external image dependencies.
+ * --------------------------------------------------------------------------- */
+
+.dugout-font-sport {
+  font-family: "Teko", sans-serif;
+}
+.dugout-font-title {
+  /* Fallback chain stays sans-serif so that if Alfa Slab One hasn't
+   * resolved yet (slow network, FOIT/FOUT window), the title renders
+   * in a heavy display-style sans rather than the browser's generic
+   * serif. Impact / Arial Black approximate the chunky display weight
+   * closest to Alfa Slab One; system-ui keeps Linux distros happy where
+   * the prior two may not exist. */
+  font-family: "Alfa Slab One", "Impact", "Arial Black", system-ui,
+    sans-serif;
+}
+.dugout-font-base {
+  font-family: "Montserrat", sans-serif;
+}
+
+.dugout-stadium-bg {
+  background:
+    radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.15) 0%, transparent 60%),
+    linear-gradient(to bottom, #0a0a0a, #0c2314);
+}
+
+.dugout-light-beam {
+  position: absolute;
+  top: -20%;
+  width: 150px;
+  height: 120%;
+  background: linear-gradient(to bottom, rgba(255, 255, 255, 0.1), transparent);
+  transform: rotate(-35deg);
+  pointer-events: none;
+}
+.dugout-light-beam-right {
+  transform: rotate(35deg);
+}
+
+/* Block-stacked drop-shadow for the DUGOUT logo. Two breakpoints because
+ * the desktop version lays down a few extra layers for crisper edges at
+ * size; switching at 768px matches the reference. */
+.dugout-title-3d {
+  position: relative;
+  color: #ffffff;
+  -webkit-text-stroke: 3px #000000;
+  text-shadow:
+    1px 1px 0 #000, 2px 2px 0 #000, 3px 3px 0 #000, 4px 4px 0 #000,
+    5px 5px 0 #000, 6px 6px 0 #000, 7px 7px 0 #000, 8px 8px 0 #000,
+    9px 9px 0 #000, 10px 10px 0 #000, 11px 11px 0 #000, 12px 12px 0 #000,
+    13px 13px 0 #000, 14px 14px 0 #000, 15px 15px 0 #000, 16px 16px 0 #000;
+}
+
+/* Animated shine sweeping across the letterforms. Renders as a duplicate
+ * copy of the title (via `data-text="DUGOUT"` -> `content: attr(data-text)`)
+ * positioned exactly over the base text. The duplicate fills with a
+ * moving white gradient clipped to the glyph shape, so only the letters
+ * pick up the highlight -- the 3D shadow stack underneath is untouched.
+ * `text-shadow: none` and `-webkit-text-stroke: 0` strip the 3D effect
+ * from the overlay so the gradient renders cleanly on top.
+ *
+ * Set `data-text` on the same element to drive the overlay text -- the
+ * Logo component does this with `data-text="DUGOUT"`. */
+.dugout-title-shine::after {
+  content: attr(data-text);
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    100deg,
+    rgba(255, 255, 255, 0) 35%,
+    rgba(255, 255, 255, 0.95) 50%,
+    rgba(255, 255, 255, 0) 65%
+  );
+  background-size: 250% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  -webkit-text-stroke: 0;
+  text-shadow: none;
+  animation: dugout-title-shine 3.5s linear infinite;
+}
+@keyframes dugout-title-shine {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dugout-title-shine::after {
+    animation: none;
+    opacity: 0;
+  }
+}
+@media (min-width: 768px) {
+  .dugout-title-3d {
+    -webkit-text-stroke: 4px #000000;
+    text-shadow:
+      1px 1px 0 #000, 2px 2px 0 #000, 3px 3px 0 #000, 4px 4px 0 #000,
+      5px 5px 0 #000, 6px 6px 0 #000, 7px 7px 0 #000, 8px 8px 0 #000,
+      9px 9px 0 #000, 10px 10px 0 #000, 11px 11px 0 #000, 12px 12px 0 #000,
+      13px 13px 0 #000, 14px 14px 0 #000, 15px 15px 0 #000, 16px 16px 0 #000,
+      17px 17px 0 #000, 18px 18px 0 #000, 19px 19px 0 #000, 20px 20px 0 #000,
+      21px 21px 0 #000, 22px 22px 0 #000, 23px 23px 0 #000, 24px 24px 0 #000;
+  }
+}
+
+/* Primary "PLAY"-style button: red gradient with the bottom-border push
+ * effect. The :active rule swaps border-bottom for top-margin to fake a
+ * depressed key without shifting the layout of surrounding buttons. */
+.dugout-btn-primary {
+  background: linear-gradient(to bottom, #e31837, #a00b22);
+  border-bottom: 4px solid #750516;
+  transition: transform 0.1s, margin 0.1s, border-bottom-width 0.1s;
+}
+.dugout-btn-primary:active {
+  transform: translateY(4px);
+  border-bottom-width: 0;
+  margin-top: 4px;
+}
+
+/* Gold variant for the secondary lane (Quick Match), so the two primary
+ * buttons read as visually distinct without one looking like a "less
+ * important" choice. */
+.dugout-btn-gold {
+  background: linear-gradient(to bottom, #ffd700, #c9a200);
+  color: #0c2314;
+  border-bottom: 4px solid #8a6d00;
+  transition: transform 0.1s, margin 0.1s, border-bottom-width 0.1s;
+}
+.dugout-btn-gold:active {
+  transform: translateY(4px);
+  border-bottom-width: 0;
+  margin-top: 4px;
+}
+
+/* Half-shape connectors for ambient cards. Numbers match the reference
+ * (24x48 base, circle scales to 32x32, diamond is 24 squared rotated).
+ * `-left` / `-right` toggle which edge they hang off; combined classes
+ * match e.g. `.dugout-shape-connector .dugout-shape-circle .dugout-shape-right`. */
+.dugout-shape-connector {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 48px;
+  background: linear-gradient(135deg, #ffd700, #fdb931);
+  border: 2px solid #fff;
+  z-index: 10;
+  box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.5);
+}
+.dugout-shape-square {
+  border-radius: 4px;
+}
+.dugout-shape-circle {
+  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+}
+.dugout-shape-diamond {
+  width: 24px;
+  height: 24px;
+  transform: translateY(-50%) rotate(45deg);
+}
+.dugout-shape-left {
+  left: -12px;
+}
+.dugout-shape-right {
+  right: -12px;
+}
+.dugout-shape-circle.dugout-shape-left {
+  left: -16px;
+}
+.dugout-shape-circle.dugout-shape-right {
+  right: -16px;
+}
+
+/* Float / glow keyframes for the ambient cards and title. Reduced motion
+ * users get static cards via the prefers-reduced-motion override below. */
+@keyframes dugout-float {
+  0%, 100% {
+    transform: translateY(0) rotate(0deg);
+  }
+  50% {
+    transform: translateY(-20px) rotate(2deg);
+  }
+}
+@keyframes dugout-pulse-glow {
+  0%, 100% {
+    opacity: 1;
+    filter: drop-shadow(0 0 15px rgba(255, 215, 0, 0.6));
+  }
+  50% {
+    opacity: 0.8;
+    filter: drop-shadow(0 0 5px rgba(255, 215, 0, 0.2));
+  }
+}
+.dugout-anim-float-slow {
+  animation: dugout-float 8s ease-in-out infinite;
+}
+.dugout-anim-float-medium {
+  animation: dugout-float 6s ease-in-out infinite reverse;
+}
+.dugout-anim-float-fast {
+  animation: dugout-float 4s ease-in-out infinite;
+}
+.dugout-anim-pulse-glow {
+  animation: dugout-pulse-glow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .dugout-anim-float-slow,
+  .dugout-anim-float-medium,
+  .dugout-anim-float-fast,
+  .dugout-anim-pulse-glow {
+    animation: none;
+  }
+}

@@ -197,10 +197,10 @@ export function Stadium() {
          <boxGeometry args={[150, 20, 20]} />
       </mesh>
 
-      {/* Sample Players */}
       <Player position={[0, 0.5, 0]} role="Pitcher" color="#1E88E5" />
       <Player position={[0, 0, homeToMound + 4]} role="Catcher" color="#1E88E5" />
       <Player position={[-4, 0, homeToMound - 2]} role="Batter" color="#E53935" />
+
       <Player position={[firstPos[0] - 8, 0, firstPos[2] - 5]} role="1B" color="#1E88E5" />
       <Player position={[25, 0, homeToMound - homeToSecond + 15]} role="2B" color="#1E88E5" />
       <Player position={[thirdPos[0] + 8, 0, thirdPos[2] - 5]} role="3B" color="#1E88E5" />
@@ -326,6 +326,10 @@ function AnimatedRunner({ move, homeToMound, firstPos, secondPos, thirdPos }: An
       // Run a bit past home plate toward the catcher so scored runners exit
       // cleanly rather than overlapping the next play's batter at home.
       scored: [3, 0, homeToMound + 8],
+      // Pickoff target: shuffle off the field toward the dugout (NOT home)
+      // so the 3D scene reads as "runner retired" rather than "runner
+      // crossed the plate". Mirror of `scored` on the opposite side.
+      out: [-3, 0, homeToMound + 8],
     }),
     [homeToMound, firstPos, secondPos, thirdPos],
   );

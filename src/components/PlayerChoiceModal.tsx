@@ -6,6 +6,25 @@ import type { PendingChoice, ResolvedChoice } from '../lib/gameStore';
 import { SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeType } from './cardShapes';
 
 /**
+ * Whitelist of shapes the player can actually pick in the shape-resolved
+ * paths. Mirrors `ShapeType` minus `none` (no-shape side, never pickable)
+ * and `wildcard` (engine-controlled, not a legal player choice). Used as
+ * the runtime guard for `kind: 'shape'` payloads so a malformed or future
+ * `PendingChoice.options` entry can never sneak an invalid `ShapeType`
+ * value into `resolveChoice`.
+ */
+const PICKABLE_SHAPES: ReadonlySet<ShapeType> = new Set([
+  'circle',
+  'diamond',
+  'square',
+  'star',
+]);
+
+function isPickableShape(value: unknown): value is ShapeType {
+  return typeof value === 'string' && PICKABLE_SHAPES.has(value as ShapeType);
+}
+
+/**
  * Modal that surfaces a player-choice question queued by the engine (b-12
  * Switch Hitter, b-65 Guess Pitch, p-56 Pinpoint Control). The modal is
  * NOT auto-opened anymore -- choices stay queued in `pendingChoices` and
@@ -85,13 +104,22 @@ function ChoicePanel({ choice, batterHand, pitcherHand, onResolve, onDismiss }: 
   // belongs to -- a fresh lookup so we always reflect any pre-modal mutations
   // (e.g. a future card that resizes the hand mid-at-bat).
   const sourceHand = choice.side === 'Batting' ? batterHand : pitcherHand;
+  // Only pickShape / pickConnection / pickGeneral carry a `targets` list;
+  // the discriminated union doesn't expose `targets` on `guessShape`.
+  // Narrow before reading to keep the type checker happy.
+  const choiceTargets =
+    choice.type === 'pickShape' ||
+    choice.type === 'pickGeneral' ||
+    choice.type === 'pickConnection'
+      ? choice.targets
+      : undefined;
   const targetCards: CardDefinition[] = useMemo(() => {
-    if (!choice.targets) return [];
+    if (!choiceTargets) return [];
     const lookup = new Map(sourceHand.map((c) => [c.id, c]));
-    return choice.targets
+    return choiceTargets
       .map((id) => lookup.get(id))
       .filter((c): c is CardDefinition => Boolean(c));
-  }, [choice.targets, sourceHand]);
+  }, [choiceTargets, sourceHand]);
 
   const isModifyShape = choice.type === 'pickShape' && targetCards.length > 0;
 
@@ -162,14 +190,23 @@ function ChoicePanel({ choice, batterHand, pitcherHand, onResolve, onDismiss }: 
             </div>
             {choice.type === 'guessShape' || choice.type === 'pickShape' ? (
               <ShapeOptionRow
-                options={(choice.options ?? []) as ShapeType[]}
-                onPick={(shape) => onResolve({ kind: 'shape', shape })}
+                // PendingChoice's discriminated union narrows `options` to
+                // ShapeType[] for these two variants, so no cast is needed.
+                // Runtime guard below still validates in case the engine
+                // ever drifts.
+                options={choice.options.filter(isPickableShape)}
+                onPick={(shape) => {
+                  if (!isPickableShape(shape)) return;
+                  onResolve({ kind: 'shape', shape });
+                }}
               />
             ) : (
-              <GenericOptionRow
-                options={choice.options ?? []}
-                onPick={(value) => onResolve({ kind: 'shape', shape: value as ShapeType })}
-              />
+              // pickGeneral / pickConnection are reserved for later phases.
+              // Their `options` are arbitrary card / seam IDs and MUST NOT
+              // be coerced into a ShapeType. Until those flows are wired,
+              // we render the row read-only -- clicking does nothing
+              // instead of silently sending invalid shapes to resolveChoice.
+              <GenericOptionRow options={choice.options} onPick={() => undefined} />
             )}
           </>
         )}

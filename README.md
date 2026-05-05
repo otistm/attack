@@ -2,19 +2,27 @@
 <img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
 </div>
 
-# Run and deploy your AI Studio app
+# Dugout
 
-This contains everything you need to run your app locally.
-
-View your app in AI Studio: https://ai.studio/apps/816b8a73-c988-4876-b897-3c68242b45d5
+A 3D baseball-card matchup game built with React, Three.js (R3F), Tailwind, and Zustand.
 
 ## Run Locally
 
-**Prerequisites:**  Node.js
-
+**Prerequisites:** Node.js
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
+2. Run the app:
    `npm run dev`
+
+The dev server runs on `http://localhost:3000`.
+
+## Notes
+
+- The repo currently has no remote-AI integration. The draft AI is a deterministic
+  heuristic auction engine in [`src/lib/draft.ts`](src/lib/draft.ts) and does not
+  call any external API. If you wire one in later, route the call through a
+  server-side process -- never inline an API key into the client bundle via
+  Vite's `define` (see comment in [`vite.config.ts`](vite.config.ts)).
+- Test scripts: `npm run test:connect`, `npm run test:effects`, `npm run test:copy`,
+  or `npm test` to run all three.

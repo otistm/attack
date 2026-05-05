@@ -4,7 +4,7 @@ import { PlayerChoiceModal } from './PlayerChoiceModal';
 import { InfoRevealOverlay } from './InfoRevealOverlay';
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Layers, RotateCcw, ChevronDown } from 'lucide-react';
+import { Layers, LogOut, RotateCcw, ChevronDown } from 'lucide-react';
 import { useGameStore, getUserSide, type Team } from '../lib/gameStore';
 import { teamPalette } from '../lib/teamColors';
 
@@ -37,6 +37,13 @@ export function UIOverlay() {
   const bases = useGameStore((s) => s.bases);
   const userTeam = useGameStore((s) => s.userTeam);
   const startDraft = useGameStore((s) => s.startDraft);
+  // While the Learn-to-Play tutorial is running, the header's "New Game"
+  // dropdown is replaced with an "End Tutorial" button that bails the
+  // walkthrough and pops the start screen back up. Subscribed here so
+  // the swap is reactive without prop-drilling through the picker.
+  const tutorialActive = useGameStore((s) => s.tutorialActive);
+  const tutorialExit = useGameStore((s) => s.tutorialExit);
+  const setShowStartScreen = useGameStore((s) => s.setShowStartScreen);
 
   const phaseLabel: Record<typeof phase, string> = {
     drafting: 'Draft',
@@ -62,7 +69,7 @@ export function UIOverlay() {
 
       <header className="w-full grid grid-cols-[minmax(220px,1fr)_auto_minmax(220px,1fr)] items-stretch gap-4 px-6 py-3 bg-slate-900/85 border-b border-slate-700 backdrop-blur-sm pointer-events-auto shadow-md">
         {/* Left: at-bat matchup */}
-        <div className="flex items-center">
+        <div className="flex items-center" data-tutorial="matchup">
           <Matchup
             batterName={batter.name}
             batterTeam={batter.team}
@@ -73,20 +80,25 @@ export function UIOverlay() {
         </div>
 
         {/* Center: scoreboard */}
-        <Scoreboard
-          inning={inning}
-          half={half}
-          homeScore={homeScore}
-          awayScore={awayScore}
-          outs={outs}
-          bases={bases}
-          battingTeam={battingTeam}
-          userTeam={userTeam}
-        />
+        <div data-tutorial="scoreboard" className="flex">
+          <Scoreboard
+            inning={inning}
+            half={half}
+            homeScore={homeScore}
+            awayScore={awayScore}
+            outs={outs}
+            bases={bases}
+            battingTeam={battingTeam}
+            userTeam={userTeam}
+          />
+        </div>
 
         {/* Right: phase + actions */}
         <div className="flex items-center justify-end gap-3">
-          <div className="flex flex-col items-end pr-2">
+          <div
+            className="flex flex-col items-end pr-2"
+            data-tutorial="phase"
+          >
             <span className="text-[9px] text-slate-500 uppercase font-bold tracking-widest">Phase</span>
             <span className={`font-black uppercase tracking-tight text-base leading-tight ${phaseTone[phase]}`}>
               {phaseLabel[phase]}
@@ -99,10 +111,29 @@ export function UIOverlay() {
             <Layers className="w-3.5 h-3.5" />
             Collection
           </button>
-          <NewGamePicker
-            onPick={(team) => startDraft(team)}
-            currentTeam={userTeam}
-          />
+          {tutorialActive ? (
+            <button
+              type="button"
+              onClick={() => {
+                // Bail out of the walkthrough AND surface the lane
+                // chooser. The in-flight quick-match game state is left
+                // alone -- whichever lane the player picks next will
+                // overwrite it via `startDraft` / `startQuickMatch`.
+                tutorialExit();
+                setShowStartScreen(true);
+              }}
+              className="flex items-center gap-1.5 px-3 py-2 bg-amber-600/90 hover:bg-amber-500 rounded-md text-[11px] font-bold text-white transition-colors uppercase tracking-wide"
+              title="Exit the tutorial and return to the Start screen"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              End Tutorial
+            </button>
+          ) : (
+            <NewGamePicker
+              onPick={(team) => startDraft(team)}
+              currentTeam={userTeam}
+            />
+          )}
         </div>
       </header>
 
