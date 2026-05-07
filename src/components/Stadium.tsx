@@ -31,6 +31,9 @@ export function Stadium() {
   const lastOutcome = useGameStore((s) => s.lastOutcome);
   const phase = useGameStore((s) => s.phase);
   const runnerMoves = useGameStore((s) => s.runnerMoves);
+  const questLegendaryCelebratePulse = useGameStore(
+    (s) => s.questLegendaryCelebratePulse,
+  );
   const dirtMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: '#D4A373', roughness: 0.9 }), []);
   const grassMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: '#7CB342', roughness: 0.8 }), []);
   const darkGrassMaterial = useMemo(() => new THREE.MeshStandardMaterial({ color: '#689F38', roughness: 0.8 }), []);
@@ -179,7 +182,12 @@ export function Stadium() {
 
       {/* Result celebration: pulse arc above the bases when a hit just happened */}
       {phase === 'between-at-bats' && (
-        <ResultPulse outcome={lastOutcome} position={[0, 8, homeToMound - baseSide]} />
+        <ResultPulse
+          key={`${lastOutcome}-${questLegendaryCelebratePulse}`}
+          outcome={lastOutcome}
+          position={[0, 8, homeToMound - baseSide]}
+          legendaryQuest={questLegendaryCelebratePulse}
+        />
       )}
 
       {/* Foul Lines */}
@@ -529,12 +537,19 @@ function positionAlongPath(
   ];
 }
 
-const PULSE_LIFETIME = 1.6;
-
-function ResultPulse({ outcome, position }: { outcome: string | null; position: [number, number, number] }) {
+function ResultPulse({
+  outcome,
+  position,
+  legendaryQuest = false,
+}: {
+  outcome: string | null;
+  position: [number, number, number];
+  legendaryQuest?: boolean;
+}) {
   const ref = useRef<THREE.Mesh>(null);
   const matRef = useRef<THREE.MeshBasicMaterial>(null);
   const startRef = useRef<number | null>(null);
+  const PULSE_LIFETIME = legendaryQuest ? 3.35 : 1.6;
   const colorMap: Record<string, string> = {
     homerun: '#FFC107',
     triple: '#10B981',
@@ -553,14 +568,20 @@ function ResultPulse({ outcome, position }: { outcome: string | null; position: 
       matRef.current.opacity = 0;
       return;
     }
-    const scale = 4 + t * 80;
+    const scale = legendaryQuest ? 6 + t * 110 : 4 + t * 80;
     ref.current.scale.setScalar(scale);
     matRef.current.opacity = 0.7 * (1 - t);
+    if (legendaryQuest) {
+      const hue = (state.clock.elapsedTime * 100) % 360;
+      matRef.current.color.setHSL(hue / 360, 0.88, 0.52);
+    } else {
+      matRef.current.color.set(color);
+    }
   });
 
   return (
     <mesh ref={ref} position={position} rotation={[-Math.PI / 2, 0, 0]}>
-      <ringGeometry args={[0.4, 0.5, 32]} />
+      <ringGeometry args={[0.4, 0.55, 48]} />
       <meshBasicMaterial ref={matRef} color={color} transparent opacity={0.7} side={THREE.DoubleSide} />
     </mesh>
   );

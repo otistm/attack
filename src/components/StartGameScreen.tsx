@@ -13,6 +13,7 @@ import {
 import { useGameStore, type Team } from '../lib/gameStore';
 import { BATTERS, PITCHERS, type MlbPlayer } from '../lib/players';
 import { teamPalette } from '../lib/teamColors';
+import { QUEST_REGISTRY, rollQuestSlate, rerollQuestSlotAt, type QuestRarity } from '../lib/quests';
 
 /**
  * Pre-game lane chooser. Shown on first boot (after the splash) and again on
@@ -69,7 +70,7 @@ export function StartGameScreen() {
               <Logo />
               <MainMenu
                 onAuction={(team) => startDraft(team)}
-                onQuick={(team) => startQuickMatch(team)}
+                onQuickConfirm={(team, questSlate) => startQuickMatch(team, questSlate)}
                 onLearn={() => {
                   // Tutorial always plays as AWAY so the user bats in the
                   // top of the 1st -- the modal copy assumes that seat.
@@ -138,18 +139,107 @@ function Logo() {
 
 type Lane = 'auction' | 'quick';
 
+function QuickQuestPickerModal({
+  team,
+  slate,
+  rerollSpent,
+  onRerollSlot,
+  onConfirm,
+  onCancel,
+}: {
+  team: Team;
+  slate: [string, string, string];
+  rerollSpent: boolean;
+  onRerollSlot: (idx: 0 | 1 | 2) => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const rarities: QuestRarity[] = ['common', 'rare', 'legendary'];
+  return (
+    <motion.div
+      className="fixed inset-0 z-[60] flex items-center justify-center px-3 bg-black/75 backdrop-blur-sm"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+    >
+      <motion.div
+        className="w-full max-w-lg rounded-xl border border-amber-500/40 bg-slate-950/95 p-5 shadow-2xl dugout-font-base"
+        initial={{ scale: 0.92, y: 16 }}
+        animate={{ scale: 1, y: 0 }}
+        transition={{ type: 'spring', stiffness: 280, damping: 24 }}
+      >
+        <h3 className="dugout-font-sport text-2xl uppercase text-amber-200 text-center mb-1">
+          Pick Your Run
+        </h3>
+        <p className="text-center text-xs text-slate-400 mb-4">
+          Three quests for this {team} quick match. Re-roll{' '}
+          <span className="text-amber-300 font-bold">one</span> card if you want a different objective.
+        </p>
+        <div className="grid gap-3 sm:grid-cols-3">
+          {slate.map((id, i) => {
+            const def = QUEST_REGISTRY[id];
+            if (!def) return null;
+            const rar = rarities[i] ?? 'common';
+            return (
+              <div
+                key={`${id}-${i}`}
+                className="rounded-lg border border-slate-700 bg-slate-900/90 p-3 flex flex-col gap-2"
+              >
+                <span className="text-[9px] font-black uppercase tracking-widest text-slate-500">
+                  {rar}
+                </span>
+                <span className="dugout-font-sport text-lg uppercase text-white leading-tight">
+                  {def.title}
+                </span>
+                <p className="text-[10px] text-slate-400 leading-snug flex-1">{def.hint}</p>
+                <button
+                  type="button"
+                  disabled={rerollSpent}
+                  onClick={() => onRerollSlot(i as 0 | 1 | 2)}
+                  className="mt-1 text-[10px] font-bold uppercase tracking-wide py-1.5 rounded border border-slate-600 text-slate-300 hover:border-amber-400 hover:text-amber-200 disabled:opacity-40 disabled:pointer-events-none"
+                >
+                  Re-roll slot
+                </button>
+              </div>
+            );
+          })}
+        </div>
+        <div className="flex flex-wrap gap-3 mt-5 justify-center">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="px-4 py-2 rounded-lg border border-slate-600 text-slate-300 text-sm font-bold uppercase"
+          >
+            Back
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="px-5 py-2 rounded-lg dugout-btn-gold text-stone-900 font-black uppercase text-sm"
+          >
+            Start with these quests
+          </button>
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+}
+
 function MainMenu({
   onAuction,
-  onQuick,
+  onQuickConfirm,
   onLearn,
 }: {
   onAuction: (team: Team) => void;
-  onQuick: (team: Team) => void;
+  onQuickConfirm: (team: Team, questSlate: string[]) => void;
   onLearn: () => void;
 }) {
-  // Tracks which lane has its inline team picker expanded. Only one open at
-  // a time; clicking the other lane swaps. Setting to null collapses both.
   const [openLane, setOpenLane] = useState<Lane | null>(null);
+  const [quickQuest, setQuickQuest] = useState<null | {
+    team: Team;
+    slate: [string, string, string];
+    rerollSpent: boolean;
+  }>(null);
 
   const toggle = (lane: Lane) =>
     setOpenLane((prev) => (prev === lane ? null : lane));
@@ -174,7 +264,14 @@ function MainMenu({
         variant="gold"
         expanded={openLane === 'quick'}
         onToggle={() => toggle('quick')}
-        onPickTeam={(team) => onQuick(team)}
+        onPickTeam={(team) => {
+          const s = rollQuestSlate();
+          setQuickQuest({
+            team,
+            slate: [s[0]!, s[1]!, s[2]!],
+            rerollSpent: false,
+          });
+        }}
       />
 
       {/* Tertiary "Learn to Play" entry. Smaller and ghost-styled so it
@@ -194,6 +291,30 @@ function MainMenu({
         <DisabledMenuButton icon={<BookOpen className="w-5 h-5" />} label="Rulebook" />
         <DisabledMenuButton icon={<Settings className="w-5 h-5" />} label="Settings" />
       </div>
+
+      <AnimatePresence>
+        {quickQuest && (
+          <QuickQuestPickerModal
+            key="quest-picker"
+            team={quickQuest.team}
+            slate={quickQuest.slate}
+            rerollSpent={quickQuest.rerollSpent}
+            onRerollSlot={(idx) => {
+              if (quickQuest.rerollSpent) return;
+              setQuickQuest({
+                ...quickQuest,
+                rerollSpent: true,
+                slate: rerollQuestSlotAt(quickQuest.slate, idx),
+              });
+            }}
+            onConfirm={() => {
+              onQuickConfirm(quickQuest.team, [...quickQuest.slate]);
+              setQuickQuest(null);
+            }}
+            onCancel={() => setQuickQuest(null)}
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 }

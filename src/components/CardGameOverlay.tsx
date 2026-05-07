@@ -2,10 +2,11 @@ import { useMemo, useState, useCallback, useEffect, useRef } from 'react';
 import { Reorder, motion, AnimatePresence } from 'motion/react';
 import { CardDefinition } from '../lib/cards';
 import { canConnect, shapeModeForSide, seamKey } from '../lib/connect';
-import { useGameStore, getUserSide, ResolutionBeat, Phase } from '../lib/gameStore';
+import { useGameStore, getUiUserSide, ResolutionBeat, Phase } from '../lib/gameStore';
 import { HitOutcome } from '../lib/scoring';
 import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
 import { PlayerHero } from './PlayerHero';
+import { QuestStrip } from './QuestStrip';
 
 /**
  * Reveal-sequence orchestrator timing. Tuned so a typical 3-5 beat hand
@@ -422,7 +423,7 @@ const CardItem = ({
     <motion.div
       data-tutorial={tutorialRegions ? 'card-shapes' : undefined}
       className={`
-        relative ${sz.card} ${cardBgClass} border-2 group
+        group relative ${sz.card} ${cardBgClass} border-2
         flex flex-col items-center justify-center cursor-grab active:cursor-grabbing
       `}
       animate={revealAnimate ?? baseAnimate}
@@ -432,6 +433,31 @@ const CardItem = ({
         marginRight: noMargin ? 0 : isConnectedRight ? `${sz.connectedGap}px` : `${sz.gap}px`,
       }}
     >
+      <div
+        data-tutorial={tutorialRegions ? 'card-ability' : undefined}
+        className="pointer-events-none invisible absolute bottom-full left-1/2 z-[60] mb-1.5 w-64 max-w-[calc(100vw-1.25rem)] max-h-[min(85vh,32rem)] -translate-x-1/2 overflow-y-auto rounded-lg border border-slate-600 bg-slate-800 p-3 opacity-0 shadow-2xl transition-opacity duration-150 group-hover:visible group-hover:opacity-100 sm:w-72"
+        role="tooltip"
+      >
+        <div className="mb-1.5 border-b border-slate-700 pb-1 text-[10px] font-black uppercase tracking-widest text-slate-500">
+          Ability
+        </div>
+        <div className="mb-1.5 flex items-center justify-between gap-2">
+          <div className="truncate text-[11px] font-black uppercase tracking-tight leading-none text-white">
+            {card.name}
+          </div>
+          <div
+            className={`shrink-0 rounded px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider text-white ${card.color || 'bg-slate-700'}`}
+          >
+            {card.abilityType}
+          </div>
+        </div>
+        {card.player && (
+          <div className="mb-1.5 text-[9px] font-semibold uppercase tracking-widest text-slate-400">
+            {card.player}
+          </div>
+        )}
+        <div className="text-xs font-medium leading-snug text-slate-300">{card.description}</div>
+      </div>
       <ShapeHalf
         shape={card.leftShape}
         side="left"
@@ -487,26 +513,6 @@ const CardItem = ({
       >
         {displayValue}
       </motion.div>
-
-      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 w-56 bg-slate-800 rounded-lg p-3 shadow-2xl opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none z-50">
-        <div className="flex items-center justify-between gap-2 mb-1.5">
-          <div className="text-[11px] font-black text-white uppercase tracking-tight leading-none truncate">
-            {card.name}
-          </div>
-          <div className={`text-[9px] font-bold text-white uppercase tracking-wider px-2 py-0.5 rounded shrink-0 ${card.color || 'bg-slate-700'}`}>
-            {card.abilityType}
-          </div>
-        </div>
-        {card.player && (
-          <div className="text-[9px] font-semibold text-slate-400 uppercase tracking-widest mb-1.5">
-            {card.player}
-          </div>
-        )}
-        <div className="text-xs text-slate-300 font-medium leading-snug">
-          {card.description}
-        </div>
-        <div className="absolute left-1/2 -translate-x-1/2 -bottom-1.5 w-3 h-3 bg-slate-800 rotate-45" />
-      </div>
     </motion.div>
   );
 };
@@ -535,7 +541,7 @@ export const CardGameOverlay = () => {
   // Which seat is the human in this half? When pitching, the bottom strip
   // becomes the pitcher hand (drag, lock-in, status chips on the user's
   // side) and the top strip becomes the AI batter (face-down -> revealed).
-  const userSide = useGameStore(getUserSide);
+  const userSide = useGameStore(getUiUserSide);
   const userIsBatting = userSide === 'Batting';
   // atBatId scopes per-card keys to a single at-bat so general-pool cards
   // shared between consecutive batters/pitchers remount cleanly (the pitcher
@@ -593,6 +599,7 @@ export const CardGameOverlay = () => {
   // no in-game explanation).
   const lastBatterCardModifiers = useGameStore((s) => s.lastBatterCardModifiers);
   const lastPitcherCardModifiers = useGameStore((s) => s.lastPitcherCardModifiers);
+  const lastRevealMathSnapshot = useGameStore((s) => s.lastRevealMathSnapshot);
 
   // Live preview. Single source of truth: `previewMatchup` runs both sides
   // through the same scoring pass that feeds the pill (including p-41's
@@ -636,6 +643,8 @@ export const CardGameOverlay = () => {
   const isSelecting = phase === 'selecting';
   const isRevealing = phase === 'revealing';
   const isResolved = phase === 'between-at-bats' || phase === 'game-over';
+  /** Hide the opponent's score readout until the at-bat is settled (post-reveal). */
+  const hideOpponentTotals = !isResolved;
 
   // Decide which per-card modifier set the strips render against. While the
   // player is selecting we want LIVE previews so the numbers update as cards
@@ -671,11 +680,8 @@ export const CardGameOverlay = () => {
     onComplete: completeReveal,
   });
 
-  // ScorePill values: live preview while selecting, orchestrator-driven while
-  // revealing, locked-in score after that. Pitcher pill stays hidden during
-  // selection so the player has to commit before peeking at the pitcher's
-  // total -- but we DO want to show it during the reveal even though `?`
-  // would otherwise apply, since the whole point is to watch the number land.
+  // Batter/pitcher numbers used for pills: user's lane follows the reveal
+  // orchestrator; opponent numbers are only surfaced once `isResolved`.
   const batterDisplayValue = isResolved
     ? lastBatterScore
     : isRevealing
@@ -720,6 +726,9 @@ export const CardGameOverlay = () => {
   const userTone = userIsBatting ? 'batter' : 'pitcher';
   const aiTone = userIsBatting ? 'pitcher' : 'batter';
 
+  const showFrozenMatchupMath =
+    lastRevealMathSnapshot !== null && (isRevealing || isResolved);
+
   // Set of cardIds in the user's hand that have an unresolved player-choice
   // prompt. The HandStrip uses this to render the "USE" pill on the
   // matching card. We filter by `userSide` so an AI-side prompt that
@@ -732,6 +741,8 @@ export const CardGameOverlay = () => {
     }
     return ids;
   }, [pendingChoices, userSide]);
+
+  const batterCardIds = useMemo(() => new Set(batterHand.map((c) => c.id)), [batterHand]);
 
   return (
     <>
@@ -748,34 +759,35 @@ export const CardGameOverlay = () => {
         resolveLog={lastResolveLog}
       />
 
-      {/* Player hero rail -- procedural Topps-style cards pinned to the LEFT
-          screen margin so the live BATTER/PITCHER total reads as belonging
-          to the player rather than as a detached HUD pill. The cards pulse +
-          color-flash on every value change so manipulating the hand visibly
-          "affects" the player on screen.
+      <QuestStrip />
 
-          Mounted as `pointer-events-none` so they never steal a click from
-          the hand strip / 3D scene; gated behind `xl:block` because the
-          left rail is only meaningfully empty on >=1280px viewports -- on
-          narrower screens the existing ScorePill above each hand is still
-          the readout. Fog-of-war mirrors ScorePill exactly: the AI's
-          number is hidden during selection (and the dim styling triggers
-          accordingly), but the player card itself stays visible so the
-          user always knows WHO they are facing. */}
+      <RevealBeatSpotlight
+        active={isRevealing}
+        spotlight={reveal.revealSpotlight}
+        batterCardIds={batterCardIds}
+        batterModifiers={batterModifiersForStrip}
+        pitcherModifiers={pitcherModifiersForStrip}
+        batterOverrides={reveal.batterValueOverrides}
+        pitcherOverrides={reveal.pitcherValueOverrides}
+      />
+
+      {/* Player hero rail: top slot = opponent (fog `?` until result), bottom = you
+          (live total always). Pairs with your hand at the bottom of the screen so
+          you always see YOUR number there whether you are batting or pitching. */}
       <div className="hidden md:block pointer-events-none absolute left-8 top-32 z-20">
         <PlayerHero
-          player={pitcher}
-          value={isSelecting && userIsBatting ? null : pitcherDisplayValue}
-          role="PITCHER"
-          dimmed={isSelecting && userIsBatting}
+          player={userIsBatting ? pitcher : batter}
+          value={hideOpponentTotals ? null : aiPillValue}
+          role={userIsBatting ? 'PITCHER' : 'BATTER'}
+          dimmed={hideOpponentTotals}
         />
       </div>
       <div className="hidden md:block pointer-events-none absolute left-8 bottom-32 z-20">
         <PlayerHero
-          player={batter}
-          value={isSelecting && !userIsBatting ? null : batterDisplayValue}
-          role="BATTER"
-          dimmed={isSelecting && !userIsBatting}
+          player={userIsBatting ? batter : pitcher}
+          value={userPillValue}
+          role={userIsBatting ? 'BATTER' : 'PITCHER'}
+          dimmed={false}
         />
       </div>
 
@@ -792,11 +804,11 @@ export const CardGameOverlay = () => {
           <ScorePill
             label={aiLabel}
             tone={aiTone}
-            value={isSelecting ? null : aiPillValue}
+            value={hideOpponentTotals ? null : aiPillValue}
             outcomeStyle={outcomeBadgeStyle}
             compact
-            banner={aiBanner}
-            heroHasValue
+            banner={hideOpponentTotals ? null : aiBanner}
+            heroHasValue={!hideOpponentTotals}
           />
           <div data-tutorial="opponent-hand">
             <FlipPitcherStrip
@@ -854,6 +866,38 @@ export const CardGameOverlay = () => {
               ignoresDebuffs={matchup.batterIgnoresDebuffs}
               chainOf={batterPreview.bestGroup.length}
               handSize={batterHand.length}
+            />
+          )}
+
+          {showFrozenMatchupMath && lastRevealMathSnapshot && userIsBatting && (
+            <MatchupMath
+              caption={isRevealing ? 'Locked-in math (reveal)' : 'Locked-in math'}
+              chainSum={lastRevealMathSnapshot.batter.chainSum}
+              pitcherDelta={lastRevealMathSnapshot.batter.pitcherDelta}
+              carryoverDelta={lastRevealMathSnapshot.batter.carryoverDelta}
+              guessDelta={lastRevealMathSnapshot.batter.guessDelta}
+              total={lastRevealMathSnapshot.batter.total}
+              ignoresDebuffs={lastRevealMathSnapshot.batter.ignoresDebuffs}
+              chainOf={lastRevealMathSnapshot.batter.chainOf}
+              handSize={lastRevealMathSnapshot.batter.handSize}
+            />
+          )}
+
+          {showFrozenMatchupMath && lastRevealMathSnapshot && !userIsBatting && (
+            <MatchupMath
+              caption={
+                isRevealing ? 'Your pitching total (locked in)' : 'Your pitching total — how it was built'
+              }
+              chainSum={lastRevealMathSnapshot.pitcher.chainSum}
+              pitcherDelta={lastRevealMathSnapshot.pitcher.batterDelta}
+              carryoverDelta={lastRevealMathSnapshot.pitcher.carryoverDelta}
+              guessDelta={0}
+              total={lastRevealMathSnapshot.pitcher.total}
+              ignoresDebuffs={false}
+              chainOf={lastRevealMathSnapshot.pitcher.chainOf}
+              handSize={lastRevealMathSnapshot.pitcher.handSize}
+              crossSideLabel="Batter"
+              crossSideTitle="Aggregate pressure from the batter's side on your pitching total. Individual batter cards stay hidden; this row is the credited modifier total only."
             />
           )}
 
@@ -1467,6 +1511,16 @@ interface MatchupMathProps {
   chainOf: number;
   /** Total cards in hand (for the X of Y caption). */
   handSize: number;
+  /**
+   * Label for the aggregate cross-side pressure row. Defaults to
+   * "Pitcher" (batter selection); use "Batter" when showing the pitcher's
+   * locked-in breakdown from defense.
+   */
+  crossSideLabel?: string;
+  /** Tooltip for the cross-side pressure row. */
+  crossSideTitle?: string;
+  /** Optional caption above the chips (e.g. reveal / result context). */
+  caption?: string;
 }
 
 /**
@@ -1491,6 +1545,9 @@ const MatchupMath = ({
   ignoresDebuffs,
   chainOf,
   handSize,
+  crossSideLabel = 'Pitcher',
+  crossSideTitle = "Aggregate pressure from the pitcher's ability cards (e.g. Wipeout Changeup, Devastating Slider, Filthy Stuff).",
+  caption,
 }: MatchupMathProps) => {
   const hasDelta = pitcherDelta !== 0 || carryoverDelta !== 0 || guessDelta !== 0;
   if (!hasDelta && !ignoresDebuffs) return null;
@@ -1506,10 +1563,10 @@ const MatchupMath = ({
   ];
   if (pitcherDelta !== 0) {
     components.push({
-      label: 'Pitcher',
+      label: crossSideLabel,
       value: pitcherDelta,
       tone: pitcherDelta < 0 ? 'neg' : 'pos',
-      title: "Aggregate pressure from the pitcher's ability cards (e.g. Wipeout Changeup, Devastating Slider, Filthy Stuff).",
+      title: crossSideTitle,
     });
   }
   if (carryoverDelta !== 0) {
@@ -1536,8 +1593,14 @@ const MatchupMath = ({
       initial={{ opacity: 0, y: -4 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.22, ease: 'easeOut' }}
-      className="flex flex-row items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-900/85 backdrop-blur border border-white/10 shadow-lg flex-wrap justify-center max-w-[420px]"
+      className="flex flex-col items-center gap-0.5 max-w-[420px]"
     >
+      {caption ? (
+        <p className="text-[9px] font-bold uppercase tracking-widest text-slate-500 text-center px-1 leading-tight">
+          {caption}
+        </p>
+      ) : null}
+      <div className="flex flex-row items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-900/85 backdrop-blur border border-white/10 shadow-lg flex-wrap justify-center w-full">
       {components.map((c, idx) => {
         const sign = c.value > 0 ? '+' : c.value < 0 ? '−' : '';
         const magnitude = Math.abs(c.value);
@@ -1577,7 +1640,84 @@ const MatchupMath = ({
           Discipline
         </span>
       )}
+      </div>
     </motion.div>
+  );
+};
+
+type RevealSpotlight =
+  | { kind: 'card'; card: CardDefinition; tone: 'source' | 'target'; caption: string }
+  | { kind: 'text'; caption: string };
+
+/** Large centered card (or text panel) for the scoring beat driving the reveal sequence. */
+const RevealBeatSpotlight = ({
+  active,
+  spotlight,
+  batterCardIds,
+  batterModifiers,
+  pitcherModifiers,
+  batterOverrides,
+  pitcherOverrides,
+}: {
+  active: boolean;
+  spotlight: RevealSpotlight | null;
+  batterCardIds: Set<string>;
+  batterModifiers: Record<string, { value: number; color?: string }>;
+  pitcherModifiers: Record<string, { value: number; color?: string }>;
+  batterOverrides: Record<string, number>;
+  pitcherOverrides: Record<string, number>;
+}) => {
+  if (!active || !spotlight) return null;
+
+  if (spotlight.kind === 'text') {
+    return (
+      <div className="fixed inset-0 z-[32] pointer-events-none flex items-center justify-center px-6">
+        <motion.div
+          key={spotlight.caption}
+          initial={{ opacity: 0, scale: 0.92, y: 8 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          exit={{ opacity: 0, scale: 0.96 }}
+          transition={{ duration: 0.28, ease: 'easeOut' }}
+          className="max-w-md rounded-2xl border border-white/15 bg-slate-950/92 px-6 py-5 shadow-2xl backdrop-blur-md"
+        >
+          <p className="text-center text-[11px] font-black uppercase tracking-[0.2em] text-slate-500 mb-2">
+            Scoring effect
+          </p>
+          <p className="text-center text-sm font-bold leading-snug text-slate-100">{spotlight.caption}</p>
+        </motion.div>
+      </div>
+    );
+  }
+
+  const { card, tone, caption } = spotlight;
+  const modifier = batterCardIds.has(card.id) ? batterModifiers[card.id] : pitcherModifiers[card.id];
+  const valueOverride = batterOverrides[card.id] ?? pitcherOverrides[card.id];
+
+  return (
+    <div className="fixed inset-0 z-[32] pointer-events-none flex items-center justify-center px-4">
+      <motion.div
+        key={card.id + tone + caption}
+        className="flex flex-col items-center"
+        initial={{ opacity: 0, scale: 0.88, y: 16 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.94 }}
+        transition={{ duration: 0.32, ease: [0.4, 0, 0.2, 1] }}
+      >
+        <CardItem
+          card={card}
+          isConnectedLeft={false}
+          isConnectedRight={false}
+          modifier={modifier}
+          compact={false}
+          noMargin
+          valueOverride={valueOverride}
+          highlightTone={tone}
+        />
+        <p className="mt-4 max-w-[min(24rem,calc(100vw-2rem))] text-center text-[11px] font-semibold leading-snug text-slate-200 drop-shadow-lg">
+          {caption}
+        </p>
+      </motion.div>
+    </div>
   );
 };
 
@@ -2581,6 +2721,69 @@ function UseAbilityPill({ active, onClick }: { active: boolean; onClick: () => v
 // Reveal-sequence orchestrator
 // ===========================================================================
 
+function formatRevealBeatCaption(
+  beat: ResolutionBeat,
+  lookup: Map<string, CardDefinition>,
+): string {
+  const sign = (n: number) => (n > 0 ? `+${n}` : `${n}`);
+  switch (beat.kind) {
+    case 'selfModifier': {
+      const c = lookup.get(beat.cardId);
+      const name = c?.name ?? beat.cardId;
+      const d = beat.finalValue - beat.baseValue;
+      return `${name} ${beat.baseValue}→${beat.finalValue} (${sign(d)})`;
+    }
+    case 'targetedDebuff': {
+      const s = lookup.get(beat.sourceCardId);
+      const t = lookup.get(beat.targetCardId);
+      return `${s?.name ?? '?'} → ${t?.name ?? '?'} (${sign(beat.delta)})`;
+    }
+    case 'aggregateDebuff':
+      return `${beat.label} (${sign(beat.delta)})`;
+    case 'guessPitchHit':
+      return `Guess Pitch (${sign(beat.delta)})`;
+    case 'crossDebuff':
+      return `${beat.label} (${sign(beat.delta)})`;
+  }
+}
+
+function spotlightForBeat(
+  beat: ResolutionBeat,
+  lookup: Map<string, CardDefinition>,
+): RevealSpotlight | null {
+  const caption = formatRevealBeatCaption(beat, lookup);
+  switch (beat.kind) {
+    case 'crossDebuff':
+      return { kind: 'text', caption };
+    case 'selfModifier': {
+      const card = lookup.get(beat.cardId);
+      if (!card) return { kind: 'text', caption };
+      return { kind: 'card', card, tone: 'source', caption };
+    }
+    case 'targetedDebuff': {
+      const card = lookup.get(beat.sourceCardId);
+      if (!card) return { kind: 'text', caption };
+      return { kind: 'card', card, tone: 'source', caption };
+    }
+    case 'aggregateDebuff': {
+      const card = lookup.get(beat.sourceCardId);
+      if (!card) return { kind: 'text', caption };
+      return { kind: 'card', card, tone: 'source', caption };
+    }
+    case 'guessPitchHit': {
+      const card = lookup.get(beat.sourceCardId);
+      if (!card) return { kind: 'text', caption };
+      return { kind: 'card', card, tone: 'source', caption };
+    }
+  }
+}
+
+function revealBeatDurationMs(beat: ResolutionBeat): number {
+  const dB = scoreDeltaForSide(beat, 'Batting');
+  const dP = scoreDeltaForSide(beat, 'Pitching');
+  return dB !== 0 || dP !== 0 ? Math.round(REVEAL_BEAT_MS * 1.32) : REVEAL_BEAT_MS;
+}
+
 interface RevealOrchestratorInput {
   phase: string;
   script: ResolutionBeat[];
@@ -2600,6 +2803,7 @@ interface RevealOrchestratorOutput {
   pitcherHighlights: Record<string, 'source' | 'target'>;
   batterBanner: ScoreBanner | null;
   pitcherBanner: ScoreBanner | null;
+  revealSpotlight: RevealSpotlight | null;
 }
 
 /**
@@ -2626,6 +2830,7 @@ function useRevealOrchestrator({
   const [pitcherHighlights, setPitcherHighlights] = useState<Record<string, 'source' | 'target'>>({});
   const [batterBanner, setBatterBanner] = useState<ScoreBanner | null>(null);
   const [pitcherBanner, setPitcherBanner] = useState<ScoreBanner | null>(null);
+  const [revealSpotlight, setRevealSpotlight] = useState<RevealSpotlight | null>(null);
 
   // Stash latest props in refs so the orchestrator effect can read them
   // without re-running every time React re-renders the parent.
@@ -2647,6 +2852,7 @@ function useRevealOrchestrator({
       setPitcherHighlights({});
       setBatterBanner(null);
       setPitcherBanner(null);
+      setRevealSpotlight(null);
       // Snap displayed scores to current finals (even outside revealing the
       // pills should track the source of truth).
       setDisplayedBatter(finalRef.current.b);
@@ -2669,6 +2875,7 @@ function useRevealOrchestrator({
     setPitcherHighlights({});
     setBatterBanner(null);
     setPitcherBanner(null);
+    setRevealSpotlight(null);
 
     const cardLookup = new Map<string, CardDefinition>();
     for (const c of batterHand) cardLookup.set(c.id, c);
@@ -2696,8 +2903,10 @@ function useRevealOrchestrator({
     } else {
       for (let i = 0; i < script.length; i++) {
         const beat = script[i];
+        const beatMs = revealBeatDurationMs(beat);
         const startAt = cursor;
-        const endAt = cursor + REVEAL_BEAT_MS;
+        const endAt = cursor + beatMs;
+        const nextTotals = applyBeatToRunning(beat, runningBatter, runningPitcher);
 
         schedule(startAt, () => {
           applyBeatStart(beat, {
@@ -2715,12 +2924,11 @@ function useRevealOrchestrator({
             beatIndex: i,
             tweens,
           });
+          setRevealSpotlight(spotlightForBeat(beat, cardLookup));
         });
 
-        // Update running totals so the NEXT beat tweens from the right place.
-        const next = applyBeatToRunning(beat, runningBatter, runningPitcher);
-        runningBatter = next.batter;
-        runningPitcher = next.pitcher;
+        runningBatter = nextTotals.batter;
+        runningPitcher = nextTotals.pitcher;
 
         schedule(endAt, () => {
           // Clear highlights + banner at the end of each beat window so the
@@ -2730,6 +2938,7 @@ function useRevealOrchestrator({
           setPitcherHighlights({});
           setBatterBanner(null);
           setPitcherBanner(null);
+          setRevealSpotlight(null);
         });
 
         cursor = endAt;
@@ -2763,6 +2972,7 @@ function useRevealOrchestrator({
     pitcherHighlights,
     batterBanner,
     pitcherBanner,
+    revealSpotlight,
   };
 }
 

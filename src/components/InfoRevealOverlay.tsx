@@ -11,7 +11,8 @@ import { SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, type ShapeType } from './car
  * pitcher's UNCOMBINED cards before lock-in; p-51 Veteran Savvy reveals the
  * full batter hand to the pitcher; p-59 Nasty Slider reveals the batter's
  * layout. The overlay is always available while there are pending reveals --
- * it lives in the bottom-left as a stack of toggleable peek pills.
+ * on the bottom-right as a stack of toggleable peek pills, clear of the
+ * left-rail PlayerHero panels.
  *
  * Only reveals belonging to the user's CURRENT seat
  * (`getUserSide(state)`) are surfaced -- showing opponent-side peeks would
@@ -42,7 +43,7 @@ export function InfoRevealOverlay() {
   if (phase !== 'selecting' || visibleReveals.length === 0) return null;
 
   return (
-    <div className="absolute left-4 bottom-44 z-40 flex flex-col gap-2 pointer-events-auto">
+    <div className="absolute right-4 bottom-44 z-40 flex flex-col items-end gap-2 pointer-events-auto sm:right-5">
       <AnimatePresence>
         {visibleReveals.map((reveal, idx) => (
           <RevealPill
@@ -75,9 +76,9 @@ function RevealPill({ reveal, onToggle, isOpen }: { reveal: PendingReveal; onTog
     <motion.button
       onClick={onToggle}
       className={`flex items-center gap-2 px-3 py-2 rounded-lg shadow-lg ${tone} text-white text-[11px] font-bold uppercase tracking-widest`}
-      initial={{ opacity: 0, x: -20 }}
+      initial={{ opacity: 0, x: 20 }}
       animate={{ opacity: 1, x: 0 }}
-      exit={{ opacity: 0, x: -20 }}
+      exit={{ opacity: 0, x: 20 }}
     >
       <Eye className="w-3.5 h-3.5" />
       <span>{reveal.source}</span>
@@ -105,9 +106,9 @@ function RevealPanel({
   return (
     <motion.div
       className="bg-slate-900/95 border border-slate-700 rounded-xl shadow-2xl backdrop-blur p-4 w-72 max-h-[60vh] overflow-y-auto"
-      initial={{ opacity: 0, x: -20, scale: 0.95 }}
+      initial={{ opacity: 0, x: 20, scale: 0.95 }}
       animate={{ opacity: 1, x: 0, scale: 1, transition: { type: 'spring', stiffness: 240, damping: 22 } }}
-      exit={{ opacity: 0, x: -20, scale: 0.95, transition: { duration: 0.16 } }}
+      exit={{ opacity: 0, x: 20, scale: 0.95, transition: { duration: 0.16 } }}
     >
       <div className="flex items-start justify-between mb-2">
         <div>

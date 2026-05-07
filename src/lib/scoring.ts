@@ -102,6 +102,11 @@ export interface ScoringContext {
    * `awayScore`/`half` and doesn't need a dedicated field.
    */
   nullifyOpponentTagMechanics?: ReadonlyArray<TagLiteral>;
+
+  /**
+   * In-game quest reward applied once on the batting hand's Hit Scale ladder.
+   */
+  questHitScaleBonus?: number;
 }
 
 /**
@@ -312,6 +317,10 @@ export function scoreHand(cards: CardDefinition[], ctx: ScoringContext): Scoring
   pitcherCombinedDelta += handAdjust.pitcherCombinedDelta;
   if (handAdjust.pitcherWinsTies) pitcherWinsTies = true;
   log.push(...handAdjust.log);
+
+  if (ctx.side === "Batting" && ctx.questHitScaleBonus) {
+    hitScaleBonus += ctx.questHitScaleBonus;
+  }
 
   return {
     groups,

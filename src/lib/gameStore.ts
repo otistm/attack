@@ -21,6 +21,19 @@ import {
   repairDraftStall,
 } from "./draft";
 import { TUTORIAL_STEPS } from "./tutorialSteps";
+import {
+  applyQuestTickToAll,
+  initialQuestProgress,
+  rollQuestSlate,
+  QUEST_REGISTRY,
+  type QuestProgressState,
+} from "./quests";
+import {
+  applyWildcardToFirstGeneral,
+  mergeQuestReward,
+  QUEST_REWARD_INITIAL,
+} from "./questRewards";
+import { playSfx } from "./sfx";
 
 export type Half = "top" | "bottom";
 export type Team = "HOME" | "AWAY";
@@ -123,6 +136,21 @@ export type Bases = [boolean, boolean, boolean]; // [1B, 2B, 3B]
 export function getUserSide(s: { userTeam: Team; half: Half }): Side {
   if (s.userTeam === "HOME") return s.half === "bottom" ? "Batting" : "Pitching";
   return s.half === "top" ? "Batting" : "Pitching";
+}
+
+/**
+ * Seat the HUD should treat as "the user's" for layout (hand strips, camera).
+ * While `phase === "revealing"`, this stays on the seat they had for the at-bat
+ * that just locked in so an immediate half flip (side retired) does not swap
+ * hands mid-animation or replay deal-in stagger. Otherwise matches
+ * {@link getUserSide}.
+ */
+export function getUiUserSide(s: {
+  revealUiUserSide: Side | null;
+  userTeam: Team;
+  half: Half;
+}): Side {
+  return s.revealUiUserSide ?? getUserSide(s);
 }
 
 /**
@@ -240,6 +268,28 @@ export interface RunnerMove {
   player: MlbPlayer | null;
 }
 
+/** Matchup breakdown captured at lock-in for reveal / result phase UI. */
+export interface RevealMathSnapshot {
+  batter: {
+    chainSum: number;
+    pitcherDelta: number;
+    carryoverDelta: number;
+    guessDelta: number;
+    total: number;
+    ignoresDebuffs: boolean;
+    chainOf: number;
+    handSize: number;
+  };
+  pitcher: {
+    chainSum: number;
+    batterDelta: number;
+    carryoverDelta: number;
+    total: number;
+    chainOf: number;
+    handSize: number;
+  };
+}
+
 export interface GameState {
   // Clock state.
   inning: number;
@@ -324,6 +374,11 @@ export interface GameState {
    */
   lastBatterCardModifiers: Record<string, { value: number; color?: string }>;
   lastPitcherCardModifiers: Record<string, { value: number; color?: string }>;
+  /**
+   * Matchup math breakdown captured at lock-in for the reveal + result UI.
+   * Cleared when a new at-bat starts (`selecting`).
+   */
+  lastRevealMathSnapshot: RevealMathSnapshot | null;
   /**
    * Per-runner movement list produced by the most recent at-bat. Drives the 3D
    * runner travel animation while the camera is zoomed out. Cleared at the
@@ -422,6 +477,13 @@ export interface GameState {
    * the outcome math. Null whenever we're not mid-reveal.
    */
   pendingResolvedPhase: Phase | null;
+  /**
+   * During `revealing`, card strips and camera use this seat instead of
+   * {@link getUserSide} so the UI does not swap batter/pitcher lanes until
+   * {@link completeReveal} — the engine applies the next half's `half` in the
+   * same tick as `lockIn`, but the reveal is still for the prior at-bat.
+   */
+  revealUiUserSide: Side | null;
 
   /**
    * Active draft state when `phase === "drafting"`. Null whenever the user
@@ -435,6 +497,22 @@ export interface GameState {
    * `./draft.ts`.
    */
   draft: DraftState | null;
+
+  /** In-game quests (3 active ids for this game). */
+  activeQuests: string[];
+  questProgress: Record<string, QuestProgressState>;
+  /** Quest ids finished this game (for trophy strip / dedupe). */
+  completedQuests: string[];
+  /** FIFO celebration queue → QuestCompleteOverlay. */
+  questCelebrationQueue: string[];
+  /** Bumped when any quest progress changes (HUD pulse). */
+  questTick: number;
+  questPendingBattingHitScale: number;
+  questForceHomerunOnce: boolean;
+  questWildcardNextBatterHand: boolean;
+  questLegendaryCelebratePulse: boolean;
+  /** Bumped when quest celebration should shake the HUD (ScreenShake). */
+  questShakeRequestId: number;
 
   // Actions.
   reorderBatterHand: (cards: CardDefinition[]) => void;
@@ -547,7 +625,11 @@ export interface GameState {
    * same way it does after a finished auction, so once this lands, the
    * downstream flow is indistinguishable from the auction path.
    */
-  startQuickMatch: (team: Team) => void;
+  /**
+   * Quick Match lane. Optional `questSlate` (exactly 3 quest ids) when the
+   * player confirms a custom roll from the pre-game quest picker.
+   */
+  startQuickMatch: (team: Team, questSlate?: string[]) => void;
   /**
    * Open an auction on the given player. No-op unless `phase === "drafting"`,
    * the user is the current nominator, and the player is in the pool. The
@@ -573,6 +655,9 @@ export interface GameState {
    * complete or we're already in gameplay.
    */
   completeDraft: () => void;
+
+  /** Dismiss current quest celebration and show next in queue if any. */
+  completeQuestCelebration: () => void;
 }
 
 export interface MatchupPreview {
@@ -622,6 +707,13 @@ export interface MatchupPreview {
   batterGuessDelta: number;
   /** True when b-9 Generational Discipline is in play (debuffs zeroed). */
   batterIgnoresDebuffs: boolean;
+
+  /** Pitcher pill: best-chain sum (same arithmetic as pitcherDisplay). */
+  pitcherChainSum: number;
+  /** Pitcher pill: aggregate batter pressure (opponentModifier + pitcherCombinedDelta). */
+  pitcherBatterDelta: number;
+  /** Pitcher pill: cross-at-bat carryover on pitching side. */
+  pitcherCarryoverDelta: number;
 }
 
 function pickRandom<T>(arr: T[]): T {
@@ -851,6 +943,45 @@ export function derivePendingReveals(
   return out;
 }
 
+function seedQuestState(): {
+  activeQuests: string[];
+  questProgress: Record<string, QuestProgressState>;
+  completedQuests: string[];
+  questCelebrationQueue: string[];
+  questTick: number;
+} & typeof QUEST_REWARD_INITIAL {
+  const activeQuests = rollQuestSlate();
+  const questProgress: Record<string, QuestProgressState> = {};
+  for (const id of activeQuests) {
+    questProgress[id] = initialQuestProgress();
+  }
+  return {
+    activeQuests,
+    questProgress,
+    completedQuests: [],
+    questCelebrationQueue: [],
+    questTick: 0,
+    ...QUEST_REWARD_INITIAL,
+  };
+}
+
+function questStateFromManualIds(ids: string[]): ReturnType<typeof seedQuestState> {
+  const valid = ids.filter((id) => QUEST_REGISTRY[id]);
+  if (valid.length !== 3) return seedQuestState();
+  const questProgress: Record<string, QuestProgressState> = {};
+  for (const id of valid) {
+    questProgress[id] = initialQuestProgress();
+  }
+  return {
+    activeQuests: valid,
+    questProgress,
+    completedQuests: [],
+    questCelebrationQueue: [],
+    questTick: 0,
+    ...QUEST_REWARD_INITIAL,
+  };
+}
+
 const INITIAL_AT_BAT = freshAtBat();
 
 // Boot the app into a quiescent "selecting" phase with the placeholder
@@ -908,6 +1039,7 @@ export const useGameStore = create<GameState>((set, get) => ({
   lastResolveLog: [],
   lastBatterCardModifiers: {},
   lastPitcherCardModifiers: {},
+  lastRevealMathSnapshot: null,
   runnerMoves: [],
 
   pendingDebuffs: [],
@@ -923,12 +1055,21 @@ export const useGameStore = create<GameState>((set, get) => ({
 
   revealScript: [],
   pendingResolvedPhase: null,
+  revealUiUserSide: null,
 
   // Empty until the player picks a lane on the StartGameScreen. Auction
   // path: `startDraft` populates with `initDraftState()` and the user
   // builds it via the auction. Quick-match path: `startQuickMatch`
   // populates with `buildQuickMatchDraft()` and skips straight to play.
   draft: null,
+
+  activeQuests: [],
+  questProgress: {},
+  completedQuests: [],
+  questCelebrationQueue: [],
+  questTick: 0,
+  questShakeRequestId: 0,
+  ...QUEST_REWARD_INITIAL,
 
   reorderBatterHand: (cards) => set({ batterHand: cards }),
   reorderPitcherHand: (cards) => set({ pitcherHand: cards }),
@@ -1070,6 +1211,8 @@ export const useGameStore = create<GameState>((set, get) => ({
       // (b-2, p-50, p-57, ...) read from this so combo detection on the
       // opponent's hand matches the seam set scoring will actually use.
       opponentAffirmedSeams: getUserSide(s) === "Pitching" ? s.affirmedSeams : null,
+      questHitScaleBonus:
+        s.questPendingBattingHitScale > 0 ? s.questPendingBattingHitScale : undefined,
     };
     return scoreHand(s.batterHand, ctx);
   },
@@ -1175,6 +1318,9 @@ export const useGameStore = create<GameState>((set, get) => ({
       batterCarryoverDelta: m.batterCarryoverDelta,
       batterGuessDelta: m.batterGuessDelta,
       batterIgnoresDebuffs: m.batterIgnoresDebuffs,
+      pitcherChainSum: m.pitcherChainSum,
+      pitcherBatterDelta: m.pitcherBatterDelta,
+      pitcherCarryoverDelta: m.pitcherCarryoverDelta,
     };
   },
 
@@ -1238,14 +1384,15 @@ export const useGameStore = create<GameState>((set, get) => ({
 
     const m = computeMatchup(s, batterResult, pitcherResult);
 
-    // Hit Scale ladder: only fires when the batter wins. Batter-side
-    // `forcedOutcome` (b-11, b-63, b-22 Walk-Off, ...) is gated on a win so
-    // the batter can't lose the matchup and still record a hit. Pitcher-side
-    // `forcedOutcome` (p-79 Intentional Walk) is honored when the pitcher
-    // "wins" -- it forces a single (the IBB walk) instead of an out.
+    const consumedForceHomer =
+      s.questForceHomerunOnce && m.batterWins && !batterResult.forcedOutcome;
+    const effectiveBatterResult = consumedForceHomer
+      ? { ...batterResult, forcedOutcome: "homerun" as const }
+      : batterResult;
+
     let outcome: HitOutcome;
-    if (batterResult.forcedOutcome && m.batterWins) {
-      outcome = batterResult.forcedOutcome;
+    if (effectiveBatterResult.forcedOutcome && m.batterWins) {
+      outcome = effectiveBatterResult.forcedOutcome;
     } else if (pitcherResult.forcedOutcome && !m.batterWins) {
       outcome = pitcherResult.forcedOutcome;
     } else if (!m.batterWins) {
@@ -1270,6 +1417,75 @@ export const useGameStore = create<GameState>((set, get) => ({
     const next = applyOutcome(s, outcome, resolveDelta);
     const message = formatOutcome(outcome, m.batterDisplay, m.pitcherDisplay, s.batter.name);
 
+    const battingTeam: Team = s.half === "top" ? "AWAY" : "HOME";
+    const isUserTeamBatting = battingTeam === s.userTeam;
+    const humanSide = getUserSide(s);
+    const humanWonMatchup =
+      humanSide === "Batting" ? m.batterWins : !m.batterWins;
+    const inningTransitioned = next.half !== s.half || next.inning !== s.inning;
+
+    let rs = {
+      questPendingBattingHitScale:
+        s.questPendingBattingHitScale > 0 ? 0 : s.questPendingBattingHitScale,
+      questForceHomerunOnce: consumedForceHomer ? false : s.questForceHomerunOnce,
+      questWildcardNextBatterHand: s.questWildcardNextBatterHand,
+      questLegendaryCelebratePulse: s.questLegendaryCelebratePulse,
+    };
+
+    const questPatch: Partial<GameState> = { ...rs };
+
+    if (s.activeQuests.length > 0) {
+      const { nextProgress, newlyCompleted } = applyQuestTickToAll(
+        s.activeQuests,
+        s.questProgress,
+        {
+          phase: "afterLockIn",
+          userTeam: s.userTeam,
+          inningAtAbStart: s.inning,
+          halfAtAbStart: s.half,
+          isUserTeamBatting,
+          humanWonMatchup,
+          lastOutcome: outcome,
+          prePlayHomeScore: s.homeScore,
+          prePlayAwayScore: s.awayScore,
+          postPlayHomeScore: next.homeScore,
+          postPlayAwayScore: next.awayScore,
+          phaseAfter: next.phase,
+          batterBestChainLength: batterResult.bestGroup.length,
+          inningTransitioned,
+        },
+      );
+      for (const id of newlyCompleted) {
+        const def = QUEST_REGISTRY[id];
+        if (def) rs = mergeQuestReward(rs, def.reward);
+      }
+      const progressChanged =
+        JSON.stringify(nextProgress) !== JSON.stringify(s.questProgress);
+      if (progressChanged && newlyCompleted.length === 0) {
+        playSfx("questTick");
+      }
+      if (newlyCompleted.length > 0) {
+        const anyLeg = newlyCompleted.some(
+          (id) => QUEST_REGISTRY[id]?.rarity === "legendary",
+        );
+        playSfx(anyLeg ? "legendary" : "questComplete");
+      }
+      Object.assign(questPatch, {
+        questProgress: nextProgress,
+        questCelebrationQueue: [...s.questCelebrationQueue, ...newlyCompleted],
+        completedQuests: Array.from(new Set([...s.completedQuests, ...newlyCompleted])),
+        questTick:
+          s.questTick +
+          (newlyCompleted.length > 0 || progressChanged ? 1 : 0),
+        questShakeRequestId:
+          s.questShakeRequestId + (newlyCompleted.length > 0 ? 1 : 0),
+        questPendingBattingHitScale: rs.questPendingBattingHitScale,
+        questForceHomerunOnce: rs.questForceHomerunOnce,
+        questWildcardNextBatterHand: rs.questWildcardNextBatterHand,
+        questLegendaryCelebratePulse: rs.questLegendaryCelebratePulse,
+      });
+    }
+
     // Drain expired debuffs (they served this at-bat) and append newly queued ones.
     const drainedDebuffs = s.pendingDebuffs
       .map((d) => ({ ...d, remainingAtBats: d.remainingAtBats - 1 }))
@@ -1284,8 +1500,30 @@ export const useGameStore = create<GameState>((set, get) => ({
     // share the same numbers.
     const script = buildRevealScript(s, batterResult, pitcherResult, m);
 
+    const lastRevealMathSnapshot: RevealMathSnapshot = {
+      batter: {
+        chainSum: m.batterChainSum,
+        pitcherDelta: m.batterPitcherDelta,
+        carryoverDelta: m.batterCarryoverDelta,
+        guessDelta: m.batterGuessDelta,
+        total: m.batterDisplay,
+        ignoresDebuffs: m.batterIgnoresDebuffs,
+        chainOf: batterResult.bestGroup.length,
+        handSize: s.batterHand.length,
+      },
+      pitcher: {
+        chainSum: m.pitcherChainSum,
+        batterDelta: m.pitcherBatterDelta,
+        carryoverDelta: m.pitcherCarryoverDelta,
+        total: m.pitcherDisplay,
+        chainOf: pitcherResult.bestGroup.length,
+        handSize: s.pitcherHand.length,
+      },
+    };
+
     set({
       ...next,
+      ...questPatch,
       lastOutcome: outcome,
       // Persist the COMPREHENSIVE display values (not the raw head-to-head
       // totals) so the resolved view matches the live preview pill.
@@ -1300,6 +1538,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       // banner with no in-game explanation.
       lastBatterCardModifiers: batterResult.cardModifiers,
       lastPitcherCardModifiers: pitcherResult.cardModifiers,
+      lastRevealMathSnapshot,
       lastResultMessage: message,
       // Strip the "b-NN " / "p-NN " card-id prefix the resolveStep prepends
       // for debugging; the player only needs the human-readable tail (e.g.
@@ -1314,6 +1553,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       // already snapshot into resolvedChoices (or auto-declined) by the
       // scoring path -- the modal is just visual at this point.
       activeChoiceCardId: null,
+      revealUiUserSide: getUserSide(s),
     });
   },
 
@@ -1324,8 +1564,14 @@ export const useGameStore = create<GameState>((set, get) => ({
       phase: s.pendingResolvedPhase ?? "between-at-bats",
       pendingResolvedPhase: null,
       revealScript: [],
+      revealUiUserSide: null,
     });
   },
+
+  completeQuestCelebration: () =>
+    set((st) => ({
+      questCelebrationQueue: st.questCelebrationQueue.slice(1),
+    })),
 
   startNextAtBat: () => {
     const s = get();
@@ -1341,8 +1587,14 @@ export const useGameStore = create<GameState>((set, get) => ({
       battersPool: pools.battersPool,
       pitchersPool: pools.pitchersPool,
     });
+    const userNext = getUserSide(s);
+    let batterHand = ab.batterHand;
+    if (s.questWildcardNextBatterHand && userNext === "Batting") {
+      batterHand = applyWildcardToFirstGeneral(ab.batterHand);
+    }
     set({
       ...ab,
+      batterHand,
       atBatId: s.atBatId + 1,
       phase: "selecting",
       lastOutcome: null,
@@ -1351,6 +1603,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       // Drop the lock-in modifier snapshot so the new at-bat shows live previews.
       lastBatterCardModifiers: {},
       lastPitcherCardModifiers: {},
+      lastRevealMathSnapshot: null,
       runnerMoves: [],
       // Preserve `isFirstAtBatOfInning` from the snapshot. `applyOutcome` sets
       // this flag to true on the third out (i.e. the first at-bat of the
@@ -1369,6 +1622,9 @@ export const useGameStore = create<GameState>((set, get) => ({
       recentPitcherIds: pushRecent(s.recentPitcherIds, ab.pitcher.id, RECENT_PITCHER_LIMIT),
       revealScript: [],
       pendingResolvedPhase: null,
+      revealUiUserSide: null,
+      questWildcardNextBatterHand: false,
+      questLegendaryCelebratePulse: false,
     });
   },
 
@@ -1397,6 +1653,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       lastResolveLog: [],
       lastBatterCardModifiers: {},
       lastPitcherCardModifiers: {},
+      lastRevealMathSnapshot: null,
       runnerMoves: [],
       pendingDebuffs: [],
       resolvedChoices: {},
@@ -1407,6 +1664,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       recentPitcherIds: [ab.pitcher.id],
       revealScript: [],
       pendingResolvedPhase: null,
+      revealUiUserSide: null,
       // `reset` is the legacy "play with random pools" path -- clear any
       // active draft so freshAtBat falls back to the global lists.
       draft: null,
@@ -1417,6 +1675,13 @@ export const useGameStore = create<GameState>((set, get) => ({
       // Tutorial state never survives a fresh game.
       tutorialActive: false,
       tutorialStepIndex: 0,
+      activeQuests: [],
+      questProgress: {},
+      completedQuests: [],
+      questCelebrationQueue: [],
+      questTick: 0,
+      questShakeRequestId: 0,
+      ...QUEST_REWARD_INITIAL,
     });
   },
 
@@ -1485,6 +1750,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       lastResolveLog: [],
       lastBatterCardModifiers: {},
       lastPitcherCardModifiers: {},
+      lastRevealMathSnapshot: null,
       runnerMoves: [],
       pendingDebuffs: [],
       resolvedChoices: {},
@@ -1495,6 +1761,14 @@ export const useGameStore = create<GameState>((set, get) => ({
       recentPitcherIds: [ab.pitcher.id],
       revealScript: [],
       pendingResolvedPhase: null,
+      revealUiUserSide: null,
+      activeQuests: [],
+      questProgress: {},
+      completedQuests: [],
+      questCelebrationQueue: [],
+      questTick: 0,
+      questShakeRequestId: 0,
+      ...QUEST_REWARD_INITIAL,
       // Player committed to a lane -- the start screen has done its job.
       showStartScreen: false,
       // Auction draft is never wrapped in a tutorial.
@@ -1503,7 +1777,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     });
   },
 
-  startQuickMatch: (team) => {
+  startQuickMatch: (team, questSlate) => {
     const s = get();
     const draft = buildQuickMatchDraft();
     // Same seeding as `completeDraft` -- batting team is determined by
@@ -1541,6 +1815,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       lastResolveLog: [],
       lastBatterCardModifiers: {},
       lastPitcherCardModifiers: {},
+      lastRevealMathSnapshot: null,
       runnerMoves: [],
       pendingDebuffs: [],
       resolvedChoices: {},
@@ -1551,6 +1826,11 @@ export const useGameStore = create<GameState>((set, get) => ({
       recentPitcherIds: [ab.pitcher.id],
       revealScript: [],
       pendingResolvedPhase: null,
+      revealUiUserSide: null,
+      ...(questSlate && questSlate.length === 3
+        ? questStateFromManualIds(questSlate)
+        : seedQuestState()),
+      questShakeRequestId: 0,
       showStartScreen: false,
       // Tutorial-cleared by default; the "Learn to Play" entry point
       // re-arms it via `startTutorial()` immediately after this call.
@@ -1657,6 +1937,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       lastResolveLog: [],
       lastBatterCardModifiers: {},
       lastPitcherCardModifiers: {},
+      lastRevealMathSnapshot: null,
       runnerMoves: [],
       pendingDebuffs: [],
       resolvedChoices: {},
@@ -1667,6 +1948,9 @@ export const useGameStore = create<GameState>((set, get) => ({
       recentPitcherIds: [ab.pitcher.id],
       revealScript: [],
       pendingResolvedPhase: null,
+      revealUiUserSide: null,
+      ...seedQuestState(),
+      questShakeRequestId: 0,
       // Draft state stays in place AFTER completion -- gameplay reads
       // `draft.roster` to pick the next batter/pitcher each at-bat. Cleared
       // by `reset` or replaced by the next `startDraft`.
@@ -1749,6 +2033,10 @@ function scoreHandFor(
     // legacy auto-connect (null = "any adjacent canConnect pair chains").
     affirmedSeams: side === getUserSide(s) ? s.affirmedSeams : null,
     opponentAffirmedSeams: side !== getUserSide(s) ? s.affirmedSeams : null,
+    questHitScaleBonus:
+      isBatting && s.questPendingBattingHitScale > 0
+        ? s.questPendingBattingHitScale
+        : undefined,
   };
   return scoreHand(hand, ctx);
 }
@@ -1827,6 +2115,15 @@ interface ComputedMatchup {
   batterCarryoverDelta: number;
   batterGuessDelta: number;
   batterIgnoresDebuffs: boolean;
+  /** Best-chain value sum for the pitcher's pill (head-to-head total). */
+  pitcherChainSum: number;
+  /**
+   * Batter-side pressure folded into the pitcher's pill: opponentModifier +
+   * pitcherCombinedDelta from the batter scoring pass.
+   */
+  pitcherBatterDelta: number;
+  /** Cross-at-bat carryover applied to the pitcher's pill. */
+  pitcherCarryoverDelta: number;
 }
 
 /**
@@ -2193,6 +2490,11 @@ function computeMatchup(
   // additional bonus is in play if they win.
   const batterDisplay = batterTotal;
 
+  const pitcherChainSum = pitcherResult.maxValue;
+  const pitcherBatterDelta =
+    batterResult.opponentModifier + batterResult.pitcherCombinedDelta;
+  const pitcherCarryoverDelta = pitcherDebuffDelta;
+
   return {
     batterTotal,
     pitcherTotal,
@@ -2206,6 +2508,9 @@ function computeMatchup(
     batterCarryoverDelta: effBatterDebuffDelta,
     batterGuessDelta: guessPitchBonus,
     batterIgnoresDebuffs,
+    pitcherChainSum,
+    pitcherBatterDelta,
+    pitcherCarryoverDelta,
   };
 }
 

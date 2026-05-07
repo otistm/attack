@@ -73,12 +73,20 @@ export const TUTORIAL_STEPS: readonly TutorialStep[] = [
     placement: 'bottom',
   },
   {
-    id: 'matchup',
-    title: 'The At-Bat',
+    id: 'game-mode',
+    title: 'Game Mode',
     body:
-      "On the left you'll see who's batting and who's pitching this round. You're playing the AWAY team, so you'll bat in the top of the inning and pitch in the bottom. The controls are identical in both seats.",
-    anchor: '[data-tutorial="matchup"]',
+      "On the left you'll see which lane you're playing -- Quick Match (random rosters, jump straight in) or Victory Mode (auction draft to build your team). The current at-bat batter and pitcher are shown on the left rail next to their player cards.",
+    anchor: '[data-tutorial="game-mode"]',
     placement: 'bottom',
+  },
+  {
+    id: 'quests',
+    title: 'Arcade Quests',
+    body:
+      "Each game gives you three quests on the left rail (common, rare, and legendary). The bar fills as you make progress—finish one for a big celebration and the reward printed on the card. Build your strategy around the goals that match how you want to play this game.",
+    anchor: '[data-tutorial="quests"]',
+    placement: 'right',
   },
   {
     id: 'field',

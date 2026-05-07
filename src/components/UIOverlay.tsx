@@ -2,11 +2,12 @@ import { CardGameOverlay } from './CardGameOverlay';
 import { CollectionScreen } from './CollectionScreen';
 import { PlayerChoiceModal } from './PlayerChoiceModal';
 import { InfoRevealOverlay } from './InfoRevealOverlay';
+import { QuestCompleteOverlay } from './QuestCompleteOverlay';
+import { ScreenShake } from './effects/ScreenShake';
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Layers, LogOut, RotateCcw, ChevronDown } from 'lucide-react';
-import { useGameStore, getUserSide, type Team } from '../lib/gameStore';
-import { teamPalette } from '../lib/teamColors';
+import { Layers, LogOut, RotateCcw, ChevronDown, Trophy, Zap } from 'lucide-react';
+import { useGameStore, getUserSide, type Team, type GameMode } from '../lib/gameStore';
 
 const SPLASH_DURATION_MS = 3000;
 
@@ -32,8 +33,6 @@ export function UIOverlay() {
   const awayScore = useGameStore((s) => s.awayScore);
   const outs = useGameStore((s) => s.outs);
   const phase = useGameStore((s) => s.phase);
-  const batter = useGameStore((s) => s.batter);
-  const pitcher = useGameStore((s) => s.pitcher);
   const bases = useGameStore((s) => s.bases);
   const userTeam = useGameStore((s) => s.userTeam);
   const startDraft = useGameStore((s) => s.startDraft);
@@ -51,6 +50,7 @@ export function UIOverlay() {
   const tutorialActive = useGameStore((s) => s.tutorialActive);
   const tutorialExit = useGameStore((s) => s.tutorialExit);
   const setShowStartScreen = useGameStore((s) => s.setShowStartScreen);
+  const questShakeRequestId = useGameStore((s) => s.questShakeRequestId);
 
   const phaseLabel: Record<typeof phase, string> = {
     drafting: 'Draft',
@@ -72,18 +72,22 @@ export function UIOverlay() {
   const battingTeam = half === 'top' ? 'AWAY' : 'HOME';
 
   return (
-    <div className="absolute inset-0 pointer-events-none flex flex-col justify-between overflow-hidden font-sans text-slate-100 z-20">
+    <ScreenShake
+      className="absolute inset-0 z-20"
+      requestId={questShakeRequestId}
+      magnitude={phase === 'game-over' ? 14 : 11}
+      duration={0.42}
+    >
+    <div className="absolute inset-0 pointer-events-none flex flex-col justify-between overflow-hidden font-sans text-slate-100">
 
       <header className="w-full grid grid-cols-[minmax(220px,1fr)_auto_minmax(220px,1fr)] items-stretch gap-4 px-6 py-3 bg-slate-900/85 border-b border-slate-700 backdrop-blur-sm pointer-events-auto shadow-md">
-        {/* Left: at-bat matchup */}
-        <div className="flex items-center" data-tutorial="matchup">
-          <Matchup
-            batterName={batter.name}
-            batterTeam={batter.team}
-            pitcherName={pitcher.name}
-            pitcherTeam={pitcher.team}
-            battingTeam={battingTeam}
-          />
+        {/* Left: game mode badge. Was previously the at-bat / pitcher
+            matchup nameplate; replaced because the batter and pitcher
+            identity is already carried by the left-rail PlayerHero panels
+            and the top-of-screen real estate is better spent labelling
+            which lane (Quick Match / Victory Mode) the player is in. */}
+        <div className="flex items-center" data-tutorial="game-mode">
+          <GameModeBadge gameMode={gameMode} />
         </div>
 
         {/* Center: scoreboard */}
@@ -177,6 +181,8 @@ export function UIOverlay() {
       {cardsReady && <InfoRevealOverlay />}
       {cardsReady && <InningTransitionBanner />}
     </div>
+    <QuestCompleteOverlay />
+    </ScreenShake>
   );
 }
 
@@ -214,6 +220,10 @@ function InningTransitionBanner() {
       return;
     }
     if (lastSig.current === sig) return;
+    // `lockIn` advances `half`/`inning` while `phase` is still `revealing`.
+    // Defer the banner until reveal completes so it does not overlap the
+    // scoring sequence or advance lastSig while the prior at-bat is on screen.
+    if (phase === 'revealing') return;
     lastSig.current = sig;
     if (phase === 'game-over') return;
     const ordinal = ordinalSuffix(inning);
@@ -461,90 +471,56 @@ function IntroSplash() {
   );
 }
 
-interface MatchupProps {
-  batterName: string;
-  batterTeam: string;
-  pitcherName: string;
-  pitcherTeam: string;
-  battingTeam: 'HOME' | 'AWAY';
-}
-
-function Matchup({ batterName, batterTeam, pitcherName, pitcherTeam, battingTeam }: MatchupProps) {
-  const batterColor = battingTeam === 'HOME' ? 'text-blue-300' : 'text-rose-300';
-  const pitcherColor = battingTeam === 'HOME' ? 'text-rose-300' : 'text-blue-300';
-  // 2-way matchups (Ohtani vs Ohtani): the two seats happen to be the same
-  // real player. Tag both cards so the player understands the pairing isn't
-  // a bug -- and so the immersive read ("Shohei vs Shohei") gets a wink.
-  const isTwoWay = batterName === pitcherName && batterTeam === pitcherTeam;
-  return (
-    <div className="flex items-stretch gap-3 text-[11px] uppercase tracking-wide">
-      <PlayerCard
-        role="At Bat"
-        name={batterName}
-        team={batterTeam}
-        color={batterColor}
-        twoWay={isTwoWay}
-      />
-      <div className="flex items-center text-slate-500 font-black text-xs">VS</div>
-      <PlayerCard
-        role="Pitching"
-        name={pitcherName}
-        team={pitcherTeam}
-        color={pitcherColor}
-        twoWay={isTwoWay}
-      />
-    </div>
-  );
-}
-
 /**
- * Compact field-view nameplate for the at-bat / pitching matchup. Same
- * visual language as the draft pool cards (team-color header band with a
- * circular team badge) so a player who left the draft as "Yankees navy +
- * grey" still reads as Yankees navy + grey when they step up to the plate.
- * Without this, every nameplate during gameplay was a uniform slate which
- * stripped the team identity the user had just spent the auction earning.
+ * Compact field-view badge that names the lane the player committed to on
+ * the StartGameScreen ("Victory Mode" for the auction draft, "Quick Match"
+ * for the random-roster lane). Replaces the previous batter / pitcher
+ * matchup nameplate that lived in the top-left of the header -- the
+ * batter and pitcher identity is already carried by the left-rail
+ * PlayerHero panels, so the header slot is repurposed to surface the
+ * mode the player is currently in.
+ *
+ * Visual language mirrors the StartGameScreen lane buttons: rose accent
+ * for Victory Mode (Trophy icon, matches the red lane), amber accent for
+ * Quick Match (Zap icon, matches the gold lane). When `gameMode` is
+ * `null` (initial boot before a lane is committed; legacy reset state)
+ * we fall back to a neutral "Match" label rather than rendering an empty
+ * badge, so the slot never collapses to whitespace mid-screen.
  */
-function PlayerCard({
-  role,
-  name,
-  team,
-  color,
-  twoWay = false,
-}: {
-  role: string;
-  name: string;
-  team: string;
-  color: string;
-  twoWay?: boolean;
-}) {
-  const tp = teamPalette(team);
+function GameModeBadge({ gameMode }: { gameMode: GameMode }) {
+  const config: { label: string; icon: React.ReactNode; accent: string; iconColor: string } =
+    gameMode === 'quick-match'
+      ? {
+          label: 'Quick Match',
+          icon: <Zap className="w-4 h-4" />,
+          accent: 'from-amber-500/90 to-amber-600/90',
+          iconColor: 'text-amber-300',
+        }
+      : gameMode === 'draft'
+      ? {
+          label: 'Victory Mode',
+          icon: <Trophy className="w-4 h-4" />,
+          accent: 'from-rose-600/90 to-rose-700/90',
+          iconColor: 'text-rose-300',
+        }
+      : {
+          label: 'Match',
+          icon: <Trophy className="w-4 h-4" />,
+          accent: 'from-slate-600/90 to-slate-700/90',
+          iconColor: 'text-slate-300',
+        };
+
   return (
-    <div className="relative flex flex-col bg-slate-800/70 border border-slate-700/80 rounded-md overflow-hidden min-w-[150px] shadow-[0_2px_6px_rgba(0,0,0,0.35)]">
-      <div
-        className="flex items-center gap-1.5 px-2 py-1 text-white"
-        style={{
-          background: `linear-gradient(110deg, ${tp.primary} 0%, ${tp.primary} 60%, ${tp.secondary} 100%)`,
-        }}
-      >
-        <span
-          className="w-5 h-5 rounded-full flex items-center justify-center text-[7px] font-black tracking-tight ring-1 ring-white/50 shrink-0 shadow-sm"
-          style={{ background: tp.secondary }}
-        >
-          {team}
-        </span>
+    <div className="relative flex flex-col bg-slate-800/70 border border-slate-700/80 rounded-md overflow-hidden min-w-[180px] shadow-[0_2px_6px_rgba(0,0,0,0.35)]">
+      <div className={`flex items-center gap-1.5 px-2 py-1 text-white bg-gradient-to-r ${config.accent}`}>
+        <span className={`shrink-0 ${config.iconColor}`}>{config.icon}</span>
         <span className="text-[8px] font-black uppercase tracking-[0.2em] opacity-90">
-          {role}
+          Game Mode
         </span>
-        {twoWay && (
-          <span className="ml-auto text-[7px] font-black text-amber-300 bg-amber-500/25 ring-1 ring-amber-300/60 rounded px-1 py-0.5 tracking-widest leading-none">
-            2-WAY
-          </span>
-        )}
       </div>
       <div className="px-3 py-1.5">
-        <div className={`font-black ${color} text-[13px] leading-tight truncate`}>
-          {name}
+        <div className="font-black text-white text-[13px] leading-tight truncate uppercase tracking-wide">
+          {config.label}
         </div>
       </div>
     </div>

@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
 import { OrthographicCamera } from '@react-three/drei';
 import * as THREE from 'three';
-import { getUserSide, useGameStore } from '../lib/gameStore';
+import { getUiUserSide, useGameStore } from '../lib/gameStore';
+import { QUEST_REGISTRY } from '../lib/quests';
 import {
   posesAlmostEqual,
   selectActivePose,
@@ -51,6 +52,36 @@ const POSE_HIT_PITCHING: CameraPose = {
   target: [0, 0, 5],
 };
 
+/** One-shot arcade punch-in while a quest celebration is showing (HUD overlay). */
+const POSE_QUEST_PUNCH_BAT: CameraPose = {
+  zoom: 9.45,
+  position: [0.46, 3.05, 29.1],
+  target: [0.46, -3.48, 8.67],
+};
+
+const POSE_QUEST_PUNCH_PITCH: CameraPose = {
+  zoom: 9.45,
+  position: [0.23, 0.35, -29.9],
+  target: [0.23, -14, -9.59],
+};
+
+function lerpPose(a: CameraPose, b: CameraPose, t: number): CameraPose {
+  const u = Math.max(0, Math.min(1, t));
+  return {
+    zoom: a.zoom + (b.zoom - a.zoom) * u,
+    position: [
+      a.position[0] + (b.position[0] - a.position[0]) * u,
+      a.position[1] + (b.position[1] - a.position[1]) * u,
+      a.position[2] + (b.position[2] - a.position[2]) * u,
+    ],
+    target: [
+      a.target[0] + (b.target[0] - a.target[0]) * u,
+      a.target[1] + (b.target[1] - a.target[1]) * u,
+      a.target[2] + (b.target[2] - a.target[2]) * u,
+    ],
+  };
+}
+
 /** Throttle live-sync writes from useFrame -> store to roughly this cadence. */
 const LIVE_SYNC_INTERVAL_MS = 80;
 
@@ -80,7 +111,9 @@ export function CameraRig() {
   // Which seat the user is in this half. Drives the default-pose flip:
   // batting -> behind home plate, pitching -> behind the mound. The lerp
   // animates smoothly when the half flip changes the seat.
-  const userSide = useGameStore(getUserSide);
+  const userSide = useGameStore(getUiUserSide);
+  const questCelebrationHead =
+    useGameStore((s) => s.questCelebrationQueue[0] ?? null) ?? null;
   // OrbitControls instance type. We intentionally peek beyond `target/update/
   // enabled` here because the camera-debug mode needs to temporarily relax the
   // orbit/zoom/distance/polar/azimuth limits so they don't fight the sliders.
@@ -106,10 +139,9 @@ export function CameraRig() {
   const lastAppliedTickRef = useRef(debugApplyTick);
   const lastLiveSyncRef = useRef(0);
   const lastIngestedRef = useRef<CameraPose>(debugPose);
-  // Snapshot of the OrbitControls limit fields captured the moment debug
-  // mode turns on, so we can faithfully restore Scene.tsx's gameplay limits
-  // when debug toggles back off.
   const savedOrbitLimitsRef = useRef<Partial<OrbitLike> | null>(null);
+  const lastQuestHeadRef = useRef<string | null>(null);
+  const questPunchStartRef = useRef(0);
 
   const targetPose = useMemo<CameraPose>(() => {
     const isHit = phase === 'between-at-bats' && lastOutcome && lastOutcome !== 'out';
@@ -240,15 +272,37 @@ export function CameraRig() {
     // Frame-rate-independent lerp factor.
     const k = 1 - Math.pow(0.001, delta);
 
-    cam.zoom += (targetPose.zoom - cam.zoom) * k;
-    cam.position.x += (targetPose.position[0] - cam.position.x) * k;
-    cam.position.y += (targetPose.position[1] - cam.position.y) * k;
-    cam.position.z += (targetPose.position[2] - cam.position.z) * k;
+    let lerpTarget = targetPose;
+    if (questCelebrationHead) {
+      if (questCelebrationHead !== lastQuestHeadRef.current) {
+        lastQuestHeadRef.current = questCelebrationHead;
+        questPunchStartRef.current = performance.now();
+      }
+      const rarity = QUEST_REGISTRY[questCelebrationHead]?.rarity ?? 'common';
+      const punchMs =
+        rarity === 'legendary' ? 920 : rarity === 'rare' ? 760 : 600;
+      const elapsed = performance.now() - questPunchStartRef.current;
+      if (elapsed < punchMs) {
+        const bell = Math.sin(Math.min(1, elapsed / punchMs) * Math.PI);
+        const punchPose =
+          userSide === 'Pitching' ? POSE_QUEST_PUNCH_PITCH : POSE_QUEST_PUNCH_BAT;
+        lerpTarget = lerpPose(targetPose, punchPose, bell * 0.88);
+      }
+    } else {
+      lastQuestHeadRef.current = null;
+    }
+
+    const kPunch = questCelebrationHead ? 1 - Math.pow(0.0002, delta) : k;
+
+    cam.zoom += (lerpTarget.zoom - cam.zoom) * kPunch;
+    cam.position.x += (lerpTarget.position[0] - cam.position.x) * kPunch;
+    cam.position.y += (lerpTarget.position[1] - cam.position.y) * kPunch;
+    cam.position.z += (lerpTarget.position[2] - cam.position.z) * kPunch;
     cam.updateProjectionMatrix();
 
-    targetRef.current.x += (targetPose.target[0] - targetRef.current.x) * k;
-    targetRef.current.y += (targetPose.target[1] - targetRef.current.y) * k;
-    targetRef.current.z += (targetPose.target[2] - targetRef.current.z) * k;
+    targetRef.current.x += (lerpTarget.target[0] - targetRef.current.x) * kPunch;
+    targetRef.current.y += (lerpTarget.target[1] - targetRef.current.y) * kPunch;
+    targetRef.current.z += (lerpTarget.target[2] - targetRef.current.z) * kPunch;
     cam.lookAt(targetRef.current);
 
     // Keep OrbitControls' target in sync so when it re-enables it doesn't snap.

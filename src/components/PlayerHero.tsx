@@ -255,10 +255,16 @@ export function PlayerHero({
         // `inline-block` lets the transform on a span actually paint --
         // inline elements ignore translate/scale, so without this the
         // entry slide-in never animates visibly.
+        //
+        // Font: intentionally left to inherit the Tailwind default sans
+        // stack so this readout matches the big number rendered on each
+        // playing card (CardGameOverlay's CardItem `displayValue`). When
+        // a card lands and the total ticks, the eye should read both
+        // digits as the same typographic family rather than the prior
+        // monospace/sans split.
         className="inline-block font-black tabular-nums leading-none select-none"
         style={{
           fontSize: 110,
-          fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
           letterSpacing: "-0.04em",
           color: "#ffffff",
           textShadow:
