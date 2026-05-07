@@ -1,6 +1,7 @@
 import { Trophy, Sparkles } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
-import { useState } from "react";
+import { useState, useLayoutEffect } from "react";
+import { createPortal } from "react-dom";
 import { useGameStore } from "../lib/gameStore";
 import {
   QUEST_REGISTRY,
@@ -35,6 +36,9 @@ const RARITY_PANEL: Record<QuestRarity, string> = {
     "border-fuchsia-500/50 from-fuchsia-950/85 via-slate-950/95 to-sky-950/85",
 };
 
+/** Same stacking as card ability tooltips — above modals and overflow clips. */
+const QUEST_FOCUS_Z = "z-[10000]";
+
 function SegmentBar({ ratio, pulse }: { ratio: number; pulse: boolean }) {
   const segs = 8;
   const lit = Math.round(ratio * segs);
@@ -58,6 +62,34 @@ export function QuestStrip() {
   const questTick = useGameStore((s) => s.questTick);
   const phase = useGameStore((s) => s.phase);
   const [focusedId, setFocusedId] = useState<string | null>(null);
+  const [focusAnchor, setFocusAnchor] = useState<{ left: number; top: number } | null>(
+    null,
+  );
+
+  useLayoutEffect(() => {
+    if (!focusedId) {
+      setFocusAnchor(null);
+      return;
+    }
+    const sync = () => {
+      const el = document.querySelector<HTMLElement>(
+        `[data-quest-focus-anchor="${focusedId}"]`,
+      );
+      if (!el) {
+        setFocusAnchor(null);
+        return;
+      }
+      const r = el.getBoundingClientRect();
+      setFocusAnchor({ left: r.right + 12, top: r.top });
+    };
+    sync();
+    window.addEventListener("scroll", sync, true);
+    window.addEventListener("resize", sync);
+    return () => {
+      window.removeEventListener("scroll", sync, true);
+      window.removeEventListener("resize", sync);
+    };
+  }, [focusedId, questTick]);
 
   if (
     activeQuests.length === 0 ||
@@ -86,15 +118,15 @@ export function QuestStrip() {
   const focusedP = focusedId ? questProgress[focusedId] : null;
 
   return (
+    <>
     <div
       data-tutorial="quests"
       className="pointer-events-none absolute left-4 md:left-8 top-1/2 -translate-y-1/2 z-20"
     >
       {/*
-       * Inner wrapper holds ONLY the strip cards. The focus overlay below
-       * is absolutely positioned so it can never resize this wrapper —
-       * which would otherwise re-center under `top-1/2 -translate-y-1/2`
-       * and slide the card out from under the cursor, breaking hover.
+       * Inner wrapper holds ONLY the strip cards. Quest detail panel is
+       * portaled to document.body (see createPortal below) so it stacks above
+       * overflow clips and stays aligned via data-quest-focus-anchor + layout.
        */}
       <div className="relative flex flex-col gap-2 w-[200px] max-w-[200px]">
       <div className="hidden xl:flex flex-col gap-2 w-[200px]">
@@ -108,6 +140,7 @@ export function QuestStrip() {
             <motion.button
               type="button"
               key={`${id}-${questTick}`}
+              data-quest-focus-anchor={id}
               onMouseEnter={() => setFocusedId(id)}
               onMouseLeave={() =>
                 setFocusedId((curr) => (curr === id ? null : curr))
@@ -160,6 +193,7 @@ export function QuestStrip() {
       {bestDef && bestP ? (
         <button
           type="button"
+          data-quest-focus-anchor={bestId}
           onMouseEnter={() => setFocusedId(bestId)}
           onMouseLeave={() =>
             setFocusedId((curr) => (curr === bestId ? null : curr))
@@ -211,26 +245,34 @@ export function QuestStrip() {
         </button>
       ) : null}
 
-      <AnimatePresence>
-        {focusedDef && focusedP ? (
-          <QuestFocusOverlay
-            key={focusedDef.id}
-            def={focusedDef}
-            progress={focusedP}
-          />
-        ) : null}
-      </AnimatePresence>
       </div>
     </div>
+    {typeof document !== "undefined" &&
+      createPortal(
+        <AnimatePresence>
+          {focusedDef && focusedP && focusAnchor ? (
+            <QuestFocusOverlay
+              key={focusedDef.id}
+              def={focusedDef}
+              progress={focusedP}
+              anchor={focusAnchor}
+            />
+          ) : null}
+        </AnimatePresence>,
+        document.body,
+      )}
+    </>
   );
 }
 
 function QuestFocusOverlay({
   def,
   progress,
+  anchor,
 }: {
   def: (typeof QUEST_REGISTRY)[string];
   progress: import("../lib/quests").QuestProgressState;
+  anchor: { left: number; top: number };
 }) {
   const ratio = questProgressRatio(def.id, progress);
   const detail = questProgressLabel(def.id, progress);
@@ -241,7 +283,8 @@ function QuestFocusOverlay({
     <motion.aside
       role="dialog"
       aria-label={`${def.title} details`}
-      className={`pointer-events-none absolute left-full top-0 ml-3 w-[260px] sm:w-[300px] rounded-lg border bg-gradient-to-br ${RARITY_PANEL[def.rarity]} shadow-2xl backdrop-blur-md px-3.5 py-3 text-left`}
+      className={`pointer-events-none fixed ${QUEST_FOCUS_Z} w-[260px] sm:w-[300px] rounded-lg border bg-gradient-to-br ${RARITY_PANEL[def.rarity]} shadow-2xl backdrop-blur-md px-3.5 py-3 text-left`}
+      style={{ left: anchor.left, top: anchor.top }}
       initial={{ opacity: 0, x: -8, scale: 0.97 }}
       animate={{
         opacity: 1,

@@ -5,7 +5,6 @@
 
 import { Scene } from './components/Scene';
 import { UIOverlay } from './components/UIOverlay';
-import { CameraDebugPanel } from './components/CameraDebugPanel';
 import { DraftScreen } from './components/DraftScreen';
 import { StartGameScreen } from './components/StartGameScreen';
 import { TutorialOverlay } from './components/TutorialOverlay';
@@ -31,8 +30,6 @@ export default function App() {
       {/* Learn-to-Play tutorial overlay. Self-gates on `tutorialActive`;
           we suppress it during a draft so it can't paint over the auction. */}
       {phase !== 'drafting' && <TutorialOverlay />}
-      {/* Dev-only camera tuning overlay. Tree-shaken in production builds. */}
-      {import.meta.env.DEV && <CameraDebugPanel />}
     </div>
   );
 }

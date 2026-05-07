@@ -1,4 +1,5 @@
 import { useMemo, useState, useCallback, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { Reorder, motion, AnimatePresence } from 'motion/react';
 import { CardDefinition } from '../lib/cards';
 import { canConnect, shapeModeForSide, seamKey } from '../lib/connect';
@@ -30,6 +31,9 @@ const REVEAL_DWELL_MS = 350;
 const REVEAL_BEAT_MS = 720;
 const REVEAL_TWEEN_MS = 520;
 const REVEAL_FINAL_PAUSE_MS = 520;
+
+/** Portaled hover UI: above modals (≈50–60), tutorial (45), and overflow clips. */
+const HOVER_LAYER_Z_CLASS = 'z-[10000]';
 
 const TEXT_COLORS: Record<string, string> = {
   'bg-blue-500': 'text-blue-500',
@@ -265,6 +269,7 @@ const CardItem = ({
   highlightTone,
   dragActive = false,
   tutorialRegions = false,
+  readOnly = false,
 }: {
   card: CardDefinition;
   isConnectedLeft: boolean;
@@ -303,6 +308,11 @@ const CardItem = ({
    * the Learn-to-Play overlay can spotlight them individually.
    */
   tutorialRegions?: boolean;
+  /**
+   * Selection-only hand: false. After lock-in / during reveal+result the strip
+   * is non-draggable but should still receive hover (ability tooltips).
+   */
+  readOnly?: boolean;
 }) => {
   // While the player is dragging, freeze ALL non-dragged cards' connection
   // state to "not connected" so we don't trigger margin shifts (8px <-> 0px),
@@ -419,24 +429,81 @@ const CardItem = ({
       ? { duration: 0.45, ease: 'easeOut' as const }
       : { duration: 0.35, ease: 'easeOut' as const };
 
-  return (
-    <motion.div
-      data-tutorial={tutorialRegions ? 'card-shapes' : undefined}
-      className={`
-        group relative ${sz.card} ${cardBgClass} border-2
-        flex flex-col items-center justify-center cursor-grab active:cursor-grabbing
-      `}
-      animate={revealAnimate ?? baseAnimate}
-      transition={revealAnimate ? revealTransition : baseTransition}
-      style={{
-        marginLeft: noMargin ? 0 : isConnectedLeft ? `${sz.connectedGap}px` : `${sz.gap}px`,
-        marginRight: noMargin ? 0 : isConnectedRight ? `${sz.connectedGap}px` : `${sz.gap}px`,
-      }}
-    >
+  const cardSurfaceRef = useRef<HTMLDivElement>(null);
+  const abilityHoverRef = useRef(false);
+  const abilityLeaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [abilityHoverOpen, setAbilityHoverOpen] = useState(false);
+  const [abilityAnchor, setAbilityAnchor] = useState<{ cx: number; top: number } | null>(null);
+
+  const clearAbilityLeaveTimer = useCallback(() => {
+    if (abilityLeaveTimerRef.current != null) {
+      clearTimeout(abilityLeaveTimerRef.current);
+      abilityLeaveTimerRef.current = null;
+    }
+  }, []);
+
+  const openAbilityHover = useCallback(() => {
+    clearAbilityLeaveTimer();
+    abilityHoverRef.current = true;
+    const el = cardSurfaceRef.current;
+    if (el) {
+      const r = el.getBoundingClientRect();
+      setAbilityAnchor({ cx: r.left + r.width / 2, top: r.top });
+    }
+    setAbilityHoverOpen(true);
+  }, [clearAbilityLeaveTimer]);
+
+  const scheduleCloseAbilityHover = useCallback(() => {
+    clearAbilityLeaveTimer();
+    abilityLeaveTimerRef.current = setTimeout(() => {
+      abilityHoverRef.current = false;
+      setAbilityHoverOpen(false);
+      setAbilityAnchor(null);
+      abilityLeaveTimerRef.current = null;
+    }, 120);
+  }, [clearAbilityLeaveTimer]);
+
+  useEffect(
+    () => () => {
+      clearAbilityLeaveTimer();
+    },
+    [clearAbilityLeaveTimer],
+  );
+
+  const syncAbilityAnchor = useCallback(() => {
+    const el = cardSurfaceRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setAbilityAnchor({ cx: r.left + r.width / 2, top: r.top });
+  }, []);
+
+  useEffect(() => {
+    if (!abilityHoverOpen) return;
+    const onScrollOrResize = () => syncAbilityAnchor();
+    window.addEventListener('scroll', onScrollOrResize, true);
+    window.addEventListener('resize', onScrollOrResize);
+    return () => {
+      window.removeEventListener('scroll', onScrollOrResize, true);
+      window.removeEventListener('resize', onScrollOrResize);
+    };
+  }, [abilityHoverOpen, syncAbilityAnchor]);
+
+  const abilityTooltip =
+    abilityHoverOpen &&
+    abilityAnchor &&
+    typeof document !== 'undefined' &&
+    createPortal(
       <div
         data-tutorial={tutorialRegions ? 'card-ability' : undefined}
-        className="pointer-events-none invisible absolute bottom-full left-1/2 z-[60] mb-1.5 w-64 max-w-[calc(100vw-1.25rem)] max-h-[min(85vh,32rem)] -translate-x-1/2 overflow-y-auto rounded-lg border border-slate-600 bg-slate-800 p-3 opacity-0 shadow-2xl transition-opacity duration-150 group-hover:visible group-hover:opacity-100 sm:w-72"
+        className={`pointer-events-auto fixed ${HOVER_LAYER_Z_CLASS} w-64 max-w-[calc(100vw-1.25rem)] max-h-[min(85vh,32rem)] overflow-y-auto rounded-lg border border-slate-600 bg-slate-800 p-3 shadow-2xl sm:w-72`}
+        style={{
+          left: abilityAnchor.cx,
+          top: abilityAnchor.top,
+          transform: 'translate(-50%, calc(-100% - 8px))',
+        }}
         role="tooltip"
+        onPointerEnter={openAbilityHover}
+        onPointerLeave={scheduleCloseAbilityHover}
       >
         <div className="mb-1.5 border-b border-slate-700 pb-1 text-[10px] font-black uppercase tracking-widest text-slate-500">
           Ability
@@ -457,8 +524,34 @@ const CardItem = ({
           </div>
         )}
         <div className="text-xs font-medium leading-snug text-slate-300">{card.description}</div>
-      </div>
-      <ShapeHalf
+      </div>,
+      document.body,
+    );
+
+  return (
+    <>
+      {abilityTooltip}
+      <motion.div
+        ref={cardSurfaceRef}
+        data-tutorial={tutorialRegions ? 'card-shapes' : undefined}
+        className={`
+        relative ${sz.card} ${cardBgClass} border-2
+        flex flex-col items-center justify-center
+        ${readOnly ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'}
+      `}
+        onPointerEnter={openAbilityHover}
+        onPointerLeave={scheduleCloseAbilityHover}
+        onPointerMove={() => {
+          if (abilityHoverRef.current) syncAbilityAnchor();
+        }}
+        animate={revealAnimate ?? baseAnimate}
+        transition={revealAnimate ? revealTransition : baseTransition}
+        style={{
+          marginLeft: noMargin ? 0 : isConnectedLeft ? `${sz.connectedGap}px` : `${sz.gap}px`,
+          marginRight: noMargin ? 0 : isConnectedRight ? `${sz.connectedGap}px` : `${sz.gap}px`,
+        }}
+      >
+        <ShapeHalf
         shape={card.leftShape}
         side="left"
         isConnected={isConnectedLeft}
@@ -514,6 +607,7 @@ const CardItem = ({
         {displayValue}
       </motion.div>
     </motion.div>
+    </>
   );
 };
 
@@ -2284,6 +2378,10 @@ interface HandStripProps {
   hand: CardDefinition[];
   onReorder: (cards: CardDefinition[]) => void;
   modifiers: Record<string, { value: number; color?: string }>;
+  /**
+   * When true: no reorder drag (reveal / result / game-over), but cards stay
+   * pointer-interactive so ability hover tooltips still work.
+   */
   disabled?: boolean;
   // Scopes per-card keys so the same general-pool card across two batters
   // doesn't carry over reorder state from the previous at-bat.
@@ -2437,7 +2535,6 @@ const HandStrip = ({
       values={hand}
       onReorder={onReorder}
       className="flex flex-row items-center justify-center list-none p-0 m-0"
-      style={{ pointerEvents: disabled ? 'none' : undefined }}
     >
       {/*
         Intentionally NO <AnimatePresence> here: cards in the batter hand are
@@ -2494,6 +2591,7 @@ const HandStrip = ({
               valueOverride={valueOverrides?.[card.id]}
               highlightTone={highlightTones?.[card.id]}
               dragActive={draggingId !== null}
+              lockReorder={disabled}
               hasPendingChoice={hasPendingChoice}
               isChoiceActive={
                 hasPendingChoice && activeChoiceCardId === card.id
@@ -2573,6 +2671,11 @@ interface HandCardProps {
    * card in the user's hand strip flips this flag.
    */
   tutorialRegions?: boolean;
+  /**
+   * Hand strip is read-only (reveal / result / game-over): disable reorder
+   * drag but keep hover so ability tooltips still work.
+   */
+  lockReorder?: boolean;
 }
 
 /**
@@ -2605,6 +2708,7 @@ const HandCard = ({
   isChoiceActive = false,
   onTriggerChoice,
   tutorialRegions = false,
+  lockReorder = false,
 }: HandCardProps) => {
   useEffect(() => {
     onEntryPlayed(card.id);
@@ -2646,6 +2750,7 @@ const HandCard = ({
       exit={exitConfig}
       transition={ITEM_LAYOUT_TRANSITION}
       dragTransition={ITEM_DRAG_TRANSITION}
+      drag={lockReorder ? false : true}
       onDragStart={handleDragStart}
       onDragEnd={onDragEnd}
     >
@@ -2661,6 +2766,7 @@ const HandCard = ({
         highlightTone={highlightTone}
         dragActive={dragActive}
         tutorialRegions={tutorialRegions}
+        readOnly={lockReorder}
       />
       {hasPendingChoice && onTriggerChoice && (
         <UseAbilityPill

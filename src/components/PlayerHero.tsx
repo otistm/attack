@@ -218,7 +218,7 @@ export function PlayerHero({
           scale: 1,
           boxShadow: "0 10px 22px rgba(0,0,0,0.5)",
         }}
-        className="relative rounded-lg overflow-hidden bg-slate-900"
+        className="relative overflow-hidden bg-slate-900"
         style={{
           width: 140,
           height: 196,
