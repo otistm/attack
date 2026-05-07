@@ -643,8 +643,9 @@ export const CardGameOverlay = () => {
   const isSelecting = phase === 'selecting';
   const isRevealing = phase === 'revealing';
   const isResolved = phase === 'between-at-bats' || phase === 'game-over';
-  /** Hide the opponent's score readout until the at-bat is settled (post-reveal). */
-  const hideOpponentTotals = !isResolved;
+  /** Opponent total stays hidden only while hands are still locked (selection). During
+   *  `revealing`, both pills follow the beat-by-beat orchestrator; after that, finals. */
+  const hideOpponentTotals = isSelecting;
 
   // Decide which per-card modifier set the strips render against. While the
   // player is selecting we want LIVE previews so the numbers update as cards
@@ -680,8 +681,9 @@ export const CardGameOverlay = () => {
     onComplete: completeReveal,
   });
 
-  // Batter/pitcher numbers used for pills: user's lane follows the reveal
-  // orchestrator; opponent numbers are only surfaced once `isResolved`.
+  // Batter/pitcher numbers used for pills: during `revealing`, both lanes follow
+  // the orchestrator; in `selecting` the matchup preview still computes both
+  // totals but the opponent readout is fogged via `hideOpponentTotals`.
   const batterDisplayValue = isResolved
     ? lastBatterScore
     : isRevealing
@@ -771,9 +773,9 @@ export const CardGameOverlay = () => {
         pitcherOverrides={reveal.pitcherValueOverrides}
       />
 
-      {/* Player hero rail: top slot = opponent (fog `?` until result), bottom = you
-          (live total always). Pairs with your hand at the bottom of the screen so
-          you always see YOUR number there whether you are batting or pitching. */}
+      {/* Player hero rail: top slot = opponent (fog `?` only during selection),
+          bottom = you (live total once that side has a committed layout). Pairs
+          with your hand at the bottom whether you bat or pitch. */}
       <div className="hidden md:block pointer-events-none absolute left-8 top-32 z-20">
         <PlayerHero
           player={userIsBatting ? pitcher : batter}
