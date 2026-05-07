@@ -17,6 +17,19 @@ export interface CombineConstraint {
   leftWildcard?: boolean;
   // Treat the right side as a wildcard for matching.
   rightWildcard?: boolean;
+  /**
+   * Hard floor on the chain length this card needs to score. When the card is
+   * scored as part of a chain shorter than `requireChainLength`, the scoring
+   * engine zeros BOTH the card's baseValue and its registered effect for the
+   * round (functionally identical to `disabled`, but conditional on chain
+   * structure rather than a hand-transform kill switch).
+   *
+   * Chains here count cards mechanically AND user-affirmed-connected (the
+   * same group the scoring engine builds), so a card with `requireChainLength: 4`
+   * sitting in a chain of 3 contributes 0 even if the player intended otherwise.
+   * Pure data: the constraint is enforced in `scoring.ts` (see `scoreGroup`).
+   */
+  requireChainLength?: number;
 }
 
 export interface CardDefinition {
@@ -1985,5 +1998,261 @@ export const ALL_CARDS: CardDefinition[] = [
     "color": "bg-emerald-500",
     "tags": ["speedster", "lefty"],
     "handedness": "L"
+  },
+
+  // ============================================================================
+  // Phase A puzzle-card expansion (b-81..b-88, p-95, p-96).
+  //
+  // Three directions cover patterns inside the chain (palindrome, sandwich,
+  // alternation, ordered run), hard chain-length floors, and lineup-slot
+  // effects. All are GENERAL DRAW cards so they live in the per-round deal
+  // pool rather than being attached to a specific player. Effects in
+  // src/lib/cardEffects.ts; the requireChainLength enforcement is in
+  // src/lib/scoring.ts (scoreGroup).
+  //
+  // Why these IDs: b-81..b-90 was deliberately reserved when the Phase 7
+  // batter expansion jumped to b-100, and p-95..p-99 was unused after the
+  // p-91..p-94 game-state batch. Both windows are still wide enough for the
+  // remaining puzzle directions if/when they ship.
+  // ============================================================================
+
+  // ---- Direction 1: pattern-aware effects ----
+  {
+    "id": "b-81",
+    "name": "Sandwich Single",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "square",
+    "description": "If sandwiched between two DIAMOND-carrying neighbors in your chain, +6 Value.",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-82",
+    "name": "Three-Pitch Sequence",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "circle",
+    "rightShape": "square",
+    "description": "If your chain reads SQUARE \u2192 DIAMOND \u2192 CIRCLE in order, +6 Value.",
+    "color": "bg-amber-500"
+  },
+
+  // ---- Direction 2: long-chain tiers ----
+  {
+    "id": "b-83",
+    "name": "Triple Threat",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 3,
+    "leftShape": "diamond",
+    "rightShape": "square",
+    "description": "+8 Value if you're in a chain of 3 or more cards.",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-84",
+    "name": "Five-Tool Run",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "Scores 0 unless in a 4-card chain. If your chain has 4+ cards, +8 Value.",
+    "color": "bg-amber-500",
+    "combineConstraint": { "requireChainLength": 4 }
+  },
+  {
+    "id": "b-85",
+    "name": "Cleanup Stacker",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "+1 Value for each card to your right in the same chain.",
+    "color": "bg-amber-500"
+  },
+
+  // ---- Direction 4: lineup-position effects ----
+  {
+    "id": "b-86",
+    "name": "Leadoff Spark",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "star",
+    "rightShape": "circle",
+    "description": "+5 Value as the leftmost card in your lineup.",
+    "color": "bg-amber-500",
+    "tags": ["speedster"]
+  },
+  {
+    "id": "b-87",
+    "name": "Cleanup Crew",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "+5 Value as the 4th card in your lineup.",
+    "color": "bg-amber-500",
+    "tags": ["power-hitter"]
+  },
+  {
+    "id": "b-88",
+    "name": "Anchor",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "diamond",
+    "rightShape": "star",
+    "description": "+3 Value when uncombined and in the rightmost slot of your lineup.",
+    "color": "bg-amber-500",
+    "tags": ["veteran"]
+  },
+
+  // ---- Direction 1: pattern-aware effects (pitcher side) ----
+  {
+    "id": "p-95",
+    "name": "Mirror Image",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "circle",
+    "rightShape": "circle",
+    "description": "If your chain reads as a shape palindrome, +5 Value and subtract 3 from the Batter's score.",
+    "color": "bg-violet-500"
+  },
+  {
+    "id": "p-96",
+    "name": "Alternating Heat",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 3,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "+2 Value for each SQUARE\u2194DIAMOND alternation in your chain.",
+    "color": "bg-violet-500",
+    "tags": ["fastball"]
   }
 ];
+
+// ============================================================================
+// Per-session shape randomization
+//
+// `ALL_CARDS` above is the CANONICAL definition of every card -- used by the
+// engine tests (`__effects_check.ts`, `__connect_check.ts`, `__copy_check.ts`,
+// `__patterns_check.ts`) and by anything else that needs a stable, replayable
+// reference. The actual game runs on `SESSION_CARDS`: a one-shot per-page-load
+// remix of every card's `leftShape` / `rightShape`, so each play session has
+// a fresh "deck layout". Combine constraints, tags, abilities, descriptions,
+// and base values are all preserved -- only the literal shapes on each side
+// are re-rolled.
+//
+// Preserved as-is:
+//   - "none" / "wildcard" shape literals. `none` is a structural flag (p-79
+//     Intentional Walk relies on it) and `wildcard` is itself a design
+//     statement (b-10 Electric Speed wants both sides to be free combiners).
+//     Re-rolling those would silently change card identity in ways players
+//     would notice.
+//   - Every other CardDefinition field. Constraints like `allowedShapes`,
+//     `leftWildcard`, `rightWildcard`, `noCombine`, `leftNoCombine`,
+//     `rightNoCombine`, and `requireChainLength` keep their semantics; the
+//     "picky" / "blocked" / "wildcard-via-flag" indicators still render as
+//     before because the constraint and the side-shape are independent
+//     concerns.
+//
+// The session seed is derived from `Math.random()` at module load and logged
+// to the console so a player who hits a weird-looking deck can report or
+// replay it. `randomizeCardShapes(cards, seed)` is exported so tests can pin
+// a fixed seed for deterministic shape assertions when needed.
+// ============================================================================
+
+const RANDOMIZABLE_SHAPES: ShapeType[] = ["square", "diamond", "circle", "star"];
+
+function isRandomizableShape(s: ShapeType): boolean {
+  return s !== "none" && s !== "wildcard";
+}
+
+/**
+ * Mulberry32-style seeded PRNG. Local copy so cards.ts has no runtime
+ * dependency on players.ts / draft.ts (both define their own copies, but
+ * pulling from one of those would create an awkward import cycle).
+ */
+function makeShapeRng(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Return a new array of cards with randomized leftShape / rightShape values.
+ * Cards are deep-copied at the top level (each entry is a fresh object) so
+ * mutating one card -- e.g. hand-transforms splicing on `disabled` -- never
+ * leaks back into the canonical `ALL_CARDS`. Nested objects (e.g.
+ * `combineConstraint`) are shared by reference because they are treated as
+ * immutable by the engine.
+ *
+ * `seed` is required so callers can opt into deterministic remix sets (tests,
+ * "replay this session" features, etc.). Pass `Math.floor(Math.random() *
+ * 0x7fffffff)` for a fresh deck.
+ */
+export function randomizeCardShapes(
+  cards: readonly CardDefinition[],
+  seed: number,
+): CardDefinition[] {
+  const rng = makeShapeRng(seed);
+  const pick = (): ShapeType =>
+    RANDOMIZABLE_SHAPES[Math.floor(rng() * RANDOMIZABLE_SHAPES.length)];
+  return cards.map((c) => ({
+    ...c,
+    leftShape: isRandomizableShape(c.leftShape) ? pick() : c.leftShape,
+    rightShape: isRandomizableShape(c.rightShape) ? pick() : c.rightShape,
+  }));
+}
+
+/**
+ * Per-session seed. Stable across the lifetime of this module (one play
+ * session) and logged to the console so issues can be reported with a
+ * reproducer. New page load = new seed = new shape layout.
+ */
+export const SESSION_SEED: number = Math.floor(Math.random() * 0x7fffffff);
+
+if (typeof console !== "undefined") {
+  console.info(`[dugout] session seed = ${SESSION_SEED}`);
+}
+
+/**
+ * The card array the GAME uses. Identical to `ALL_CARDS` in every field
+ * except `leftShape` / `rightShape`, which are re-rolled per session via
+ * `randomizeCardShapes`. Tests should keep using `ALL_CARDS` -- it's the
+ * canonical reference -- but every gameplay-facing path (dealing hands,
+ * drafting, draft visualization, collection screen, pending-choice modal)
+ * reads from this one so the player sees one consistent shape layout for
+ * the whole session.
+ */
+export const SESSION_CARDS: CardDefinition[] = randomizeCardShapes(
+  ALL_CARDS,
+  SESSION_SEED,
+);
+
+const SESSION_CARDS_BY_ID: Record<string, CardDefinition> = {};
+for (const c of SESSION_CARDS) SESSION_CARDS_BY_ID[c.id] = c;
+
+/**
+ * Lookup helper that mirrors `Array.find` against `SESSION_CARDS` but in O(1).
+ * Returns `undefined` for unknown ids -- callers that hold a known-good id
+ * (e.g. dealHand resolving signatureCardIds) typically assert non-null at
+ * the call site since a missing id is a data-integrity bug.
+ */
+export function sessionCardById(id: string): CardDefinition | undefined {
+  return SESSION_CARDS_BY_ID[id];
+}

@@ -1,4 +1,4 @@
-import { ALL_CARDS, CardDefinition, Handedness } from "./cards";
+import { CardDefinition, Handedness, SESSION_CARDS } from "./cards";
 
 export interface MlbPlayer {
   id: string;
@@ -51,8 +51,12 @@ export const PLAYERS: MlbPlayer[] = [
 export const BATTERS = PLAYERS.filter((p) => p.role === "Batter");
 export const PITCHERS = PLAYERS.filter((p) => p.role === "Pitcher");
 
+// Sourced from SESSION_CARDS so dealt hands carry the per-session
+// shape layout. Card IDs / abilityType / tags / baseValue are identical to
+// ALL_CARDS; only leftShape / rightShape differ (see `randomizeCardShapes`
+// in cards.ts).
 const cardsById: Record<string, CardDefinition> = {};
-for (const c of ALL_CARDS) cardsById[c.id] = c;
+for (const c of SESSION_CARDS) cardsById[c.id] = c;
 
 // Module-load assertion: every player's signatureCardIds must resolve to a
 // real CardDefinition. Previously a typo'd id silently dropped via
@@ -65,7 +69,7 @@ for (const p of PLAYERS) {
   for (const id of p.signatureCardIds) {
     if (!cardsById[id]) {
       throw new Error(
-        `players.ts: ${p.id} (${p.name}) references signatureCardId "${id}" which does not exist in ALL_CARDS.`,
+        `players.ts: ${p.id} (${p.name}) references signatureCardId "${id}" which does not exist in SESSION_CARDS.`,
       );
     }
   }
@@ -76,8 +80,8 @@ for (const p of PLAYERS) {
   }
 }
 
-const GENERAL_BATTING = ALL_CARDS.filter((c) => c.type === "Batting" && c.abilityType === "General Draw");
-const GENERAL_PITCHING = ALL_CARDS.filter((c) => c.type === "Pitching" && c.abilityType === "General Draw");
+const GENERAL_BATTING = SESSION_CARDS.filter((c) => c.type === "Batting" && c.abilityType === "General Draw");
+const GENERAL_PITCHING = SESSION_CARDS.filter((c) => c.type === "Pitching" && c.abilityType === "General Draw");
 
 /** Expected hand size for a fresh at-bat. */
 const EXPECTED_HAND_SIZE = 5;

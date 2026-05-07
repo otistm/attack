@@ -997,6 +997,109 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-135 Stolen Bag: extra runner placed in resolveStep. Per-card hook
   // stays a no-op.
   "b-135": () => NOOP,
+
+  // ============ Phase A puzzle-card expansion (b-81..b-88, p-95, p-96) ============
+  //
+  // Cards are GENERAL DRAW so they hit the dealer pool without needing player
+  // attribution; their data and copy live alongside the existing generals at
+  // the bottom of `cards.ts`. See the helpers in this file (chainShapeReading,
+  // hasABA, isPalindromeShapes, alternates, countAlternations, containsSequence,
+  // runOfShape, indexInHand) and the `requireChainLength` enforcement in
+  // scoring.ts (scoreGroup) for the supporting machinery.
+
+  // ---- Direction 1: pattern-aware effects ----
+
+  // b-81 Sandwich Single: +6 if combined AND both immediate neighbors in the
+  // chain carry a DIAMOND on either side. Mirrors "I sit between two diamonds"
+  // by reading the LITERAL neighbor shapes (not the dedup chain) so the card
+  // can clearly point at "the cards next to me", not a global pattern check.
+  "b-81": (ctx) => {
+    if (!ctx.isCombined) return NOOP;
+    const neighbors = neighborsInGroup(ctx);
+    if (neighbors.length < 2) return NOOP;
+    const allDiamond = neighbors.every(
+      (n) => n.leftShape === "diamond" || n.rightShape === "diamond",
+    );
+    return allDiamond ? r({ selfValueDelta: 6 }) : NOOP;
+  },
+
+  // b-82 Three-Pitch Sequence: +6 if the chain dedup-shape sequence reads
+  // SQUARE -> DIAMOND -> CIRCLE in order somewhere. Pattern check is
+  // contiguous on the dedup sequence, so any chain that "moves through"
+  // those three shapes in that order qualifies.
+  "b-82": (ctx) =>
+    containsSequence(ctx.group, ["square", "diamond", "circle"])
+      ? r({ selfValueDelta: 6 })
+      : NOOP,
+
+  // ---- Direction 2: long-chain tiers ----
+
+  // b-83 Triple Threat: +8 once the chain reaches 3+ cards. Pure structural
+  // gate -- doesn't care about shape composition, just length.
+  "b-83": (ctx) => (ctx.group.length >= 3 ? r({ selfValueDelta: 8 }) : NOOP),
+
+  // b-84 Five-Tool Run: pairs with `requireChainLength: 4` so the card scores
+  // 0 in chains shorter than 4 (enforced in scoring.ts). When the floor is
+  // satisfied, this effect tacks +8 on top of the baseValue for a clean +12
+  // payout. The ctx.group.length check is redundant given the constraint
+  // gate but keeps the hook self-consistent if requireChainLength is ever
+  // edited away in card data.
+  "b-84": (ctx) => (ctx.group.length >= 4 ? r({ selfValueDelta: 8 }) : NOOP),
+
+  // b-85 Cleanup Stacker: +1 per card to your right inside the same chain.
+  // Reads `indexInGroup` (NOT `indexInHand`) -- only counts cards that
+  // actually CHAIN to this one, so a long unchained tail doesn't pay out.
+  "b-85": (ctx) => {
+    const rightCount = ctx.group.length - 1 - ctx.indexInGroup;
+    return rightCount > 0 ? r({ selfValueDelta: rightCount }) : NOOP;
+  },
+
+  // ---- Direction 4: lineup-position effects ----
+
+  // b-86 Leadoff Spark: +5 when in slot 0 of the LINEUP (ctx.hand), regardless
+  // of whether it's combined or not. Encourages the player to lead with this
+  // card; pairing with a chain bonus is just gravy.
+  "b-86": (ctx) => {
+    const card = ctx.group[ctx.indexInGroup];
+    return indexInHand(card, ctx.hand) === 0 ? r({ selfValueDelta: 5 }) : NOOP;
+  },
+
+  // b-87 Cleanup Crew: +5 when in slot 3 (the 4th card) of the LINEUP. Slot
+  // is fixed regardless of how the chain assembles around it. Lineups
+  // shorter than 4 cards (rare in normal play) silently skip the bonus.
+  "b-87": (ctx) => {
+    const card = ctx.group[ctx.indexInGroup];
+    return indexInHand(card, ctx.hand) === 3 ? r({ selfValueDelta: 5 }) : NOOP;
+  },
+
+  // b-88 Anchor: +3 when uncombined AND in the rightmost slot of the lineup.
+  // Pairs the position check with an explicit !isCombined gate so a stray
+  // chain reaching the right edge of the lineup doesn't trigger it.
+  "b-88": (ctx) => {
+    if (ctx.isCombined) return NOOP;
+    const card = ctx.group[ctx.indexInGroup];
+    const idx = indexInHand(card, ctx.hand);
+    return idx === ctx.hand.length - 1 ? r({ selfValueDelta: 3 }) : NOOP;
+  },
+
+  // ---- Direction 1 (continued): pattern-aware effects on the pitcher side ----
+
+  // p-95 Mirror Image: +5 self AND -3 opponent when the chain dedup-shape
+  // sequence is a palindrome. Even a solo p-95 chain qualifies (the dedup
+  // collapses [c,c] to [c], a trivial palindrome) -- the card carries
+  // circle/circle so it self-rewards on a clean uncombined draw too.
+  "p-95": (ctx) =>
+    isPalindromeShapes(ctx.group)
+      ? r({ selfValueDelta: 5, opponentValueDelta: -3 })
+      : NOOP,
+
+  // p-96 Alternating Heat: +2 per SQUARE<->DIAMOND alternation in the chain
+  // dedup sequence. Counts EVERY a<->b flip, so longer alternating runs
+  // scale linearly (a perfect [s,d,s,d,s] reads 4 alternations -> +8).
+  "p-96": (ctx) => {
+    const flips = countAlternations(ctx.group, "square", "diamond");
+    return flips > 0 ? r({ selfValueDelta: flips * 2 }) : NOOP;
+  },
 };
 
 export function applyCardEffect(card: CardDefinition, ctx: EffectContext): EffectResult {
@@ -1112,10 +1215,14 @@ function buildGroupsFor(
 
 /**
  * Highest-baseValue card. Tie-breaker: lexicographically smallest id so
- * reordering the hand doesn't change which card "wins" the tie -- mirrors
- * the rule in gameStore / scoring.
+ * reordering the hand doesn't change which card "wins" the tie.
+ *
+ * Single source of truth for the rule -- gameStore and scoring both import
+ * this so the "highest card" any silence/buff targets stays consistent
+ * across the engine. Previously each module had its own copy of the same
+ * reduce loop and it was easy for them to drift.
  */
-function highestValueCard(cards: CardDefinition[]): CardDefinition | undefined {
+export function highestValueCard(cards: CardDefinition[]): CardDefinition | undefined {
   if (cards.length === 0) return undefined;
   return cards.reduce((a, b) => {
     if (b.baseValue > a.baseValue) return b;
@@ -1215,5 +1322,159 @@ function neighborsInGroup(ctx: EffectContext): CardDefinition[] {
   if (left) out.push(left);
   if (right) out.push(right);
   return out;
+}
+
+// ============ Phase A pattern / position helpers ============
+// These helpers read structural properties of a chain (palindrome, ABA
+// sandwich, alternation, ordered sequence, run-length) or a card's
+// position in the WHOLE hand (vs. its group). They power the "puzzle card"
+// expansion (Sandwich Single, Mirror Image, Alternating Heat, Three-Pitch
+// Sequence, Triple Threat, Five-Tool Run, Cleanup Stacker, Leadoff Spark,
+// Cleanup Crew, Anchor) without changing scoring math -- each card's effect
+// just reads one of these and emits the standard EffectResult deltas.
+
+/**
+ * Walk the chain left-to-right, concatenating each card's [leftShape,
+ * rightShape], then collapse consecutive duplicates. The resulting sequence
+ * is what a player "reads" off the chain by colour/shape, with seam-matched
+ * shapes counted once.
+ *
+ * Examples:
+ *   [s/d, d/s]              -> [s, d, s]
+ *   [s/c, c/c, c/s]         -> [s, c, s]    (Mirror Image palindrome)
+ *   [star/sq, sq/d, d/c]    -> [star, sq, d, c]
+ *
+ * Shapes are kept literal (`wildcard`, `none` are treated as their own
+ * tokens). Cards using `*Wildcard` constraint flags do NOT have their literal
+ * leftShape/rightShape rewritten -- the helpers operate on the raw shape data
+ * so a card displayed as wildcard via constraint still reads as its underlying
+ * shape here. Card data should match what the player sees on the card face.
+ */
+export function chainShapeReading(group: CardDefinition[]): ShapeType[] {
+  const all: ShapeType[] = [];
+  for (const c of group) {
+    all.push(c.leftShape, c.rightShape);
+  }
+  const out: ShapeType[] = [];
+  for (const s of all) {
+    if (out.length === 0 || out[out.length - 1] !== s) out.push(s);
+  }
+  return out;
+}
+
+/**
+ * True when the chain reads the same forwards and backwards by the dedup
+ * shape sequence above. Single-card chains are trivially palindromes.
+ * Empty chains return false (defensive — `scoreGroup` never invokes effects
+ * on empty groups, but callers should not get a false-positive on no data).
+ */
+export function isPalindromeShapes(group: CardDefinition[]): boolean {
+  if (group.length === 0) return false;
+  const seq = chainShapeReading(group);
+  for (let i = 0, j = seq.length - 1; i < j; i++, j--) {
+    if (seq[i] !== seq[j]) return false;
+  }
+  return true;
+}
+
+/**
+ * True when somewhere in the chain dedup sequence the shape `a` sandwiches
+ * the shape `b`, i.e. the contiguous triple `[a, b, a]` appears. Useful for
+ * "I sit between two X" checks where the card data carries the b in the
+ * middle. Also handy for non-self structural reads (any A-B-A anywhere).
+ */
+export function hasABA(group: CardDefinition[], a: ShapeType, b: ShapeType): boolean {
+  const seq = chainShapeReading(group);
+  for (let i = 0; i + 2 < seq.length; i++) {
+    if (seq[i] === a && seq[i + 1] === b && seq[i + 2] === a) return true;
+  }
+  return false;
+}
+
+/**
+ * True when the chain dedup sequence is strictly an alternation of `a` and
+ * `b` (either `a-b-a-b...` or `b-a-b-a...`) using ONLY those two shapes.
+ * Single-shape sequences return false (no alternation present). Sequences
+ * containing any third shape return false.
+ */
+export function alternates(group: CardDefinition[], a: ShapeType, b: ShapeType): boolean {
+  const seq = chainShapeReading(group);
+  if (seq.length < 2) return false;
+  if (a === b) return false;
+  for (let i = 0; i < seq.length; i++) {
+    if (seq[i] !== a && seq[i] !== b) return false;
+    if (i > 0 && seq[i] === seq[i - 1]) return false;
+  }
+  return true;
+}
+
+/**
+ * Count the number of `a<->b` flips in the chain dedup sequence. A run of
+ * `[a, b, a, b]` returns 3. Pairs that don't involve both `a` and `b` are
+ * ignored, so a sequence like `[a, b, c, a]` returns 1 (only the first
+ * a->b flip counts). Used by Alternating Heat to scale its bonus with how
+ * "fastball-y" the chain reads.
+ */
+export function countAlternations(group: CardDefinition[], a: ShapeType, b: ShapeType): number {
+  if (a === b) return 0;
+  const seq = chainShapeReading(group);
+  let n = 0;
+  for (let i = 1; i < seq.length; i++) {
+    const prev = seq[i - 1];
+    const curr = seq[i];
+    if ((prev === a && curr === b) || (prev === b && curr === a)) n++;
+  }
+  return n;
+}
+
+/**
+ * True when the dedup chain shape sequence contains `pattern` as a
+ * CONTIGUOUS run somewhere. Empty patterns return true (vacuously). Patterns
+ * longer than the chain return false. Used by Three-Pitch Sequence (S->D->C).
+ */
+export function containsSequence(group: CardDefinition[], pattern: ShapeType[]): boolean {
+  if (pattern.length === 0) return true;
+  const seq = chainShapeReading(group);
+  if (pattern.length > seq.length) return false;
+  for (let i = 0; i + pattern.length <= seq.length; i++) {
+    let match = true;
+    for (let k = 0; k < pattern.length; k++) {
+      if (seq[i + k] !== pattern[k]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+/**
+ * True when the chain has at least `n` consecutive cards each "touching"
+ * `shape` (leftShape === shape OR rightShape === shape). Card-level (not
+ * dedup-shape-level) so a square/square card counts as a single touch, not
+ * two. Used for "run of pitches" style cards.
+ */
+export function runOfShape(group: CardDefinition[], shape: ShapeType, n: number): boolean {
+  if (n <= 0) return true;
+  let cur = 0;
+  for (const c of group) {
+    if (c.leftShape === shape || c.rightShape === shape) {
+      cur++;
+      if (cur >= n) return true;
+    } else {
+      cur = 0;
+    }
+  }
+  return false;
+}
+
+/**
+ * Position of `card` in the WHOLE hand (the lineup), not the group. Returns
+ * -1 if not found. Position-aware effects (Leadoff Spark, Cleanup Crew,
+ * Anchor) use this to key off the lineup slot instead of the chain slot.
+ */
+export function indexInHand(card: CardDefinition, hand: CardDefinition[]): number {
+  return hand.findIndex((c) => c.id === card.id);
 }
 

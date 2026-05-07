@@ -1,7 +1,7 @@
 import { CardDefinition, TagLiteral } from "./cards";
 import { ShapeType } from "../components/cardShapes";
 import { canConnect, seamKey } from "./connect";
-import { applyCardEffect, applyOpponentTotalAdjustments, EffectContext, EffectResult } from "./cardEffects";
+import { applyCardEffect, applyOpponentTotalAdjustments, EffectContext, EffectResult, highestValueCard } from "./cardEffects";
 
 export interface ScoringContext {
   // Whose hand is being scored ('Batting' or 'Pitching').
@@ -114,20 +114,6 @@ export interface ScoringContext {
 export function batterTeamRunsThisGame(ctx: ScoringContext): number {
   if (ctx.half === "bottom") return ctx.homeScore ?? 0;
   return ctx.awayScore ?? 0;
-}
-
-/**
- * Local helper: highest-baseValue card (or undefined for empty hand).
- * Tie-breaker: lexicographically smallest card id, so reordering the hand
- * doesn't change which card "wins" the tie.
- */
-function highestValueCard(cards: CardDefinition[]): CardDefinition | undefined {
-  if (cards.length === 0) return undefined;
-  return cards.reduce((a, b) => {
-    if (b.baseValue > a.baseValue) return b;
-    if (b.baseValue === a.baseValue && b.id < a.id) return b;
-    return a;
-  });
 }
 
 /**
@@ -444,15 +430,25 @@ function scoreGroup(group: CardDefinition[], ctx: ScoringContext, hand: CardDefi
     const tagSilenced =
       (ctx.nullifyOpponentTagMechanics?.length ?? 0) > 0 &&
       (card.tags?.some((t) => ctx.nullifyOpponentTagMechanics!.includes(t)) ?? false);
+    // requireChainLength is a per-card hard floor: when the card sits in a
+    // chain shorter than its required length, both its baseValue and its
+    // effect zero out for the round. Treated identically to `disabled` from
+    // the engine's POV (NOOP effect, zero contribution to totalValue).
+    const chainLengthRequirement = card.combineConstraint?.requireChainLength;
+    const chainTooShort =
+      typeof chainLengthRequirement === "number" &&
+      group.length < chainLengthRequirement;
     const isNullified =
       (ctx.nullifiedCardIds?.has(card.id) ?? false) ||
       card.disabled === true ||
       baseSilenced ||
-      tagSilenced;
+      tagSilenced ||
+      chainTooShort;
     const effect: EffectResult = isNullified
       ? { selfValueDelta: 0, opponentValueDelta: 0, hitScaleBonus: 0, pitcherCombinedDelta: 0 }
       : applyCardEffect(card, effectCtx);
-    const finalValue = card.baseValue + effect.selfValueDelta;
+    // chainTooShort zeros the baseValue too (mirrors `disabled` semantics).
+    const finalValue = chainTooShort ? 0 : card.baseValue + effect.selfValueDelta;
     let highlightColor: string | undefined;
     if (effect.selfValueDelta > 0) highlightColor = card.color;
     else if (effect.selfValueDelta < 0) highlightColor = DEBUFF_HIGHLIGHT;

@@ -1,4 +1,4 @@
-import { ALL_CARDS, CardDefinition } from '../lib/cards';
+import { CardDefinition, SESSION_CARDS } from '../lib/cards';
 import { BATTERS, PITCHERS, MlbPlayer } from '../lib/players';
 import { ShapeHalf } from './CardGameOverlay';
 import { motion, AnimatePresence } from 'motion/react';
@@ -81,7 +81,7 @@ export const CollectionScreen = ({ onClose }: { onClose: () => void }) => {
     [selectedPlayerId],
   );
 
-  const filteredCards = ALL_CARDS.filter(c => {
+  const filteredCards = SESSION_CARDS.filter(c => {
     if (filter !== 'All' && c.type !== filter) return false;
     if (selectedPlayer && !selectedPlayer.signatureCardIds.includes(c.id)) return false;
     if (search && !c.name.toLowerCase().includes(search.toLowerCase()) && !c.abilityType.toLowerCase().includes(search.toLowerCase())) return false;

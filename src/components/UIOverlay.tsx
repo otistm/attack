@@ -37,6 +37,13 @@ export function UIOverlay() {
   const bases = useGameStore((s) => s.bases);
   const userTeam = useGameStore((s) => s.userTeam);
   const startDraft = useGameStore((s) => s.startDraft);
+  const startQuickMatch = useGameStore((s) => s.startQuickMatch);
+  // Which lane the player committed to. The header's "New Game" button
+  // rematches in the SAME lane so locking in cards mid-quick-match doesn't
+  // surprise the player by punting them into an auction draft on the next
+  // tap. `null` (no lane committed yet) falls back to the auction path,
+  // which matches the legacy default behavior.
+  const gameMode = useGameStore((s) => s.gameMode);
   // While the Learn-to-Play tutorial is running, the header's "New Game"
   // dropdown is replaced with an "End Tutorial" button that bails the
   // walkthrough and pops the start screen back up. Subscribed here so
@@ -130,7 +137,16 @@ export function UIOverlay() {
             </button>
           ) : (
             <NewGamePicker
-              onPick={(team) => startDraft(team)}
+              onPick={(team) => {
+                // Rematch in the lane the player is already in. Quick Match
+                // stays Quick Match; auction Draft stays Draft; legacy null
+                // falls back to the auction path.
+                if (gameMode === 'quick-match') {
+                  startQuickMatch(team);
+                } else {
+                  startDraft(team);
+                }
+              }}
               currentTeam={userTeam}
             />
           )}
@@ -265,9 +281,11 @@ function InningTransitionBanner() {
 /**
  * "New Game" entry point. Replaces the bare reset button with a small
  * dropdown so the player can pick which team they're playing AS for the
- * fresh game. Picking opens the auction draft via `startDraft(team)` --
- * the store carries that team across the next New Game (e.g. "rematch as
- * HOME") unless the player picks a different one.
+ * fresh game. Picking rematches in whichever lane the player is already
+ * in (Quick Match or auction Draft) -- the parent passes a single
+ * `onPick(team)` that already encodes the lane choice. The store carries
+ * the team across the next New Game unless the player picks a different
+ * one here.
  *
  * The current `userTeam` is highlighted in the dropdown so they can tell
  * which side they're already on without opening it twice. Closes on

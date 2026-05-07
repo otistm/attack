@@ -19,7 +19,7 @@
  * they can either bid normally again or their roster is full. This punishes
  * overspending without ever leaving the player softlocked at the menu.
  */
-import { ALL_CARDS, CardDefinition, TagLiteral } from "./cards";
+import { CardDefinition, SESSION_CARDS, TagLiteral } from "./cards";
 import { BATTERS, MlbPlayer, PITCHERS } from "./players";
 
 export type DraftSide = "user" | "ai";
@@ -129,8 +129,13 @@ export function makeRng(seed: number): () => number {
 
 // ----- card lookup (built once) --------------------------------------------
 
+// Sourced from SESSION_CARDS. Draft AI valuation reads `baseValue` and
+// `tags` (both identical to ALL_CARDS), so this swap is functionally a
+// no-op for pricing -- but it keeps any downstream consumer that snapshots
+// these objects (e.g. UI tooltips on hovered nominees) on the same shape
+// layout the player will see in-hand.
 const CARD_BY_ID: Record<string, CardDefinition> = {};
-for (const c of ALL_CARDS) CARD_BY_ID[c.id] = c;
+for (const c of SESSION_CARDS) CARD_BY_ID[c.id] = c;
 
 // ----- player metrics -------------------------------------------------------
 

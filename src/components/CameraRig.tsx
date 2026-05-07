@@ -16,8 +16,8 @@ const POSE_DEFAULT: CameraPose = {
   // the batter at home and the pitcher on the mound stack vertically in the
   // field band between the two card decks at a tight, tilted-back angle.
   zoom: 8.55,
-  position: [0.23, 0.5, 32.59],
-  target: [0.23, -6.5, 9.59],
+  position: [0.46, 3.52, 31.67],
+  target: [0.46, -3.48, 8.67],
 };
 
 const POSE_HIT: CameraPose = {

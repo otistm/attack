@@ -1439,11 +1439,13 @@ function assertBeat(
     (c) => c.type === "Pitching" && c.abilityType === "General Draw",
   );
   // Phase 6 expanded both pools: +6 batting (b-91..b-96) and +4 pitching
-  // (p-91..p-94) state-trigger generals. New targets: 26 batting / 24 pitching.
-  assert(battingGenerals.length === 26,
-    `Phase 5/6 (a): batting general pool is 26 (got ${battingGenerals.length})`);
-  assert(pitchingGenerals.length === 24,
-    `Phase 5/6 (a): pitching general pool is 24 (got ${pitchingGenerals.length})`);
+  // (p-91..p-94) state-trigger generals. Phase A puzzle expansion (b-81..b-88,
+  // p-95..p-96) adds another +8 batting and +2 pitching, landing the pools at
+  // 34 batting / 26 pitching.
+  assert(battingGenerals.length === 34,
+    `Phase 5/6/A (a): batting general pool is 34 (got ${battingGenerals.length})`);
+  assert(pitchingGenerals.length === 26,
+    `Phase 5/6/A (a): pitching general pool is 26 (got ${pitchingGenerals.length})`);
 
   // (b) every tag has at least 2 cards carrying it.
   for (const tag of ALL_TAGS) {
@@ -3398,6 +3400,10 @@ import { BATTERS, PITCHERS, PLAYERS } from "./players";
   assert(after.draft !== null, "QM/store: draft populated");
   assert(after.draft?.phase === "complete", "QM/store: draft.phase = complete");
   assert(after.showStartScreen === false, "QM/store: showStartScreen flipped off");
+  // gameMode pins the lane the player committed to so the in-game "New
+  // Game" button can rematch in the same lane (Quick Match stays Quick
+  // Match, never punts to the auction draft).
+  assert(after.gameMode === "quick-match", "QM/store: gameMode = quick-match");
   assert(after.inning === 1 && after.half === "top", "QM/store: fresh inning state");
   assert(after.outs === 0, "QM/store: outs reset");
   assert(after.homeScore === 0 && after.awayScore === 0, "QM/store: scores reset");
@@ -3427,6 +3433,7 @@ import { BATTERS, PITCHERS, PLAYERS } from "./players";
 
   assert(after.userTeam === "HOME", "QM/store HOME: userTeam set");
   assert(after.phase === "selecting", "QM/store HOME: phase = selecting");
+  assert(after.gameMode === "quick-match", "QM/store HOME: gameMode = quick-match");
   // half=top, userTeam=HOME means user is pitching first, so the batter
   // comes from the AI side and the pitcher comes from the user side.
   const aiBatters = after.draft!.roster.ai.batters.map((p) => p.id);
@@ -3440,6 +3447,35 @@ import { BATTERS, PITCHERS, PLAYERS } from "./players";
     userPitchers.includes(after.pitcher.id),
     "QM/store HOME: first pitcher drawn from user (HOME) pitcher pool",
     { pitcher: after.pitcher.id, userPitchers },
+  );
+}
+
+{
+  // gameMode round-trip: startDraft pins 'draft', startQuickMatch pins
+  // 'quick-match', and `reset` drops back to null so the StartGameScreen
+  // is the source of truth. These three transitions are what powers the
+  // header's "New Game" button rematching in the same lane instead of
+  // always punting to the auction draft.
+  useGameStore.getState().reset();
+  assert(useGameStore.getState().gameMode === null, "gameMode/reset: cleared to null");
+
+  useGameStore.getState().startDraft("AWAY");
+  assert(useGameStore.getState().gameMode === "draft", "gameMode/startDraft: pinned to 'draft'");
+
+  useGameStore.getState().reset();
+  assert(useGameStore.getState().gameMode === null, "gameMode/reset after draft: cleared again");
+
+  useGameStore.getState().startQuickMatch("AWAY");
+  assert(
+    useGameStore.getState().gameMode === "quick-match",
+    "gameMode/startQuickMatch: pinned to 'quick-match'",
+  );
+
+  // Switching lanes overrides cleanly (no stale 'quick-match' bleed-through).
+  useGameStore.getState().startDraft("HOME");
+  assert(
+    useGameStore.getState().gameMode === "draft",
+    "gameMode/startDraft after QM: switches lane back to 'draft'",
   );
 }
 
@@ -3571,6 +3607,450 @@ import { BATTERS, PITCHERS, PLAYERS } from "./players";
   assert(
     s.tutorialStepIndex === 0,
     "tutorial/over-next: stepping past the end resets index",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase A puzzle-card expansion (b-81..b-88, p-95, p-96).
+//
+// End-to-end smoke checks via scoreHand so the whole pipe (effect helpers ->
+// effect registry -> scoring -> hit-scale ladder) is exercised. We pick
+// concrete neighbor compositions per card so failures point cleanly at the
+// effect that regressed.
+//
+// Cards exercised here:
+//   - b-81  Sandwich Single        (between two diamond-carriers -> +6)
+//   - b-82  Three-Pitch Sequence   (chain reads s->d->c -> +6)
+//   - b-83  Triple Threat          (chain length >= 3 -> +8)
+//   - b-84  Five-Tool Run          (requireChainLength gate + +8 satisfied)
+//   - b-85  Cleanup Stacker        (+1 per card to the right in chain)
+//   - b-86  Leadoff Spark          (+5 in slot 0)
+//   - b-87  Cleanup Crew           (+5 in slot 3)
+//   - b-88  Anchor                 (+3 uncombined AND in last slot)
+//   - p-95  Mirror Image           (palindrome -> +5 self / -3 batter)
+//   - p-96  Alternating Heat       (+2 per s<->d alternation)
+// ---------------------------------------------------------------------------
+{
+  // ---- b-81 Sandwich Single ----
+  // Chain b-1 (sq/diamond) - b-81 (sq/sq) - b-71 (sq/sq, fastball card).
+  // Wait -- sq/diamond -> sq/sq connects on the diamond? No: sq/diamond's
+  // RIGHT is diamond, b-81's LEFT is square. Doesn't connect. Use b-3
+  // (circle/square) on the left and b-71 (sq/sq) on the right? b-3 right=sq
+  // matches b-81 left=sq. b-81 right=sq matches b-71 left=sq. Chain forms.
+  // For diamond-carrying neighbors: b-3 has circle/square -- no diamond.
+  // Use b-1 left flipped via a diamond/sq card? Pick b-65 (sq/star) -- no.
+  // Cleanest: build with b-2 (diamond/circle) + b-81... but b-2 right=circle
+  // doesn't match b-81 left=sq.
+  //
+  // Synthesise stub cards so we don't fight the existing card pool. Both
+  // neighbors carry a diamond on one side AND have a square seam to b-81.
+  const stubLeftDiamond: CardDefinition = {
+    id: "stub-ldiam",
+    name: "Stub L",
+    type: "Batting",
+    abilityType: "General Draw",
+    baseValue: 1,
+    leftShape: "diamond",
+    rightShape: "square",
+    description: "test stub",
+  };
+  const stubRightDiamond: CardDefinition = {
+    id: "stub-rdiam",
+    name: "Stub R",
+    type: "Batting",
+    abilityType: "General Draw",
+    baseValue: 1,
+    leftShape: "square",
+    rightShape: "diamond",
+    description: "test stub",
+  };
+  const stubNoDiamond: CardDefinition = {
+    id: "stub-nod",
+    name: "Stub N",
+    type: "Batting",
+    abilityType: "General Draw",
+    baseValue: 1,
+    leftShape: "square",
+    rightShape: "circle",
+    description: "test stub",
+  };
+
+  const sandwich = cardById("b-81");
+  // Both neighbors carry diamond -> +6 fires.
+  const sandHand = [stubLeftDiamond, sandwich, stubRightDiamond];
+  const sandResult = scoreHand(sandHand, batterCtx([cardById("p-31")]));
+  assert(
+    sandResult.cardModifiers["b-81"]?.value === sandwich.baseValue + 6,
+    "Phase A: b-81 fires +6 between two diamond neighbors",
+    sandResult.cardModifiers["b-81"],
+  );
+  // Only one diamond neighbor -> no bonus.
+  const sandPartial = scoreHand(
+    [stubLeftDiamond, sandwich, stubNoDiamond],
+    batterCtx([cardById("p-31")]),
+  );
+  // stubNoDiamond seam: square-square - connects.
+  assert(
+    sandPartial.cardModifiers["b-81"]?.value === sandwich.baseValue,
+    "Phase A: b-81 stays at base when only one neighbor carries diamond",
+    sandPartial.cardModifiers["b-81"],
+  );
+  // Uncombined -> no bonus.
+  const sandSolo = scoreHand([sandwich], batterCtx([cardById("p-31")]));
+  assert(
+    sandSolo.cardModifiers["b-81"]?.value === sandwich.baseValue,
+    "Phase A: b-81 stays at base when uncombined",
+  );
+
+  // ---- b-82 Three-Pitch Sequence ----
+  // Chain shape sequence needs to read SQUARE -> DIAMOND -> CIRCLE somewhere.
+  // Stub chain: [star/sq, sq/diamond, diamond/circle] -> dedup [star,sq,d,c].
+  // Contains [sq,d,c]. b-82 itself is circle/sq -- park it on the LEFT and
+  // chain it via stub seams. Concrete chain: b-82 (circle/sq) + a (sq/d) +
+  // b (d/c). a-left=sq matches b-82-right=sq, a-right=d matches b-left=d.
+  const seqA: CardDefinition = {
+    id: "stub-sd",
+    name: "Stub SD",
+    type: "Batting",
+    abilityType: "General Draw",
+    baseValue: 1,
+    leftShape: "square",
+    rightShape: "diamond",
+    description: "test stub",
+  };
+  const seqB: CardDefinition = {
+    id: "stub-dc",
+    name: "Stub DC",
+    type: "Batting",
+    abilityType: "General Draw",
+    baseValue: 1,
+    leftShape: "diamond",
+    rightShape: "circle",
+    description: "test stub",
+  };
+  const threePitch = cardById("b-82");
+  const seqHand = [threePitch, seqA, seqB];
+  const seqResult = scoreHand(seqHand, batterCtx([cardById("p-31")]));
+  // Dedup of [c,sq,sq,d,d,c] = [c,sq,d,c] -- contains [sq,d,c]. +6 fires.
+  assert(
+    seqResult.cardModifiers["b-82"]?.value === threePitch.baseValue + 6,
+    "Phase A: b-82 fires +6 when chain reads sq->d->c",
+    seqResult.cardModifiers["b-82"],
+  );
+  // No s-d-c run: solo b-82 (dedup [c,sq]) -- no bonus.
+  const seqSolo = scoreHand([threePitch], batterCtx([cardById("p-31")]));
+  assert(
+    seqSolo.cardModifiers["b-82"]?.value === threePitch.baseValue,
+    "Phase A: b-82 stays at base when chain lacks s->d->c",
+  );
+
+  // ---- b-83 Triple Threat ----
+  // +8 once chain length is 3+. Use stubs so seams are clean.
+  const stubSqSq: CardDefinition = {
+    id: "stub-ss",
+    name: "Stub SS",
+    type: "Batting",
+    abilityType: "General Draw",
+    baseValue: 1,
+    leftShape: "square",
+    rightShape: "square",
+    description: "test stub",
+  };
+  const stubSqDiamond: CardDefinition = {
+    id: "stub-sd2",
+    name: "Stub SD2",
+    type: "Batting",
+    abilityType: "General Draw",
+    baseValue: 1,
+    leftShape: "square",
+    rightShape: "diamond",
+    description: "test stub",
+  };
+  const tripleThreat = cardById("b-83");
+  // tripleThreat is diamond/square. Chain: stubSqDiamond (sq/d) + tripleThreat
+  // (d/sq) + stubSqSq (sq/sq) -> length 3.
+  const tripleHand = [stubSqDiamond, tripleThreat, stubSqSq];
+  const tripleResult = scoreHand(tripleHand, batterCtx([cardById("p-31")]));
+  assert(
+    tripleResult.cardModifiers["b-83"]?.value === tripleThreat.baseValue + 8,
+    "Phase A: b-83 fires +8 in a 3-card chain",
+    tripleResult.cardModifiers["b-83"],
+  );
+  // 2-card chain -> no bonus.
+  const tripleShort = scoreHand(
+    [stubSqDiamond, tripleThreat],
+    batterCtx([cardById("p-31")]),
+  );
+  assert(
+    tripleShort.cardModifiers["b-83"]?.value === tripleThreat.baseValue,
+    "Phase A: b-83 stays at base in a 2-card chain",
+  );
+
+  // ---- b-84 Five-Tool Run + requireChainLength gate ----
+  const fiveTool = cardById("b-84");
+  assert(
+    fiveTool.combineConstraint?.requireChainLength === 4,
+    "Phase A: b-84 carries requireChainLength=4",
+  );
+  // Solo b-84 -> chain length 1 -> requireChainLength gate fires; total 0.
+  const fiveSolo = scoreHand([fiveTool], batterCtx([cardById("p-31")]));
+  assert(
+    fiveSolo.cardModifiers["b-84"]?.value === 0,
+    "Phase A: b-84 zeros out below requireChainLength",
+    fiveSolo.cardModifiers["b-84"],
+  );
+  // 4-card chain: stubSqDiamond + fiveTool (sq/d) + ... need to align. b-84
+  // is sq/d. Chain: stubSqSq (sq/sq) + fiveTool (sq/d) -> seam sq=sq ok;
+  // fiveTool right=d, next must left=d. Use stubSqDiamond reversed? Build
+  // a stub d/sq for the right, then another sq/sq tail.
+  const stubDiamondSq: CardDefinition = {
+    id: "stub-ds",
+    name: "Stub DS",
+    type: "Batting",
+    abilityType: "General Draw",
+    baseValue: 1,
+    leftShape: "diamond",
+    rightShape: "square",
+    description: "test stub",
+  };
+  // Chain of 4: stubSqSq -> fiveTool (sq/d) -> stubDiamondSq (d/sq) -> stubSqSq.
+  // Use distinct ids so the cardModifiers map doesn't collide.
+  const stubSqSqB: CardDefinition = { ...stubSqSq, id: "stub-ss-b" };
+  const fiveLong = scoreHand(
+    [stubSqSq, fiveTool, stubDiamondSq, stubSqSqB],
+    batterCtx([cardById("p-31")]),
+  );
+  assert(
+    fiveLong.cardModifiers["b-84"]?.value === fiveTool.baseValue + 8,
+    "Phase A: b-84 fires +8 once chain reaches 4",
+    fiveLong.cardModifiers["b-84"],
+  );
+
+  // ---- b-85 Cleanup Stacker ----
+  const stacker = cardById("b-85"); // sq/d
+  // Chain: stubSqSq -> stacker (sq/d) -> stubDiamondSq (d/sq) -> stubSqSqB.
+  // stacker is at index 1; cards to right = 2.
+  const stackerChain = scoreHand(
+    [stubSqSq, stacker, stubDiamondSq, stubSqSqB],
+    batterCtx([cardById("p-31")]),
+  );
+  assert(
+    stackerChain.cardModifiers["b-85"]?.value === stacker.baseValue + 2,
+    "Phase A: b-85 +2 with two cards to the right",
+    stackerChain.cardModifiers["b-85"],
+  );
+  // Solo -> no bonus.
+  const stackerSolo = scoreHand([stacker], batterCtx([cardById("p-31")]));
+  assert(
+    stackerSolo.cardModifiers["b-85"]?.value === stacker.baseValue,
+    "Phase A: b-85 stays at base when solo",
+  );
+
+  // ---- b-86 Leadoff Spark ----
+  const leadoff = cardById("b-86");
+  const leadoffSlot0 = scoreHand([leadoff], batterCtx([cardById("p-31")]));
+  assert(
+    leadoffSlot0.cardModifiers["b-86"]?.value === leadoff.baseValue + 5,
+    "Phase A: b-86 fires +5 in slot 0",
+    leadoffSlot0.cardModifiers["b-86"],
+  );
+  // Slot 1 -> no bonus. Pick a non-connecting partner so the chain doesn't
+  // accidentally trigger anything.
+  const leadoffSlot1 = scoreHand(
+    [stubSqSq, leadoff],
+    batterCtx([cardById("p-31")]),
+  );
+  // stubSqSq right=sq, leadoff left=star -> doesn't connect. b-86 is at
+  // index 1 of hand, no other effect modifiers.
+  assert(
+    leadoffSlot1.cardModifiers["b-86"]?.value === leadoff.baseValue,
+    "Phase A: b-86 stays at base when not in slot 0",
+  );
+
+  // ---- b-87 Cleanup Crew ----
+  const cleanup = cardById("b-87"); // sq/d
+  // Use 4 stub cards with cleanup at slot 3. Use no-connect shapes for
+  // simplicity: stub_circle/circle * 3 then cleanup. circle != sq so the
+  // chain stays broken everywhere.
+  const stubCC: CardDefinition = {
+    id: "stub-cc",
+    name: "Stub CC",
+    type: "Batting",
+    abilityType: "General Draw",
+    baseValue: 1,
+    leftShape: "circle",
+    rightShape: "circle",
+    description: "test stub",
+  };
+  const stubCCb = { ...stubCC, id: "stub-cc-b" };
+  const stubCCc = { ...stubCC, id: "stub-cc-c" };
+  const cleanupChain = scoreHand(
+    [stubCC, stubCCb, stubCCc, cleanup],
+    batterCtx([cardById("p-31")]),
+  );
+  assert(
+    cleanupChain.cardModifiers["b-87"]?.value === cleanup.baseValue + 5,
+    "Phase A: b-87 fires +5 in slot 3 (4th lineup card)",
+    cleanupChain.cardModifiers["b-87"],
+  );
+  // Slot 0 -> no bonus.
+  const cleanupSlot0 = scoreHand([cleanup], batterCtx([cardById("p-31")]));
+  assert(
+    cleanupSlot0.cardModifiers["b-87"]?.value === cleanup.baseValue,
+    "Phase A: b-87 stays at base when not in slot 3",
+  );
+
+  // ---- b-88 Anchor ----
+  const anchor = cardById("b-88"); // d/star
+  // Solo -> rightmost AND uncombined -> +3.
+  const anchorSolo = scoreHand([anchor], batterCtx([cardById("p-31")]));
+  assert(
+    anchorSolo.cardModifiers["b-88"]?.value === anchor.baseValue + 3,
+    "Phase A: b-88 +3 when solo (rightmost & uncombined)",
+    anchorSolo.cardModifiers["b-88"],
+  );
+  // In rightmost slot but COMBINED -> no bonus.
+  // anchor is d/star; place stub_diamond_d (?/diamond) on its left so seams
+  // connect. Use stubSqDiamond (sq/d) -> anchor (d/star). seam d/d connects.
+  const anchorCombined = scoreHand(
+    [stubSqDiamond, anchor],
+    batterCtx([cardById("p-31")]),
+  );
+  assert(
+    anchorCombined.cardModifiers["b-88"]?.value === anchor.baseValue,
+    "Phase A: b-88 stays at base when combined",
+  );
+  // Not in rightmost slot -> no bonus.
+  const anchorNotRight = scoreHand(
+    [anchor, stubCC],
+    batterCtx([cardById("p-31")]),
+  );
+  // anchor d/star, stubCC c/c: anchor right=star, stubCC left=circle, no
+  // connect, anchor stays uncombined but is in slot 0 (not slot 1, the
+  // rightmost), so the rightmost-slot gate fails.
+  assert(
+    anchorNotRight.cardModifiers["b-88"]?.value === anchor.baseValue,
+    "Phase A: b-88 stays at base when not in rightmost slot",
+  );
+
+  // ---- p-95 Mirror Image ----
+  const mirror = cardById("p-95"); // c/c
+  // Solo -> dedup [c] -> palindrome -> +5 self / -3 opponent.
+  const mirrorSolo = scoreHand([mirror], pitcherCtx([cardById("b-1")]));
+  assert(
+    mirrorSolo.cardModifiers["p-95"]?.value === mirror.baseValue + 5,
+    "Phase A: p-95 +5 self on palindrome",
+    mirrorSolo.cardModifiers["p-95"],
+  );
+  assert(
+    mirrorSolo.opponentModifier === -3,
+    "Phase A: p-95 -3 opponent on palindrome",
+    { opponentModifier: mirrorSolo.opponentModifier },
+  );
+  // Non-palindrome chain. Build [c/c, c/sq] so dedup = [c, sq] -- not
+  // palindrome (length 2 with two different shapes).
+  const stubCSq: CardDefinition = {
+    id: "stub-csq",
+    name: "Stub CSq",
+    type: "Pitching",
+    abilityType: "General Draw",
+    baseValue: 1,
+    leftShape: "circle",
+    rightShape: "square",
+    description: "test stub",
+  };
+  const mirrorBroken = scoreHand([mirror, stubCSq], pitcherCtx([cardById("b-1")]));
+  assert(
+    mirrorBroken.cardModifiers["p-95"]?.value === mirror.baseValue,
+    "Phase A: p-95 stays at base on non-palindrome",
+    mirrorBroken.cardModifiers["p-95"],
+  );
+
+  // ---- p-96 Alternating Heat ----
+  const alt = cardById("p-96"); // sq/d
+  // Solo: dedup [sq, d] -> 1 alternation -> +2.
+  const altSolo = scoreHand([alt], pitcherCtx([cardById("b-1")]));
+  assert(
+    altSolo.cardModifiers["p-96"]?.value === alt.baseValue + 2,
+    "Phase A: p-96 +2 on 1 alternation",
+    altSolo.cardModifiers["p-96"],
+  );
+  // Chain [sq/d, d/sq]: dedup = [sq, d, sq] -> 2 alternations -> +4.
+  const stubDSqP: CardDefinition = {
+    id: "stub-dsq-p",
+    name: "Stub DSqP",
+    type: "Pitching",
+    abilityType: "General Draw",
+    baseValue: 1,
+    leftShape: "diamond",
+    rightShape: "square",
+    description: "test stub",
+  };
+  const altLong = scoreHand([alt, stubDSqP], pitcherCtx([cardById("b-1")]));
+  assert(
+    altLong.cardModifiers["p-96"]?.value === alt.baseValue + 4,
+    "Phase A: p-96 +4 on 2 alternations",
+    altLong.cardModifiers["p-96"],
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase A: requireChainLength gate is a hard floor on the engine side, NOT
+// just a card-level effect tweak. Pin the contract:
+//   - solo card with requireChainLength > 1 contributes 0 (both baseValue
+//     and effect zeroed)
+//   - same card in a chain that meets the floor contributes baseValue + effect
+//   - the gate triggers regardless of whether CARD_EFFECTS has an entry --
+//     it's a scoring-side concern.
+// ---------------------------------------------------------------------------
+{
+  const fiveTool = cardById("b-84");
+  // Solo: total scoreHand value should drop to 0 (only b-84 in lineup).
+  const fiveSolo = scoreHand([fiveTool], batterCtx([cardById("p-31")]));
+  assert(
+    fiveSolo.maxValue === 0,
+    "Phase A: requireChainLength zeros total when chain too short",
+    { maxValue: fiveSolo.maxValue },
+  );
+
+  // Synth a card with requireChainLength but NO CARD_EFFECTS entry -- gate
+  // must still fire (it's enforced in scoreGroup, not the registry).
+  const stubReq: CardDefinition = {
+    id: "stub-req",
+    name: "Stub Req",
+    type: "Batting",
+    abilityType: "General Draw",
+    baseValue: 6,
+    leftShape: "square",
+    rightShape: "square",
+    description: "test stub",
+    combineConstraint: { requireChainLength: 3 },
+  };
+  const stubReqSolo = scoreHand([stubReq], batterCtx([cardById("p-31")]));
+  assert(
+    stubReqSolo.cardModifiers["stub-req"]?.value === 0,
+    "Phase A: requireChainLength fires for cards without an effect entry",
+    stubReqSolo.cardModifiers["stub-req"],
+  );
+
+  // Chain of 3 of the same stub (all sq/sq) -> requirement met -> baseValue
+  // counts. Use distinct ids so the cardModifiers map keeps each entry.
+  const stubReqA = { ...stubReq, id: "stub-req-a" };
+  const stubReqB = { ...stubReq, id: "stub-req-b" };
+  const stubReqC = { ...stubReq, id: "stub-req-c" };
+  const stubReqLong = scoreHand(
+    [stubReqA, stubReqB, stubReqC],
+    batterCtx([cardById("p-31")]),
+  );
+  assert(
+    stubReqLong.cardModifiers["stub-req-a"]?.value === stubReq.baseValue,
+    "Phase A: requireChainLength satisfied -> baseValue counts",
+    stubReqLong.cardModifiers["stub-req-a"],
+  );
+  assert(
+    stubReqLong.maxValue === stubReq.baseValue * 3,
+    "Phase A: requireChainLength satisfied -> full chain scores",
+    { maxValue: stubReqLong.maxValue },
   );
 }
 

@@ -5,6 +5,7 @@ import { canConnect, shapeModeForSide, seamKey } from '../lib/connect';
 import { useGameStore, getUserSide, ResolutionBeat, Phase } from '../lib/gameStore';
 import { HitOutcome } from '../lib/scoring';
 import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
+import { PlayerHero } from './PlayerHero';
 
 /**
  * Reveal-sequence orchestrator timing. Tuned so a typical 3-5 beat hand
@@ -511,6 +512,8 @@ const CardItem = ({
 };
 
 export const CardGameOverlay = () => {
+  const batter = useGameStore((s) => s.batter);
+  const pitcher = useGameStore((s) => s.pitcher);
   const batterHand = useGameStore((s) => s.batterHand);
   const pitcherHand = useGameStore((s) => s.pitcherHand);
   const reorderBatter = useGameStore((s) => s.reorderBatterHand);
@@ -520,6 +523,7 @@ export const CardGameOverlay = () => {
   const startNextAtBat = useGameStore((s) => s.startNextAtBat);
   const setShowStartScreen = useGameStore((s) => s.setShowStartScreen);
   const lastOutcome = useGameStore((s) => s.lastOutcome);
+  const lastResolveLog = useGameStore((s) => s.lastResolveLog);
   const lastBatterScore = useGameStore((s) => s.lastBatterScore);
   const lastPitcherScore = useGameStore((s) => s.lastPitcherScore);
   const lastResultMessage = useGameStore((s) => s.lastResultMessage);
@@ -737,7 +741,43 @@ export const CardGameOverlay = () => {
           to a tiny chip on the score pill, which makes hits feel anticlimactic
           even when the engine has done all the work. Self-dismisses after
           ~1.6s so the player can immediately read the matchup and tap Next. */}
-      <HitResultBanner outcome={lastOutcome} phase={phase} atBatId={atBatId} />
+      <HitResultBanner
+        outcome={lastOutcome}
+        phase={phase}
+        atBatId={atBatId}
+        resolveLog={lastResolveLog}
+      />
+
+      {/* Player hero rail -- procedural Topps-style cards pinned to the LEFT
+          screen margin so the live BATTER/PITCHER total reads as belonging
+          to the player rather than as a detached HUD pill. The cards pulse +
+          color-flash on every value change so manipulating the hand visibly
+          "affects" the player on screen.
+
+          Mounted as `pointer-events-none` so they never steal a click from
+          the hand strip / 3D scene; gated behind `xl:block` because the
+          left rail is only meaningfully empty on >=1280px viewports -- on
+          narrower screens the existing ScorePill above each hand is still
+          the readout. Fog-of-war mirrors ScorePill exactly: the AI's
+          number is hidden during selection (and the dim styling triggers
+          accordingly), but the player card itself stays visible so the
+          user always knows WHO they are facing. */}
+      <div className="hidden md:block pointer-events-none absolute left-8 top-32 z-20">
+        <PlayerHero
+          player={pitcher}
+          value={isSelecting && userIsBatting ? null : pitcherDisplayValue}
+          role="PITCHER"
+          dimmed={isSelecting && userIsBatting}
+        />
+      </div>
+      <div className="hidden md:block pointer-events-none absolute left-8 bottom-32 z-20">
+        <PlayerHero
+          player={batter}
+          value={isSelecting && !userIsBatting ? null : batterDisplayValue}
+          role="BATTER"
+          dimmed={isSelecting && !userIsBatting}
+        />
+      </div>
 
       {/* AI hand - top of screen. Face-down during selection regardless of
           whether the AI is playing batter or pitcher this half (same
@@ -756,6 +796,7 @@ export const CardGameOverlay = () => {
             outcomeStyle={outcomeBadgeStyle}
             compact
             banner={aiBanner}
+            heroHasValue
           />
           <div data-tutorial="opponent-hand">
             <FlipPitcherStrip
@@ -785,6 +826,7 @@ export const CardGameOverlay = () => {
             outcomeStyle={outcomeBadgeStyle}
             atBatId={atBatId}
             banner={userBanner}
+            heroHasValue
             // Hit Scale hint is a batter-only concept ("if you win, +N to
             // your hit"). Only show it when the user IS the batter.
             hitScaleHint={
@@ -928,10 +970,18 @@ const HitResultBanner = ({
   outcome,
   phase,
   atBatId,
+  resolveLog,
 }: {
   outcome: HitOutcome | null;
   phase: Phase;
   atBatId: number;
+  /**
+   * Player-facing resolve-step lines (e.g. "Stolen Bag: extra runner placed
+   * on 1B"). Rendered as small chips beneath the hit label so post-hit card
+   * effects don't read as visual glitches when a phantom runner pops onto
+   * the field.
+   */
+  resolveLog: string[];
 }) => {
   const [visible, setVisible] = useState(false);
   // Re-enter every time a fresh resolved-state lands. We key on atBatId so a
@@ -988,6 +1038,24 @@ const HitResultBanner = ({
               <span className="text-xs font-bold uppercase tracking-[0.32em] opacity-80">
                 {cfg.sub}
               </span>
+            )}
+            {/* Resolve-step log: tells the player WHY follow-on effects fired
+                (e.g. an extra phantom runner from b-135 Stolen Bag). Renders
+                as compact chips under the hit label so the field doesn't
+                look glitched when more than one runner appears on a single
+                at-bat. */}
+            {resolveLog.length > 0 && (
+              <div className="mt-2 flex flex-wrap items-center justify-center gap-1.5 max-w-[420px]">
+                {resolveLog.map((line, i) => (
+                  <span
+                    key={`${atBatId}-rlog-${i}`}
+                    className="px-2 py-0.5 rounded-full bg-slate-900/35 text-[10px] font-bold uppercase tracking-[0.18em] leading-none border border-white/30"
+                    style={{ textShadow: 'none' }}
+                  >
+                    {line}
+                  </span>
+                ))}
+              </div>
             )}
           </div>
         </motion.div>
@@ -1123,11 +1191,13 @@ const BatterStatusStrip = ({
       if (!impacting.has(card.id)) continue;
       out.push({ key: card.id, label });
     }
-    // p-36 Ace's Command always silences the batter's highest card -- the
-    // player will see the red highlight + zeroed value during reveal, but
-    // without this chip there's no warning during selection.
+    // p-36 Ace's Command nullifies the ABILITY of the batter's highest card,
+    // not the card itself -- the base value still scores. The previous chip
+    // text ("Highest Card Silenced") read like the whole card was nuked, so
+    // playtesters saw the card's value count anyway and assumed a bug.
+    // "Top Card Ability Off" lines up with the longer tooltip below.
     if (pitcherHand.some((c) => c.id === 'p-36')) {
-      out.push({ key: 'p-36', label: 'Highest Card Silenced' });
+      out.push({ key: 'p-36', label: 'Top Card Ability Off' });
     }
     // p-41 Sweeping Slider breaks a seam in the batter's best combo at
     // lock-in. Now that the preview folds the seam break in (so the
@@ -1216,6 +1286,15 @@ interface ScorePillProps {
    * default exit fade into the next at-bat's card-selection HUD (B1 fix).
    */
   atBatId?: number;
+  /**
+   * When true, the live BATTER/PITCHER total is also being rendered by the
+   * left-rail PlayerHero (md-and-up only). The pill's label+value span is
+   * then hidden at the `md` breakpoint so the user isn't reading the same
+   * number twice; the pill bg itself collapses too when there's nothing
+   * else to anchor (no outcome chip, no hit-scale hint). Below `md` -- where
+   * the hero rail is hidden -- the pill stays the canonical readout.
+   */
+  heroHasValue?: boolean;
 }
 
 /**
@@ -1242,11 +1321,27 @@ const ScorePill = ({
   banner = null,
   hitScaleHint = null,
   atBatId,
+  heroHasValue = false,
 }: ScorePillProps) => {
   const valueColor = tone === 'batter' ? 'text-blue-600' : 'text-rose-600';
   const containerSize = compact
     ? 'px-4 py-1 text-sm gap-2'
     : 'px-6 py-2 text-xl gap-4';
+
+  // At md+ the PlayerHero rail carries the live total, so the pill's
+  // label+value span is dropped to avoid a redundant readout. The pill bg
+  // itself only stays at md when there's *something else* inside it worth
+  // showing (an outcome chip after lock-in, or a hit-scale hint badge mid
+  // selection). Below md the heroes are hidden and the pill is the
+  // canonical readout, so this collapsing logic is a no-op. The threshold
+  // here MUST stay in sync with the `hidden md:block` gate on the hero
+  // wrappers above -- otherwise either the pill collapses while no hero
+  // shows (no readout at all) or both render and the value is duplicated.
+  const hasOutcomeChip = !!outcome;
+  const hasHintBadge = hitScaleHint !== null && hitScaleHint !== 0;
+  const valueGroupClass = heroHasValue ? 'md:hidden' : '';
+  const pillBgHiddenAtMd = heroHasValue && !hasOutcomeChip && !hasHintBadge;
+
   return (
     // `z-30` lifts the pill (and the BeatBanner anchored absolute below it)
     // above sibling cards in the user's column. Without this the banner
@@ -1258,9 +1353,9 @@ const ScorePill = ({
     <div className="relative z-30 flex flex-col items-center">
       <motion.div
         layout
-        className={`bg-white/95 backdrop-blur rounded-full font-bold text-slate-900 shadow-xl border-2 border-white/50 flex items-center ${containerSize}`}
+        className={`bg-white/95 backdrop-blur rounded-full font-bold text-slate-900 shadow-xl border-2 border-white/50 flex items-center ${containerSize} ${pillBgHiddenAtMd ? 'md:hidden' : ''}`}
       >
-        <span className="flex items-center gap-2">
+        <span className={`flex items-center gap-2 ${valueGroupClass}`}>
           <span className={compact ? 'text-[10px] font-extrabold uppercase tracking-widest text-slate-500' : 'text-xs font-extrabold uppercase tracking-widest text-slate-500'}>
             {label}
           </span>
@@ -1759,7 +1854,12 @@ type DealDirection = 'top' | 'bottom';
 // keeping drag interactions snappy and decoupled from the entry stagger.
 // ---------------------------------------------------------------------------
 
-const SIGNATURE_DELAY_CHILDREN = 0.18;
+// Bumped from 0.18 to 0.55 so the signature cards wait for the left-rail
+// PlayerHero entry tween to finish (~0.48s for the batter row including
+// its 0.08s role stagger) before the first hand card flies in. The user-
+// facing sequence is then: pitcher hero -> batter hero -> signature cards
+// -> general-draw cards.
+const SIGNATURE_DELAY_CHILDREN = 0.55;
 const SIGNATURE_STAGGER = 0.1;
 // Pause after the last signature settles before the deck draw starts.
 const SIGNATURE_SETTLE_PAD = 0.55;

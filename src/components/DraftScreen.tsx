@@ -66,11 +66,15 @@ import {
 } from '../lib/draft';
 import { useGameStore } from '../lib/gameStore';
 import { type MlbPlayer } from '../lib/players';
-import { ALL_CARDS, type CardDefinition, type TagLiteral } from '../lib/cards';
+import { type CardDefinition, SESSION_CARDS, type TagLiteral } from '../lib/cards';
 import { teamPalette } from '../lib/teamColors';
 
+// Sourced from SESSION_CARDS so signature-card previews on the auction tile
+// match the shapes the player will actually hold once the draft completes
+// and the game starts dealing hands. Tags / baseValue / abilityType are
+// identical to ALL_CARDS, so this swap doesn't move the auction valuation.
 const CARDS_BY_ID: Record<string, CardDefinition> = {};
-for (const c of ALL_CARDS) CARDS_BY_ID[c.id] = c;
+for (const c of SESSION_CARDS) CARDS_BY_ID[c.id] = c;
 
 // ---- Tier visual identity ------------------------------------------------
 //

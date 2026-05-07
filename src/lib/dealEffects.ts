@@ -1,4 +1,4 @@
-import { ALL_CARDS, CardDefinition } from "./cards";
+import { CardDefinition, SESSION_CARDS } from "./cards";
 
 /**
  * Deal-time roster mods. These run BEFORE handTransforms in freshAtBat and
@@ -15,18 +15,44 @@ import { ALL_CARDS, CardDefinition } from "./cards";
  * effect is silently a no-op if the relevant pool is empty.
  */
 
-const GENERAL_BATTING_POOL = ALL_CARDS.filter(
+// Sourced from SESSION_CARDS so freshly-dealt cards (b-67 Foul Ball redraw,
+// p-54 Dual Threat extra general, p-77 Mound Visit swap) carry the same
+// per-session shape layout the rest of the player's hand already does.
+const GENERAL_BATTING_POOL = SESSION_CARDS.filter(
   (c) => c.type === "Batting" && c.abilityType === "General Draw",
 );
-const GENERAL_PITCHING_POOL = ALL_CARDS.filter(
+const GENERAL_PITCHING_POOL = SESSION_CARDS.filter(
   (c) => c.type === "Pitching" && c.abilityType === "General Draw",
 );
 
-function pickRandomNotIn(pool: CardDefinition[], avoid: CardDefinition[]): CardDefinition | null {
+type RngFn = () => number;
+
+/**
+ * Small deterministic PRNG (mulberry32). Mirrors the implementation in
+ * `players.ts` so a (player, seed) pair already used for dealing can be
+ * folded into the deal-effects pass without forcing callers to move to a
+ * different random algorithm.
+ */
+function mulberry32(seed: number): RngFn {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function pickRandomNotIn(
+  pool: CardDefinition[],
+  avoid: CardDefinition[],
+  rng: RngFn,
+): CardDefinition | null {
   const avoidIds = new Set(avoid.map((c) => c.id));
   const candidates = pool.filter((c) => !avoidIds.has(c.id));
   if (candidates.length === 0) return null;
-  return candidates[Math.floor(Math.random() * candidates.length)];
+  return candidates[Math.floor(rng() * candidates.length)];
 }
 
 function lowestValueGeneralIdx(hand: CardDefinition[]): number {
@@ -60,13 +86,22 @@ export interface DealEffectResult {
   log: string[];
 }
 
+/**
+ * Apply deal-time roster mods. `seed` is optional -- when supplied, every
+ * random pick this pass makes is driven by a seeded PRNG so the (seed, hand,
+ * hand) triple reproduces exactly. When omitted, falls back to Math.random
+ * for the legacy non-deterministic behavior. gameStore feeds a per-at-bat
+ * seed so reproductions / bug reports can pin a specific deal pattern.
+ */
 export function applyDealEffects(
   batterHand: CardDefinition[],
   pitcherHand: CardDefinition[],
+  seed?: number,
 ): DealEffectResult {
   let bh = batterHand;
   let ph = pitcherHand;
   const log: string[] = [];
+  const rng: RngFn = seed === undefined ? Math.random : mulberry32(seed);
   // Track every card that ever leaves the batter's hand during this deal-time
   // pass so subsequent random redraws (b-67 Foul Ball) can't immediately
   // re-deal a card we already discarded. Without this, p-39 -> b-67 sequences
@@ -77,7 +112,7 @@ export function applyDealEffects(
   // p-54 Dual Threat: pitcher draws an extra general. Auto-take is always a
   // win for the pitcher (more cards, no downside) so we always accept.
   if (ph.some((c) => c.id === "p-54")) {
-    const extra = pickRandomNotIn(GENERAL_PITCHING_POOL, ph);
+    const extra = pickRandomNotIn(GENERAL_PITCHING_POOL, ph, rng);
     if (extra) {
       ph = [...ph, extra];
       log.push(`p-54 Dual Threat: drew extra general ${extra.id}`);
@@ -122,6 +157,7 @@ export function applyDealEffects(
       const next = pickRandomNotIn(
         GENERAL_BATTING_POOL,
         [...bh, ...draws, ...batterDiscarded],
+        rng,
       );
       if (next) draws.push(next);
     }
@@ -138,7 +174,7 @@ export function applyDealEffects(
   if (ph.some((c) => c.id === "p-77")) {
     const idx = lowestValueAnyIdx(ph);
     if (idx !== -1) {
-      const fresh = pickRandomNotIn(GENERAL_PITCHING_POOL, ph);
+      const fresh = pickRandomNotIn(GENERAL_PITCHING_POOL, ph, rng);
       if (fresh) {
         const removed = ph[idx];
         ph = ph.map((c, i) => (i === idx ? fresh : c));

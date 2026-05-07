@@ -3,7 +3,7 @@ import { CardDefinition } from "./cards";
 import { BATTERS, dealHand, MlbPlayer, PITCHERS } from "./players";
 import { HitOutcome, resolveHitScale, scoreHand, ScoringContext, ScoringResult } from "./scoring";
 import { canConnect, seamKey } from "./connect";
-import { applyCardEffect, EffectContext } from "./cardEffects";
+import { applyCardEffect, EffectContext, highestValueCard } from "./cardEffects";
 import { applyHandTransforms } from "./handTransforms";
 import { applyDealEffects } from "./dealEffects";
 import { applyResolveStep, PendingDebuff, RunnerSlot } from "./resolveStep";
@@ -25,6 +25,14 @@ import { TUTORIAL_STEPS } from "./tutorialSteps";
 export type Half = "top" | "bottom";
 export type Team = "HOME" | "AWAY";
 export type Side = "Batting" | "Pitching";
+/**
+ * Which lane the player committed to from the StartGameScreen. Drives the
+ * in-game "New Game" rematch button so it stays inside the chosen lane
+ * instead of always punting to an auction draft. `null` means the player
+ * hasn't picked a lane yet (initial boot, post-`reset`); the StartGameScreen
+ * is the source of truth in that case.
+ */
+export type GameMode = "draft" | "quick-match" | null;
 /**
  * `revealing` sits between `selecting` and `between-at-bats`. lockIn computes
  * the final outcome (and applies bases / runs / outs) but parks the phase here
@@ -249,6 +257,20 @@ export interface GameState {
    */
   userTeam: Team;
 
+  /**
+   * Which lane the player is in. `'draft'` means the auction-draft path was
+   * chosen via {@link startDraft}; `'quick-match'` means the random-roster
+   * path via {@link startQuickMatch}. `null` before any lane is committed
+   * (initial boot, post-`reset`).
+   *
+   * The in-game "New Game" button uses this to start a fresh match in the
+   * SAME lane: locking in your cards in a quick match shouldn't suddenly
+   * drop you into an auction the next time you tap New Game. Anything that
+   * exits gameplay back to the StartGameScreen (legacy `reset`, tutorial
+   * end) clears this so the lane chooser is the source of truth again.
+   */
+  gameMode: GameMode;
+
   // Score.
   homeScore: number;
   awayScore: number;
@@ -277,6 +299,17 @@ export interface GameState {
   lastBatterScore: number;
   lastPitcherScore: number;
   lastResultMessage: string;
+  /**
+   * Player-facing log lines produced by the resolve step of the most recent
+   * at-bat (e.g. "Stolen Bag: extra runner placed on 1B"). Surfaced under the
+   * hit-result banner so post-hit card effects don't read as visual glitches:
+   * before this, b-135 Stolen Bag silently dropped a phantom runner on 1B and
+   * playtest reports flagged the field as showing "duplicate runners". The
+   * raw resolveStep log carries a "p-44 ", "b-135 ", ... prefix; we strip the
+   * card id when persisting so the UI can render the clean tail directly.
+   * Cleared at the start of each new at-bat (and on reset).
+   */
+  lastResolveLog: string[];
   /**
    * Snapshot of the per-card modifier values (from scoreBatter / scorePitcher)
    * captured at lock-in time. The result phase reads these instead of the live
@@ -612,6 +645,38 @@ function pickAvoidingRecent<T extends { id: string }>(pool: T[], recent: string[
   return candidates[Math.floor(Math.random() * candidates.length)];
 }
 
+/**
+ * Pitcher-pick variant that ALSO filters out same-team / same-name as the
+ * already-chosen batter. Two-way Ohtani lives in both `BATTERS` and
+ * `PITCHERS` (`ohtani-bat` and `ohtani-pit`) and was the headline case --
+ * the HUD literally read "SHOHEI OHTANI" on both sides of the matchup. The
+ * same-team filter rules out other surreal pairings like Aaron Judge (NYY)
+ * batting against Gerrit Cole (NYY), which broke the fiction even when the
+ * mechanics worked correctly.
+ *
+ * Falls back through filter tiers (recent + team + name -> recent + name ->
+ * recent only -> raw pool) so the pick never starves on a pool small enough
+ * to make every option overlap on something.
+ */
+function pickPitcherForBatter(
+  pool: MlbPlayer[],
+  recent: string[],
+  batter: MlbPlayer,
+): MlbPlayer {
+  const tiers: ((p: MlbPlayer) => boolean)[] = [
+    (p) => !recent.includes(p.id) && p.team !== batter.team && p.name !== batter.name,
+    (p) => !recent.includes(p.id) && p.name !== batter.name,
+    (p) => !recent.includes(p.id),
+  ];
+  for (const filter of tiers) {
+    const candidates = pool.filter(filter);
+    if (candidates.length > 0) {
+      return candidates[Math.floor(Math.random() * candidates.length)];
+    }
+  }
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
 function pushRecent(list: string[], id: string, limit: number): string[] {
   const next = [id, ...list.filter((x) => x !== id)];
   return next.slice(0, limit);
@@ -683,13 +748,22 @@ function freshAtBat(opts: FreshAtBatOptions = {}): FreshAtBat {
   const battersPool = opts.battersPool && opts.battersPool.length > 0 ? opts.battersPool : BATTERS;
   const pitchersPool = opts.pitchersPool && opts.pitchersPool.length > 0 ? opts.pitchersPool : PITCHERS;
   const batter = pickAvoidingRecent(battersPool, opts.recent?.batters ?? []);
-  const pitcher = pickAvoidingRecent(pitchersPool, opts.recent?.pitchers ?? []);
+  const pitcher = pickPitcherForBatter(
+    pitchersPool,
+    opts.recent?.pitchers ?? [],
+    batter,
+  );
   const rawBatter = dealHand(batter);
   const rawPitcher = dealHand(pitcher);
 
   // Phase 2 ordering: roster mods (add/remove/swap) run BEFORE shape/value
   // transforms, so b-21 / p-31 / p-47 etc. see the final hand composition.
-  const dealResult = applyDealEffects(rawBatter, rawPitcher);
+  // Per-at-bat seed: applyDealEffects used to pull `Math.random()` directly
+  // which made b-67 / p-54 / p-77 redraws non-reproducible (and triggered a
+  // documented ~10% flaky test in `__effects_check`). Threading a single
+  // mulberry seed in lets bug reports / tests pin a specific outcome.
+  const dealSeed = Math.floor(Math.random() * 0x7fffffff);
+  const dealResult = applyDealEffects(rawBatter, rawPitcher, dealSeed);
   const transformed = applyHandTransforms(dealResult.batterHand, dealResult.pitcherHand);
 
   // Choices & reveals key off the post-deal hands (e.g. b-67 may have
@@ -802,6 +876,10 @@ export const useGameStore = create<GameState>((set, get) => ({
   // Default AWAY preserves the historical "user bats in the top of the
   // 1st" cadence -- existing tests and playtest muscle memory carry over.
   userTeam: "AWAY",
+  // No lane committed yet -- the StartGameScreen will set this when the
+  // player picks a lane. Cleared by `reset` so the post-`reset` boot still
+  // shows the lane chooser instead of leaking the prior session's mode.
+  gameMode: null,
 
   homeScore: 0,
   awayScore: 0,
@@ -827,6 +905,7 @@ export const useGameStore = create<GameState>((set, get) => ({
   lastBatterScore: 0,
   lastPitcherScore: 0,
   lastResultMessage: "",
+  lastResolveLog: [],
   lastBatterCardModifiers: {},
   lastPitcherCardModifiers: {},
   runnerMoves: [],
@@ -1222,6 +1301,10 @@ export const useGameStore = create<GameState>((set, get) => ({
       lastBatterCardModifiers: batterResult.cardModifiers,
       lastPitcherCardModifiers: pitcherResult.cardModifiers,
       lastResultMessage: message,
+      // Strip the "b-NN " / "p-NN " card-id prefix the resolveStep prepends
+      // for debugging; the player only needs the human-readable tail (e.g.
+      // "Stolen Bag: extra runner placed on 1B").
+      lastResolveLog: resolveDelta.log.map((line) => line.replace(/^[bp]-\d+\s+/, "")),
       phase: "revealing",
       pendingResolvedPhase: next.phase,
       revealScript: script,
@@ -1264,6 +1347,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       phase: "selecting",
       lastOutcome: null,
       lastResultMessage: "",
+      lastResolveLog: [],
       // Drop the lock-in modifier snapshot so the new at-bat shows live previews.
       lastBatterCardModifiers: {},
       lastPitcherCardModifiers: {},
@@ -1310,6 +1394,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       lastBatterScore: 0,
       lastPitcherScore: 0,
       lastResultMessage: "",
+      lastResolveLog: [],
       lastBatterCardModifiers: {},
       lastPitcherCardModifiers: {},
       runnerMoves: [],
@@ -1325,6 +1410,10 @@ export const useGameStore = create<GameState>((set, get) => ({
       // `reset` is the legacy "play with random pools" path -- clear any
       // active draft so freshAtBat falls back to the global lists.
       draft: null,
+      // Drop the lane commitment too so the StartGameScreen treats the
+      // next start as a fresh choice (rather than the in-game New Game
+      // button rematching the prior lane).
+      gameMode: null,
       // Tutorial state never survives a fresh game.
       tutorialActive: false,
       tutorialStepIndex: 0,
@@ -1377,6 +1466,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     set({
       phase: "drafting",
       userTeam: team,
+      gameMode: "draft",
       draft,
       inning: 1,
       half: "top",
@@ -1392,6 +1482,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       lastBatterScore: 0,
       lastPitcherScore: 0,
       lastResultMessage: "",
+      lastResolveLog: [],
       lastBatterCardModifiers: {},
       lastPitcherCardModifiers: {},
       runnerMoves: [],
@@ -1431,6 +1522,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     set({
       phase: "selecting",
       userTeam: team,
+      gameMode: "quick-match",
       draft,
       inning: 1,
       half: "top",
@@ -1446,6 +1538,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       lastBatterScore: 0,
       lastPitcherScore: 0,
       lastResultMessage: "",
+      lastResolveLog: [],
       lastBatterCardModifiers: {},
       lastPitcherCardModifiers: {},
       runnerMoves: [],
@@ -1561,6 +1654,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       lastBatterScore: 0,
       lastPitcherScore: 0,
       lastResultMessage: "",
+      lastResolveLog: [],
       lastBatterCardModifiers: {},
       lastPitcherCardModifiers: {},
       runnerMoves: [],
@@ -1959,7 +2053,7 @@ function findAggregateSource(
       isFinalInning: s.inning === s.totalInnings,
       batterHandedness: s.batter.handedness,
       opponentHand: opponent,
-      opponentBaseCard: highestValueCard(opponent) ?? undefined,
+      opponentBaseCard: highestValueCard(opponent),
       hand,
       group: result.bestGroup,
       indexInGroup: i,
@@ -2116,23 +2210,6 @@ function computeMatchup(
 }
 
 // ============ helpers ============
-
-/**
- * Highest-baseValue card in `hand`. Tie-breaker is the lexicographically
- * smallest card id, NOT positional -- the previous "first card with max
- * value" rule meant the player could change which card got nullified
- * (e.g. by p-36 Ace's Command) by simply reordering their hand. Picking
- * by id keeps the result stable across reorders so the rule is
- * predictable for the player.
- */
-function highestValueCard(hand: CardDefinition[]): CardDefinition | null {
-  if (!hand || hand.length === 0) return null;
-  return hand.reduce((a, b) => {
-    if (b.baseValue > a.baseValue) return b;
-    if (b.baseValue === a.baseValue && b.id < a.id) return b;
-    return a;
-  });
-}
 
 /**
  * Phase 7 helper: builds connection groups using the same "canConnect AND

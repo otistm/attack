@@ -11,8 +11,23 @@ import { BaseSlot, RunnerMove, useGameStore } from '../lib/gameStore';
 const RUNNER_TEAM_COLOR = '#E53935';
 const RUNNER_TEAM_DARK = '#B71C1C';
 
+// "Phantom" runners are placed by card effects (currently only b-135 Stolen
+// Bag) rather than the natural outcome of the at-bat. They have no specific
+// drafted player attached. We tint them gold/amber so a hit + Stolen Bag
+// reads as "single + steal" instead of looking like a duplicate-runner glitch
+// when two figures appear after a single swing. Picked to stand cleanly
+// against the green grass + brown dirt and differ obviously from the red of
+// a real baserunner.
+const PHANTOM_RUNNER_COLOR = '#FFB300';
+const PHANTOM_RUNNER_DARK = '#E65100';
+
 export function Stadium() {
   const bases = useGameStore((s) => s.bases);
+  // Per-base runner identities so we can tell a real drafted player on 1B
+  // apart from an "anonymous" extra runner spawned by a card effect like
+  // b-135 Stolen Bag (where the slot is `null`). The phantom flag on the
+  // runner figures is what differentiates a stolen bag from a true hit.
+  const baseRunners = useGameStore((s) => s.baseRunners);
   const lastOutcome = useGameStore((s) => s.lastOutcome);
   const phase = useGameStore((s) => s.phase);
   const runnerMoves = useGameStore((s) => s.runnerMoves);
@@ -140,9 +155,24 @@ export function Stadium() {
         }
         return (
           <>
-            {bases[0] && <Runner position={[firstPos[0] + 1, 0, firstPos[2] - 1]} />}
-            {bases[1] && <Runner position={[secondPos[0] + 1, 0, secondPos[2] + 2]} />}
-            {bases[2] && <Runner position={[thirdPos[0] - 1, 0, thirdPos[2] - 1]} />}
+            {bases[0] && (
+              <Runner
+                position={[firstPos[0] + 1, 0, firstPos[2] - 1]}
+                phantom={baseRunners[0] === null}
+              />
+            )}
+            {bases[1] && (
+              <Runner
+                position={[secondPos[0] + 1, 0, secondPos[2] + 2]}
+                phantom={baseRunners[1] === null}
+              />
+            )}
+            {bases[2] && (
+              <Runner
+                position={[thirdPos[0] - 1, 0, thirdPos[2] - 1]}
+                phantom={baseRunners[2] === null}
+              />
+            )}
           </>
         );
       })()}
@@ -201,9 +231,13 @@ export function Stadium() {
       <Player position={[0, 0, homeToMound + 4]} role="Catcher" color="#1E88E5" />
       <Player position={[-4, 0, homeToMound - 2]} role="Batter" color="#E53935" />
 
-      <Player position={[firstPos[0] - 8, 0, firstPos[2] - 5]} role="1B" color="#1E88E5" />
+      {/* Corner infielders are pushed clearly off their bags (~18-20 ft) so a
+          new game can never look like it has a runner already standing on
+          1B / 3B. Standing right on the bag was causing first-time players to
+          report "the game started with a player on third base". */}
+      <Player position={[firstPos[0] - 14, 0, firstPos[2] - 14]} role="1B" color="#1E88E5" />
       <Player position={[25, 0, homeToMound - homeToSecond + 15]} role="2B" color="#1E88E5" />
-      <Player position={[thirdPos[0] + 8, 0, thirdPos[2] - 5]} role="3B" color="#1E88E5" />
+      <Player position={[thirdPos[0] + 14, 0, thirdPos[2] - 14]} role="3B" color="#1E88E5" />
       <Player position={[-25, 0, homeToMound - homeToSecond + 15]} role="SS" color="#1E88E5" />
       <Player position={[-90, 0, homeToMound - 200]} role="LF" color="#1E88E5" />
       <Player position={[0, 0, homeToMound - 250]} role="CF" color="#1E88E5" />
@@ -238,8 +272,19 @@ function LightTower({ position, rotation }: { position: [number, number, number]
 /**
  * Light bouncing-idle figure planted on a base. Rendered when the play has
  * settled — for the visible run between bases see {@link AnimatedRunner}.
+ *
+ * `phantom` flips the figure to its gold/amber palette to represent runners
+ * spawned by a card effect (b-135 Stolen Bag) rather than a real at-bat.
+ * Without this distinction, a hit + Stolen Bag puts two identical red figures
+ * on different bases after a single swing and the field reads as glitched.
  */
-function Runner({ position }: { position: [number, number, number] }) {
+function Runner({
+  position,
+  phantom = false,
+}: {
+  position: [number, number, number];
+  phantom?: boolean;
+}) {
   const ref = useRef<THREE.Group>(null);
   useFrame((state) => {
     if (!ref.current) return;
@@ -248,7 +293,7 @@ function Runner({ position }: { position: [number, number, number] }) {
   });
   return (
     <group ref={ref} position={position}>
-      <RunnerBody />
+      <RunnerBody phantom={phantom} />
     </group>
   );
 }
@@ -261,14 +306,16 @@ function Runner({ position }: { position: [number, number, number] }) {
  * + emissive ground halo make the figure pop against the green grass and
  * brown dirt at every zoom level.
  */
-function RunnerBody() {
+function RunnerBody({ phantom = false }: { phantom?: boolean }) {
+  const bodyColor = phantom ? PHANTOM_RUNNER_COLOR : RUNNER_TEAM_COLOR;
+  const helmetColor = phantom ? PHANTOM_RUNNER_DARK : RUNNER_TEAM_DARK;
   return (
     <>
       <mesh position={[0, 2.5, 0]} castShadow>
         <cylinderGeometry args={[1.4, 1.4, 5.0, 10]} />
         <meshStandardMaterial
-          color={RUNNER_TEAM_COLOR}
-          emissive={RUNNER_TEAM_COLOR}
+          color={bodyColor}
+          emissive={bodyColor}
           emissiveIntensity={0.45}
           roughness={0.55}
         />
@@ -280,13 +327,13 @@ function RunnerBody() {
       {/* Helmet on top so the head stands out from a fielder's cap. */}
       <mesh position={[0, 6.2, 0]} castShadow>
         <sphereGeometry args={[1.15, 16, 16, 0, Math.PI * 2, 0, Math.PI / 2]} />
-        <meshStandardMaterial color={RUNNER_TEAM_DARK} roughness={0.4} />
+        <meshStandardMaterial color={helmetColor} roughness={0.4} />
       </mesh>
       {/* Bright halo on the ground, in the team color. Larger and more opaque
           than the original so the runner is unmistakable from a wide camera. */}
       <mesh position={[0, 0.08, 0]} rotation={[-Math.PI / 2, 0, 0]}>
         <ringGeometry args={[2.4, 3.6, 32]} />
-        <meshBasicMaterial color={RUNNER_TEAM_COLOR} transparent opacity={0.55} side={THREE.DoubleSide} />
+        <meshBasicMaterial color={bodyColor} transparent opacity={0.55} side={THREE.DoubleSide} />
       </mesh>
     </>
   );
@@ -314,6 +361,14 @@ function AnimatedRunner({ move, homeToMound, firstPos, secondPos, thirdPos }: An
   const groupRef = useRef<THREE.Group>(null);
   const matRefs = useRef<THREE.Material[]>([]);
   const startTimeRef = useRef<number | null>(null);
+
+  // Phantom runners (currently only b-135 Stolen Bag's "anonymous" extra
+  // runner) carry no specific drafted player. Tinted gold/amber so a single
+  // + steal animates as two visibly different figures instead of looking
+  // like a duplicated runner glitch.
+  const phantom = move.player === null && move.kind === 'runner';
+  const bodyColor = phantom ? PHANTOM_RUNNER_COLOR : RUNNER_TEAM_COLOR;
+  const helmetColor = phantom ? PHANTOM_RUNNER_DARK : RUNNER_TEAM_DARK;
 
   // Build per-slot world positions. Runners sit slightly off the bag so they
   // don't z-fight with the BaseTarget meshes.
@@ -401,8 +456,8 @@ function AnimatedRunner({ move, homeToMound, firstPos, secondPos, thirdPos }: An
         <cylinderGeometry args={[1.4, 1.4, 5.0, 10]} />
         <meshStandardMaterial
           ref={(r) => collectMat(r as THREE.Material | null)}
-          color={RUNNER_TEAM_COLOR}
-          emissive={RUNNER_TEAM_COLOR}
+          color={bodyColor}
+          emissive={bodyColor}
           emissiveIntensity={0.55}
           roughness={0.55}
         />
@@ -419,7 +474,7 @@ function AnimatedRunner({ move, homeToMound, firstPos, secondPos, thirdPos }: An
         <sphereGeometry args={[1.15, 16, 16, 0, Math.PI * 2, 0, Math.PI / 2]} />
         <meshStandardMaterial
           ref={(r) => collectMat(r as THREE.Material | null)}
-          color={RUNNER_TEAM_DARK}
+          color={helmetColor}
           roughness={0.4}
         />
       </mesh>
@@ -427,7 +482,7 @@ function AnimatedRunner({ move, homeToMound, firstPos, secondPos, thirdPos }: An
         <ringGeometry args={[2.4, 3.6, 32]} />
         <meshBasicMaterial
           ref={(r) => collectMat(r as THREE.Material | null)}
-          color={RUNNER_TEAM_COLOR}
+          color={bodyColor}
           transparent
           opacity={0.55}
           side={THREE.DoubleSide}

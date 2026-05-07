@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useGameStore, getUserSide } from '../lib/gameStore';
-import { ALL_CARDS, CardDefinition } from '../lib/cards';
+import { CardDefinition, sessionCardById } from '../lib/cards';
 import type { PendingChoice, ResolvedChoice } from '../lib/gameStore';
 import { SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeType } from './cardShapes';
 
@@ -97,7 +97,7 @@ interface ChoicePanelProps {
 }
 
 function ChoicePanel({ choice, batterHand, pitcherHand, onResolve, onDismiss }: ChoicePanelProps) {
-  const card = ALL_CARDS.find((c) => c.id === choice.cardId);
+  const card = sessionCardById(choice.cardId);
   const promptCopy = PROMPTS[choice.type] ?? 'Make a choice';
 
   // Source the eligible target cards from the live hand the prompting card
