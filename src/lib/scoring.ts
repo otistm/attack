@@ -1,4 +1,5 @@
 import { CardDefinition, TagLiteral } from "./cards";
+import { ITEMS } from "./items";
 import { ShapeType } from "../components/cardShapes";
 import { canConnect, seamKey } from "./connect";
 import { applyCardEffect, applyOpponentTotalAdjustments, EffectContext, EffectResult, highestValueCard } from "./cardEffects";
@@ -457,7 +458,17 @@ function scoreGroup(group: CardDefinition[], ctx: ScoringContext, hand: CardDefi
       ? { selfValueDelta: 0, opponentValueDelta: 0, hitScaleBonus: 0, pitcherCombinedDelta: 0 }
       : applyCardEffect(card, effectCtx);
     // chainTooShort zeros the baseValue too (mirrors `disabled` semantics).
-    const finalValue = chainTooShort ? 0 : card.baseValue + effect.selfValueDelta;
+    
+    let itemValueBonus = 0;
+    if (ctx.equippedItems?.[card.id]) {
+      for (const itemId of ctx.equippedItems[card.id]) {
+        const item = ITEMS[itemId];
+        if (item?.valueModifier) itemValueBonus += item.valueModifier;
+        if (item?.hitScaleModifier) hitScaleBonus += item.hitScaleModifier;
+      }
+    }
+    const finalValue = chainTooShort ? 0 : card.baseValue + effect.selfValueDelta + itemValueBonus;
+
     let highlightColor: string | undefined;
     if (effect.selfValueDelta > 0) highlightColor = card.color;
     else if (effect.selfValueDelta < 0) highlightColor = DEBUFF_HIGHLIGHT;

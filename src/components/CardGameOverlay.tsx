@@ -3,10 +3,12 @@ import { createPortal } from 'react-dom';
 import { Reorder, motion, AnimatePresence } from 'motion/react';
 import { CardDefinition } from '../lib/cards';
 import { canConnect, shapeModeForSide, seamKey } from '../lib/connect';
+import { ITEMS } from '../lib/items';
 import { useGameStore, getUiUserSide, ResolutionBeat, Phase } from '../lib/gameStore';
 import { HitOutcome } from '../lib/scoring';
 import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
 import { PlayerHero } from './PlayerHero';
+import { ManagerHand } from './ManagerHand';
 import { QuestStrip } from './QuestStrip';
 
 /**
@@ -314,6 +316,8 @@ const CardItem = ({
    */
   readOnly?: boolean;
 }) => {
+  const equippedItemIdsRaw = useGameStore((s) => s.equippedItems[card.id]);
+  const equippedItemIds = equippedItemIdsRaw || [];
   // While the player is dragging, freeze ALL non-dragged cards' connection
   // state to "not connected" so we don't trigger margin shifts (8px <-> 0px),
   // border flips, or shape brightness flips on cards the user isn't holding.
@@ -1091,6 +1095,7 @@ export const CardGameOverlay = () => {
           </AnimatePresence>
         </div>
       </div>
+      <ManagerHand side={userSide} />
     </>
   );
 };

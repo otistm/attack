@@ -6,6 +6,7 @@
 import { Scene } from './components/Scene';
 import { UIOverlay } from './components/UIOverlay';
 import { DraftScreen } from './components/DraftScreen';
+import { ShopScreen } from './components/ShopScreen';
 import { StartGameScreen } from './components/StartGameScreen';
 import { TutorialOverlay } from './components/TutorialOverlay';
 import { useGameStore } from './lib/gameStore';
@@ -23,6 +24,7 @@ export default function App() {
       <UIOverlay />
       {/* Draft overlay sits ABOVE the game UI when phase === 'drafting'. */}
       {phase === 'drafting' && <DraftScreen />}
+      {phase === 'shop' && <ShopScreen />}
       {/* Pre-game lane chooser (auction vs quick match). Self-gates on
           `showStartScreen`; we additionally suppress it during an in-flight
           draft so the auction overlay never renders behind it. */}
