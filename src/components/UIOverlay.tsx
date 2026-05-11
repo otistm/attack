@@ -66,6 +66,7 @@ export function UIOverlay() {
 
   const phaseLabel: Record<typeof phase, string> = {
     drafting: 'Draft',
+    shop: 'Shop',
     selecting: 'Card Selection',
     resolving: 'Resolving',
     revealing: 'Revealing',
@@ -74,6 +75,7 @@ export function UIOverlay() {
   };
   const phaseTone: Record<typeof phase, string> = {
     drafting: 'text-violet-400',
+    shop: 'text-cyan-400',
     selecting: 'text-amber-400',
     resolving: 'text-sky-400',
     revealing: 'text-fuchsia-400',

@@ -3407,7 +3407,8 @@ import { BATTERS, PITCHERS, PLAYERS } from "./players";
   useGameStore.getState().startQuickMatch("AWAY");
   const after = useGameStore.getState();
 
-  assert(after.phase === "selecting", "QM/store: phase = selecting after startQuickMatch");
+  assert(after.phase === "shop", "QM/store: phase = shop after startQuickMatch (pre-battle Front Office)");
+  useGameStore.setState({ phase: "selecting" });
   assert(after.userTeam === "AWAY", "QM/store: userTeam set");
   assert(after.draft !== null, "QM/store: draft populated");
   assert(after.draft?.phase === "complete", "QM/store: draft.phase = complete");
@@ -3444,7 +3445,8 @@ import { BATTERS, PITCHERS, PLAYERS } from "./players";
   const after = useGameStore.getState();
 
   assert(after.userTeam === "HOME", "QM/store HOME: userTeam set");
-  assert(after.phase === "selecting", "QM/store HOME: phase = selecting");
+  assert(after.phase === "shop", "QM/store HOME: phase = shop after startQuickMatch");
+  useGameStore.setState({ phase: "selecting" });
   assert(after.gameMode === "quick-match", "QM/store HOME: gameMode = quick-match");
   // half=top, userTeam=HOME means user is pitching first, so the batter
   // comes from the AI side and the pitcher comes from the user side.
@@ -3542,6 +3544,7 @@ import { BATTERS, PITCHERS, PLAYERS } from "./players";
   // Re-arm tutorial mode and walk to step 1 (any non-final step).
   useGameStore.getState().reset();
   useGameStore.getState().startQuickMatch("AWAY");
+  useGameStore.setState({ phase: "selecting" });
   useGameStore.getState().startTutorial();
   useGameStore.getState().tutorialNext();
   s = useGameStore.getState();
@@ -3558,6 +3561,7 @@ import { BATTERS, PITCHERS, PLAYERS } from "./players";
   // ---- lockIn ON final step clears the flag and resolves the at-bat ----
   useGameStore.getState().reset();
   useGameStore.getState().startQuickMatch("AWAY");
+  useGameStore.setState({ phase: "selecting" });
   useGameStore.getState().startTutorial();
   // Jump straight to the final step.
   for (let i = 0; i < TUTORIAL_STEPS.length - 1; i++) {

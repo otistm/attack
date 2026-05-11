@@ -7,6 +7,7 @@ import { useGameStore, getUiUserSide, getUserSide, ResolutionBeat, Phase } from 
 import { HitOutcome } from '../lib/scoring';
 import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
 import { PlayerHero } from './PlayerHero';
+import { ManagerHand } from './ManagerHand';
 import { QuestStrip } from './QuestStrip';
 import { teamPalette } from '../lib/teamColors';
 import { TIER_BASE_VALUE } from '../lib/run';
@@ -321,6 +322,8 @@ const CardItem = ({
    */
   readOnly?: boolean;
 }) => {
+  const equippedItemIdsRaw = useGameStore((s) => s.equippedItems[card.id]);
+  const equippedItemIds = equippedItemIdsRaw || [];
   // While the player is dragging, freeze ALL non-dragged cards' connection
   // state to "not connected" so we don't trigger margin shifts (8px <-> 0px),
   // border flips, or shape brightness flips on cards the user isn't holding.
@@ -1264,6 +1267,8 @@ export const CardGameOverlay = () => {
           </AnimatePresence>
         </div>
       </motion.div>
+
+      <ManagerHand side={userSide} />
 
       {/* SZN Mode: dugout panel + toggle. Mounted as a sibling of the
           hand container so it can render below the lifted hand and own

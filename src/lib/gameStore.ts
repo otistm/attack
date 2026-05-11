@@ -79,6 +79,7 @@ export type GameMode = "draft" | "quick-match" | "szn" | null;
  * (between-at-bats or game-over) is stashed in `pendingResolvedPhase`.
  */
 export type Phase =
+  | "shop"
   | "drafting"
   | "selecting"
   | "resolving"
@@ -344,6 +345,13 @@ export interface GameState {
    * end) clears this so the lane chooser is the source of truth again.
    */
   gameMode: GameMode;
+
+  // Season State
+  seasonWins: number;
+  seasonLosses: number;
+  teamBudget: number;
+  inventory: string[];
+  equippedItems: Record<string, string[]>; // cardId -> itemIds
 
   // Score.
   homeScore: number;
@@ -660,6 +668,8 @@ export interface GameState {
    * player confirms a custom roll from the pre-game quest picker.
    */
   startQuickMatch: (team: Team, questSlate?: string[]) => void;
+  equipItem: (itemId: string, targetCardId: string) => void;
+  unEquipItem: (itemId: string, sourceCardId: string) => void;
   /**
    * Open an auction on the given player. No-op unless `phase === "drafting"`,
    * the user is the current nominator, and the player is in the pool. The
@@ -1205,6 +1215,12 @@ export const useGameStore = create<GameState>((set, get) => ({
   // shows the lane chooser instead of leaking the prior session's mode.
   gameMode: null,
 
+  seasonWins: 0,
+  seasonLosses: 0,
+  teamBudget: 1000,
+  inventory: [],
+  equippedItems: {},
+
   homeScore: 0,
   awayScore: 0,
   bases: [false, false, false],
@@ -1384,6 +1400,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     const ctx: ScoringContext = {
       side: "Batting",
       inning: s.inning,
+      equippedItems: s.equippedItems,
       isFirstAtBatOfInning: s.isFirstAtBatOfInning,
       outs: s.outs,
       isFinalInning: s.inning === s.totalInnings,
@@ -1452,6 +1469,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     const ctx: ScoringContext = {
       side: "Pitching",
       inning: s.inning,
+      equippedItems: s.equippedItems,
       isFirstAtBatOfInning: s.isFirstAtBatOfInning,
       outs: s.outs,
       isFinalInning: s.inning === s.totalInnings,
@@ -2001,10 +2019,15 @@ export const useGameStore = create<GameState>((set, get) => ({
       pitchersPool: draft.roster[fieldingSide].pitchers,
     });
     set({
-      phase: "selecting",
+      phase: "shop",
       userTeam: team,
       gameMode: "quick-match",
       draft,
+      seasonWins: 0,
+      seasonLosses: 0,
+      teamBudget: 1000,
+      inventory: [],
+      equippedItems: {},
       inning: 1,
       half: "top",
       outs: 0,
@@ -2733,8 +2756,39 @@ export const useGameStore = create<GameState>((set, get) => ({
     });
     return true;
   },
-}));
 
+  equipItem: (itemId, targetCardId) => {
+    set((s) => {
+      if (!s.inventory.includes(itemId)) return s;
+      const current = s.equippedItems[targetCardId] || [];
+      return {
+        inventory: s.inventory.filter((id) => id !== itemId),
+        equippedItems: {
+          ...s.equippedItems,
+          [targetCardId]: [...current, itemId],
+        },
+      };
+    });
+  },
+
+  unEquipItem: (itemId, sourceCardId) => {
+    set((s) => {
+      const current = s.equippedItems[sourceCardId] || [];
+      if (!current.includes(itemId)) return s;
+
+      const newItems = [...current];
+      newItems.splice(newItems.indexOf(itemId), 1);
+
+      return {
+        inventory: [...s.inventory, itemId],
+        equippedItems: {
+          ...s.equippedItems,
+          [sourceCardId]: newItems,
+        },
+      };
+    });
+  },
+}));
 /**
  * Score a hand using the same context the store would build, but with an
  * arbitrary card list substituted in. Used by lockIn / previewMatchup when
@@ -2789,6 +2843,7 @@ function scoreHandFor(
   const ctx: ScoringContext = {
     side,
     inning: s.inning,
+      equippedItems: s.equippedItems,
     isFirstAtBatOfInning: s.isFirstAtBatOfInning,
     outs: s.outs,
     isFinalInning: s.inning === s.totalInnings,
@@ -3129,6 +3184,7 @@ function findAggregateSource(
     const ctx: EffectContext = {
       side,
       inning: s.inning,
+      equippedItems: s.equippedItems,
       isFirstAtBatOfInning: s.isFirstAtBatOfInning,
       outs: s.outs,
       isFinalInning: s.inning === s.totalInnings,

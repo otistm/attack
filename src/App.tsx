@@ -6,6 +6,7 @@
 import { Scene } from './components/Scene';
 import { UIOverlay } from './components/UIOverlay';
 import { DraftScreen } from './components/DraftScreen';
+import { ShopScreen } from './components/ShopScreen';
 import { StartGameScreen } from './components/StartGameScreen';
 import { TutorialOverlay } from './components/TutorialOverlay';
 import { PackRipScreen } from './components/PackRipScreen';
@@ -57,6 +58,7 @@ export default function App() {
       <RunHud />
       {/* Draft overlay sits ABOVE the game UI when phase === 'drafting'. */}
       {phase === 'drafting' && <DraftScreen />}
+      {phase === 'shop' && <ShopScreen />}
       {/* SZN Mode screens — only one mounts at a time based on run state. */}
       {sznShowPack && <PackRipScreen />}
       {sznShowFrontOffice && <FrontOfficeScreen />}

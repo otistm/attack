@@ -5,6 +5,7 @@ export type QuestTeam = "HOME" | "AWAY";
 export type QuestHalf = "top" | "bottom";
 export type QuestPhaseAfter =
   | "drafting"
+  | "shop"
   | "selecting"
   | "resolving"
   | "revealing"
