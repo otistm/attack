@@ -2,10 +2,12 @@ import { useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import {
   BookOpen,
+  Calendar,
   ChevronRight,
   GraduationCap,
   Layers,
   Lock,
+  Play,
   Settings,
   Trophy,
   Zap,
@@ -40,6 +42,7 @@ export function StartGameScreen() {
   const phase = useGameStore((s) => s.phase);
   const startDraft = useGameStore((s) => s.startDraft);
   const startQuickMatch = useGameStore((s) => s.startQuickMatch);
+  const startSznRun = useGameStore((s) => s.startSznRun);
   const startTutorial = useGameStore((s) => s.startTutorial);
 
   // The screen never paints over an in-flight auction. App.tsx also gates
@@ -71,6 +74,7 @@ export function StartGameScreen() {
               <MainMenu
                 onAuction={(team) => startDraft(team)}
                 onQuickConfirm={(team, questSlate) => startQuickMatch(team, questSlate)}
+                onSzn={(team) => startSznRun(team)}
                 onLearn={() => {
                   // Tutorial always plays as AWAY so the user bats in the
                   // top of the 1st -- the modal copy assumes that seat.
@@ -137,7 +141,7 @@ function Logo() {
  * Main menu controls
  * --------------------------------------------------------------------------- */
 
-type Lane = 'auction' | 'quick';
+type Lane = 'auction' | 'quick' | 'szn';
 
 function QuickQuestPickerModal({
   team,
@@ -228,10 +232,12 @@ function QuickQuestPickerModal({
 function MainMenu({
   onAuction,
   onQuickConfirm,
+  onSzn,
   onLearn,
 }: {
   onAuction: (team: Team) => void;
   onQuickConfirm: (team: Team, questSlate: string[]) => void;
+  onSzn: (team: Team) => void;
   onLearn: () => void;
 }) {
   const [openLane, setOpenLane] = useState<Lane | null>(null);
@@ -272,6 +278,16 @@ function MainMenu({
             rerollSpent: false,
           });
         }}
+      />
+      <LaneButton
+        lane="szn"
+        title="SZN Mode"
+        subtitle="Make it to the World Series"
+        icon={<Calendar className="w-6 h-6" />}
+        variant="emerald"
+        expanded={openLane === 'szn'}
+        onToggle={() => toggle('szn')}
+        onPickTeam={(team) => onSzn(team)}
       />
 
       {/* Tertiary "Learn to Play" entry. Smaller and ghost-styled so it
@@ -320,6 +336,7 @@ function MainMenu({
 }
 
 function LaneButton({
+  lane,
   title,
   subtitle,
   icon,
@@ -332,7 +349,7 @@ function LaneButton({
   title: string;
   subtitle: string;
   icon: React.ReactNode;
-  variant: 'red' | 'gold';
+  variant: 'red' | 'gold' | 'emerald';
   expanded: boolean;
   onToggle: () => void;
   onPickTeam: (team: Team) => void;
@@ -340,13 +357,27 @@ function LaneButton({
   const buttonClass =
     variant === 'red'
       ? 'dugout-btn-primary text-white shadow-[0_0_20px_rgba(227,24,55,0.4)] hover:shadow-[0_0_30px_rgba(227,24,55,0.7)]'
-      : 'dugout-btn-gold text-stone-900 shadow-[0_0_20px_rgba(255,215,0,0.35)] hover:shadow-[0_0_30px_rgba(255,215,0,0.6)]';
+      : variant === 'emerald'
+        ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-[0_0_20px_rgba(16,185,129,0.4)] hover:shadow-[0_0_30px_rgba(16,185,129,0.7)] transition-colors'
+        : 'dugout-btn-gold text-stone-900 shadow-[0_0_20px_rgba(255,215,0,0.35)] hover:shadow-[0_0_30px_rgba(255,215,0,0.6)]';
+  // SZN Mode skips the AWAY/HOME team picker -- a run is asynchronous
+  // weekend baseball, not a coin-flip game, so the seat distinction is
+  // meaningless to a player just picking up the lane. Clicking "SZN Mode"
+  // jumps straight into the pack rip with the user batting first (AWAY).
+  const skipTeamPicker = lane === 'szn';
+  const handleClick = () => {
+    if (skipTeamPicker) {
+      onPickTeam('AWAY');
+      return;
+    }
+    onToggle();
+  };
   return (
     <div className="flex flex-col">
       <button
         type="button"
-        onClick={onToggle}
-        aria-expanded={expanded}
+        onClick={handleClick}
+        aria-expanded={skipTeamPicker ? undefined : expanded}
         className={`${buttonClass} w-full py-4 px-6 rounded-xl dugout-font-sport text-2xl sm:text-3xl uppercase tracking-wider flex items-center justify-between gap-3 transition-shadow`}
       >
         <span className="flex items-center gap-3">
@@ -358,13 +389,21 @@ function LaneButton({
             </span>
           </span>
         </span>
-        <ChevronRight
-          className={`w-5 h-5 transition-transform duration-200 ${expanded ? 'rotate-90' : ''}`}
-        />
+        {/* Lanes that expand into a team picker show a chevron that
+            rotates to indicate "drawer opens"; lanes that jump straight
+            into a run (currently SZN Mode) show a play glyph so the
+            user reads the click as a commit rather than an expand. */}
+        {skipTeamPicker ? (
+          <Play className="w-5 h-5" />
+        ) : (
+          <ChevronRight
+            className={`w-5 h-5 transition-transform duration-200 ${expanded ? 'rotate-90' : ''}`}
+          />
+        )}
       </button>
 
       <AnimatePresence initial={false}>
-        {expanded && (
+        {expanded && !skipTeamPicker && (
           <motion.div
             key="team-picker"
             initial={{ height: 0, opacity: 0 }}

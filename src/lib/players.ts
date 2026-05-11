@@ -1,4 +1,6 @@
 import { CardDefinition, Handedness, SESSION_CARDS } from "./cards";
+import type { ShapeType } from "../components/cardShapes";
+import type { ClassTag } from "./run";
 
 export interface MlbPlayer {
   id: string;
@@ -7,9 +9,68 @@ export interface MlbPlayer {
   role: "Batter" | "Pitcher";
   handedness: Handedness;
   signatureCardIds: string[];
+  /**
+   * Shape sockets exposed by the player at the plate in SZN Mode. Items
+   * connect to the player via these sides through the existing shape engine.
+   * Defaults are derived from each player's first signature card so legacy
+   * paths (Quick Match, Auction Draft) don't need to deal with them.
+   */
+  leftShape: ShapeType;
+  rightShape: ShapeType;
+  /** SZN Mode class tag. */
+  tag: ClassTag;
 }
 
-export const PLAYERS: MlbPlayer[] = [
+/**
+ * SZN Mode class tag per player. Drives team-wide synergy buffs (see
+ * `synergies.ts`). Defined here next to PLAYERS so adding a player can't
+ * silently leak into SZN mode without a tag.
+ */
+const PLAYER_TAGS: Record<string, ClassTag> = {
+  judge: "Slugger",
+  "ohtani-bat": "Slugger",
+  soto: "Contact",
+  delacruz: "Speedster",
+  betts: "Contact",
+  witt: "Speedster",
+  harper: "Slugger",
+  acuna: "Speedster",
+  henderson: "Contact",
+  vlad: "Slugger",
+  trout: "Veteran",
+  freeman: "Veteran",
+  alvarez: "Slugger",
+  seager: "Contact",
+  jramirez: "Veteran",
+  alonso: "Slugger",
+  tturner: "Speedster",
+  rutschman: "Rookie",
+  devers: "Slugger",
+  lindor: "Veteran",
+  altuve: "Veteran",
+  chisholm: "Speedster",
+  skenes: "Strikeout",
+  cole: "Veteran",
+  skubal: "Strikeout",
+  wheeler: "Starter",
+  clase: "Closer",
+  miller: "Closer",
+  sale: "Veteran",
+  "ohtani-pit": "Strikeout",
+  yamamoto: "Control",
+  cease: "Strikeout",
+};
+
+interface PlayerSeed {
+  id: string;
+  name: string;
+  team: string;
+  role: "Batter" | "Pitcher";
+  handedness: Handedness;
+  signatureCardIds: string[];
+}
+
+const PLAYER_SEEDS: PlayerSeed[] = [
   // ===== Batters =====
   { id: "judge", name: "Aaron Judge", team: "NYY", role: "Batter", handedness: "R", signatureCardIds: ["b-1", "b-2", "b-3"] },
   { id: "ohtani-bat", name: "Shohei Ohtani", team: "LAD", role: "Batter", handedness: "L", signatureCardIds: ["b-4", "b-5", "b-6"] },
@@ -21,7 +82,6 @@ export const PLAYERS: MlbPlayer[] = [
   { id: "acuna", name: "Ronald Acuña Jr.", team: "ATL", role: "Batter", handedness: "R", signatureCardIds: ["b-22", "b-23", "b-24"] },
   { id: "henderson", name: "Gunnar Henderson", team: "BAL", role: "Batter", handedness: "L", signatureCardIds: ["b-25", "b-26", "b-27"] },
   { id: "vlad", name: "Vladimir Guerrero Jr.", team: "TOR", role: "Batter", handedness: "R", signatureCardIds: ["b-28", "b-29", "b-30"] },
-  // Draft-pool expansion (Phase 7): 12 additional batters.
   { id: "trout", name: "Mike Trout", team: "LAA", role: "Batter", handedness: "R", signatureCardIds: ["b-100", "b-101", "b-102"] },
   { id: "freeman", name: "Freddie Freeman", team: "LAD", role: "Batter", handedness: "L", signatureCardIds: ["b-103", "b-104", "b-105"] },
   { id: "alvarez", name: "Yordan Alvarez", team: "HOU", role: "Batter", handedness: "L", signatureCardIds: ["b-106", "b-107", "b-108"] },
@@ -47,6 +107,38 @@ export const PLAYERS: MlbPlayer[] = [
   { id: "yamamoto", name: "Yoshinobu Yamamoto", team: "LAD", role: "Pitcher", handedness: "R", signatureCardIds: ["p-55", "p-56", "p-57"] },
   { id: "cease", name: "Dylan Cease", team: "SDP", role: "Pitcher", handedness: "R", signatureCardIds: ["p-58", "p-59", "p-60"] },
 ];
+
+/**
+ * Build the live `MlbPlayer` list. We derive each player's left/right shape
+ * from their first signature card's shapes so SZN mode connectors are
+ * authentic to the player's pitch/hit identity.
+ *
+ * Falls back to ('square', 'circle') if the signature card is missing. The
+ * existing module-load assertion below catches that case as a startup error,
+ * but the fallback keeps tooling-only paths (typecheck before assertions
+ * run) from crashing.
+ */
+const _seedShapeFor = (cardId: string): { left: ShapeType; right: ShapeType } => {
+  const card = SESSION_CARDS.find((c) => c.id === cardId);
+  if (!card) return { left: "square", right: "circle" };
+  return { left: card.leftShape, right: card.rightShape };
+};
+
+export const PLAYERS: MlbPlayer[] = PLAYER_SEEDS.map((seed) => {
+  const tag = PLAYER_TAGS[seed.id];
+  if (!tag) {
+    throw new Error(
+      `players.ts: ${seed.id} (${seed.name}) is missing a SZN Mode class tag in PLAYER_TAGS.`,
+    );
+  }
+  const shapes = _seedShapeFor(seed.signatureCardIds[0]);
+  return {
+    ...seed,
+    leftShape: shapes.left,
+    rightShape: shapes.right,
+    tag,
+  };
+});
 
 export const BATTERS = PLAYERS.filter((p) => p.role === "Batter");
 export const PITCHERS = PLAYERS.filter((p) => p.role === "Pitcher");

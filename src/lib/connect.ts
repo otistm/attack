@@ -1,5 +1,48 @@
 import { CardDefinition } from "./cards";
+import type { MlbPlayer } from "./players";
 import { ShapeMode, ShapeType } from "../components/cardShapes";
+
+/**
+ * SZN Mode adapter: turn an `MlbPlayer` into a `CardDefinition`-shaped
+ * record so the existing `canConnect` rules apply unchanged when items
+ * connect to the player at the plate. The player carries no abilities or
+ * combineConstraints; only its left/right sockets matter for chaining.
+ *
+ * `baseValue` is 0 in connect (SZN seeds tier in `freshAtBat` from the run
+ * roster).
+ */
+export function playerAsCard(player: MlbPlayer): CardDefinition {
+  return {
+    id: `player:${player.id}`,
+    name: player.name,
+    player: player.name,
+    type: player.role === "Batter" ? "Batting" : "Pitching",
+    abilityType: "Player",
+    baseValue: 0,
+    leftShape: player.leftShape,
+    rightShape: player.rightShape,
+    description: "",
+    handedness: player.handedness,
+  };
+}
+
+/**
+ * Convenience: can a card connect to either side of the player at the
+ * plate? Returns `{ left, right }` booleans the UI can use to drive
+ * drop-zone hints in SZN Mode.
+ */
+export function canConnectToPlayer(
+  player: MlbPlayer,
+  itemCard: CardDefinition,
+): { left: boolean; right: boolean } {
+  const playerCard = playerAsCard(player);
+  return {
+    // Item sits to the LEFT of the player => itemCard's right meets player's left.
+    left: canConnect(itemCard, playerCard),
+    // Item sits to the RIGHT of the player => player's right meets item's left.
+    right: canConnect(playerCard, itemCard),
+  };
+}
 
 /**
  * Stable identifier for a seam between two cards, regardless of which side of

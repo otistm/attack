@@ -484,29 +484,37 @@ function pitcherCtx(opp: CardDefinition[]): ScoringContext {
         p.bestGroup.map((c) => c.id));
 
       // Expected ordered script:
-      //   1. selfModifier pitching p-32 (8 -> 10, +2 uncombined bonus)
-      //   2. targetedDebuff b-2 -> p-32 (-2)
-      // No batter selfMod (b-2 has no own bonus). No pitcher selfMod for
-      // p-44 (it's not in bestGroup and has no own bonus anyway).
-      assert(beats.length === 2,
-        "Phase 2 A: 2-beat script", beats);
+      //   1. selfModifier batter b-2 — full chain value (vanilla card still
+      //      gets a beat so the pill steps up through the chain)
+      //   2. selfModifier pitching p-32 (full locked value incl. +2 uncombined)
+      //   3. targetedDebuff b-2 -> p-32 (-2)
+      assert(beats.length === 3,
+        "Phase 2 A: 3-beat script", beats);
 
       assertBeat(beats[0], {
         kind: "selfModifier",
-        side: "Pitching",
-        cardId: "p-32",
-        baseValue: 8,
-        finalValue: 10,
+        side: "Batting",
+        cardId: "b-2",
+        baseValue: 0,
+        finalValue: 6,
       }, "Phase 2 A beat 0");
 
       assertBeat(beats[1], {
+        kind: "selfModifier",
+        side: "Pitching",
+        cardId: "p-32",
+        baseValue: 0,
+        finalValue: 10,
+      }, "Phase 2 A beat 1");
+
+      assertBeat(beats[2], {
         kind: "targetedDebuff",
         sourceSide: "Batting",
         sourceCardId: "b-2",
         targetSide: "Pitching",
         targetCardId: "p-32",
         delta: -2,
-      }, "Phase 2 A beat 1");
+      }, "Phase 2 A beat 2");
     },
   );
 
@@ -530,10 +538,14 @@ function pitcherCtx(opp: CardDefinition[]): ScoringContext {
         p.bestGroup.map((c) => c.id));
 
       // p-71 is "Four-Seam Fastball" (+1 if uncombined). Combined here, so
-      // no self-mod beat. b-17 also has no self-mod (its only effect is the
-      // pitcher-combined debuff). So the script is ONLY the two b-17 beats.
+      // no *extra* buff, but both combo cards still get a chain-step beat
+      // (baseValue 0 -> full mod.value). b-17 gets a batter chain beat too,
+      // then two b-17 targeted debuffs on the pitcher cards.
       const targeted = beats.filter((x) => x.kind === "targetedDebuff");
       const aggregates = beats.filter((x) => x.kind === "aggregateDebuff");
+      const selfMods = beats.filter((x) => x.kind === "selfModifier");
+      assert(selfMods.length === 3,
+        "Phase 2 B: 3 chain-step selfModifier beats", selfMods);
       assert(targeted.length === 2,
         "Phase 2 B: 2 targeted beats from b-17", targeted);
       assert(aggregates.length === 0,

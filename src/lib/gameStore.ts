@@ -1,8 +1,8 @@
 import { create } from "zustand";
-import { CardDefinition } from "./cards";
-import { BATTERS, dealHand, MlbPlayer, PITCHERS } from "./players";
+import { CardDefinition, SESSION_CARDS } from "./cards";
+import { BATTERS, dealHand, MlbPlayer, PITCHERS, PLAYERS } from "./players";
 import { HitOutcome, resolveHitScale, scoreHand, ScoringContext, ScoringResult } from "./scoring";
-import { canConnect, seamKey } from "./connect";
+import { canConnect, playerAsCard, seamKey } from "./connect";
 import { applyCardEffect, EffectContext, highestValueCard } from "./cardEffects";
 import { applyHandTransforms } from "./handTransforms";
 import { applyDealEffects } from "./dealEffects";
@@ -34,6 +34,30 @@ import {
   QUEST_REWARD_INITIAL,
 } from "./questRewards";
 import { playSfx } from "./sfx";
+import {
+  emptyRunState,
+  FRONT_OFFICE_DAYS,
+  MAX_PICKS_PER_DAY,
+  indexOfRosterPlayer,
+  makeRunId,
+  nextTier as nextRunTier,
+  RUN_LOSS_LIMIT,
+  RUN_WIN_TARGET,
+  STARTER_PACK_BATTERS,
+  STARTER_PACK_PITCHERS,
+  TIER_BASE_VALUE,
+  WEEKLY_CASH,
+  type DayOfWeek,
+  type EncounterOffer,
+  type EventEffect,
+  type Item,
+  type RosterPlayer,
+  type RunState,
+  type Tier,
+} from "./run";
+import { rollDailyOffers, rollRandomItemCardId } from "./items";
+import { buildGhostSnapshot, weekendScoutingFromGhost } from "./ghost";
+import { teamBatterBonus, teamPitcherBonus } from "./synergies";
 
 export type Half = "top" | "bottom";
 export type Team = "HOME" | "AWAY";
@@ -45,7 +69,7 @@ export type Side = "Batting" | "Pitching";
  * hasn't picked a lane yet (initial boot, post-`reset`); the StartGameScreen
  * is the source of truth in that case.
  */
-export type GameMode = "draft" | "quick-match" | null;
+export type GameMode = "draft" | "quick-match" | "szn" | null;
 /**
  * `revealing` sits between `selecting` and `between-at-bats`. lockIn computes
  * the final outcome (and applies bases / runs / outs) but parks the phase here
@@ -514,6 +538,12 @@ export interface GameState {
   /** Bumped when quest celebration should shake the HUD (ScreenShake). */
   questShakeRequestId: number;
 
+  /**
+   * SZN weekend combat: item bag ("Dugout") drawer open. Toggle is rendered
+   * in RunHud (above the week/series strip) so it never stacks on Lock In.
+   */
+  sznDugoutOpen: boolean;
+
   // Actions.
   reorderBatterHand: (cards: CardDefinition[]) => void;
   reorderPitcherHand: (cards: CardDefinition[]) => void;
@@ -658,6 +688,89 @@ export interface GameState {
 
   /** Dismiss current quest celebration and show next in queue if any. */
   completeQuestCelebration: () => void;
+
+  // ----- SZN Mode (run-loop pivot) -----
+  /**
+   * Active SZN run state, or `null` when not in SZN Mode. Carries the
+   * 12-week timeline, roster, item bag, cash, and series controller.
+   * Quick Match / Auction Draft lanes are unaffected and leave this null.
+   */
+  run: RunState | null;
+  /**
+   * Lane entry: kicks off a fresh SZN run. Sets `gameMode: "szn"`,
+   * initializes `run` to a starter run-state, and triggers the pack-rip
+   * reveal screen.
+   */
+  startSznRun: (team: Team) => void;
+  /** Pack-rip: reveal the starter 10 and seed Week 1 Mon. */
+  openStarterPack: () => void;
+  /** Pack-rip: dismiss the reveal screen and route to the Front Office. */
+  dismissPackRip: () => void;
+  /** Monday: dismiss the scouting report overlay for the current week. */
+  acknowledgeWeekScouting: () => void;
+  /**
+   * Front Office: commit a pick. Bumps `picksUsed`, re-rolls the slate,
+   * and auto-advances the day when the cap (`MAX_PICKS_PER_DAY`) is
+   * reached. Caller is responsible for closing any open modal first --
+   * the offers will replace mid-flight if the modal stays mounted.
+   */
+  commitEncounter: () => void;
+  /**
+   * Merchant view: buy a listing (item add OR roster upgrade).
+   * Returns `true` when the purchase actually applied so the caller can
+   * gate UI state (e.g. "did the user actually spend?" pick-burn flag)
+   * on the real outcome instead of a click that may have been a no-op
+   * because of cash/state mismatch.
+   */
+  purchaseFromMerchant: (slotIndex: number, listingIndex: number) => boolean;
+  /** Event view: pick one of the choice branches. */
+  resolveEventChoice: (slotIndex: number, choiceId: string) => void;
+  /** Front Office: advance to the next day (or the weekend series). */
+  advanceDay: () => void;
+  /** Weekend: kick off the Bo3 series with a generated ghost. */
+  startSeries: () => void;
+  /** Weekend: register the just-finished game's outcome and either move to game 2/3 or end the series. */
+  reportSeriesGameResult: (userWonGame: boolean) => void;
+  /** End the run early (Quit / shame leave). */
+  endRun: (reason: "champion" | "fired" | "manual") => void;
+  /**
+   * Exit the SZN run completely back to the start-screen lane chooser.
+   * Clears `run` and `gameMode` so the App-level routing falls back to the
+   * legacy non-SZN paths and the StartGameScreen overlay can paint again.
+   */
+  exitSznToMenu: () => void;
+  /** Tier upgrade helpers — direct entry points (used by RosterDrawer). */
+  upgradeWithDuplicate: (playerId: string, duplicateTier: Tier) => boolean;
+  replaceWithHigherTier: (playerId: string, newTier: Tier) => boolean;
+  /**
+   * Sell a roster player back for cash (Roster Drawer entry point).
+   * Returns the cash gained, or 0 if the player can't be sold.
+   * Refuses to sell the last batter or last pitcher so the user always
+   * has a viable lineup for the upcoming series.
+   */
+  sellPlayerForCash: (playerId: string) => number;
+  /**
+   * Front Office: buy a fresh MLB player onto the roster from the player
+   * market merchant. The store validates cash, checks for duplicates, and
+   * adds the new RosterPlayer at Bronze tier (using the player's intrinsic
+   * class tag). Returns `true` when the signing actually applied so
+   * callers can gate "pick spent" UI state on a real transaction.
+   */
+  buyPlayerFromMarket: (slotIndex: number, listingIndex: number) => boolean;
+  /**
+   * SZN Mode combat: deal an item from the run's bag (Dugout) into the
+   * user's current hand. The card is APPENDED to the hand so the player
+   * can drag it into chain position. No-op if the item is already in the
+   * hand or if the user isn't in SZN combat.
+   */
+  sznDealItem: (instanceId: string) => void;
+  /**
+   * SZN Mode combat: pull a card out of the user's hand. Player cards
+   * (`abilityType === "Player"`) are anchored and cannot be recalled --
+   * they're the seat's identity for the at-bat.
+   */
+  sznRecallItem: (cardId: string) => void;
+  setSznDugoutOpen: (open: boolean) => void;
 }
 
 export interface MatchupPreview {
@@ -782,10 +895,40 @@ function pushRecent(list: string[], id: string, limit: number): string[] {
  * BATTERS / PITCHERS lists, preserving back-compat for tests and the
  * INITIAL_AT_BAT seed.
  */
-function rosterPoolsFor(s: { draft: DraftState | null; userTeam: Team; half: Half }): {
+function rosterPoolsFor(s: {
+  draft: DraftState | null;
+  userTeam: Team;
+  half: Half;
+  gameMode: GameMode | null;
+  run: RunState | null;
+}): {
   battersPool?: MlbPlayer[];
   pitchersPool?: MlbPlayer[];
 } {
+  // SZN Mode: pools come from the run roster (user) and ghost (opponent).
+  // Without this branch the next-at-bat would silently fall through to the
+  // global BATTERS / PITCHERS catalog, which would break SZN tier seeding on
+  // the player-as-card (`freshAtBat` matches roster ids for `baseValue`).
+  if (s.gameMode === "szn" && s.run && s.run.ghost) {
+    const userBatters = s.run.roster
+      .filter((r) => r.player.role === "Batter")
+      .map((r) => r.player);
+    const userPitchers = s.run.roster
+      .filter((r) => r.player.role === "Pitcher")
+      .map((r) => r.player);
+    const ghostBatters = s.run.ghost.roster
+      .filter((r) => r.player.role === "Batter")
+      .map((r) => r.player);
+    const ghostPitchers = s.run.ghost.roster
+      .filter((r) => r.player.role === "Pitcher")
+      .map((r) => r.player);
+    const battingTeam: Team = s.half === "top" ? "AWAY" : "HOME";
+    const userBatting = battingTeam === s.userTeam;
+    return {
+      battersPool: userBatting ? userBatters : ghostBatters,
+      pitchersPool: userBatting ? ghostPitchers : userPitchers,
+    };
+  }
   if (!s.draft || s.draft.phase !== "complete") return {};
   const battingTeam: Team = s.half === "top" ? "AWAY" : "HOME";
   const battingSide = battingTeam === s.userTeam ? "user" : "ai";
@@ -834,6 +977,28 @@ interface FreshAtBatOptions {
   recent?: { batters?: string[]; pitchers?: string[] };
   battersPool?: MlbPlayer[];
   pitchersPool?: MlbPlayer[];
+  /**
+   * SZN Mode: when set, the BATTER's hand is replaced with these cards
+   * instead of being dealt. Used so the user's purchased item bag drives
+   * the play instead of a generated 5-card hand. Falls back to the normal
+   * deal when undefined / empty so non-SZN paths are unaffected.
+   */
+  userBatterHandOverride?: CardDefinition[];
+  /** Same shape, for the pitcher seat. */
+  userPitcherHandOverride?: CardDefinition[];
+  /**
+   * SZN Mode flag: when true, the user's seat starts with ONLY the
+   * MlbPlayer-as-card in their hand. Items are added to the hand at
+   * runtime via the Dugout drawer (`sznDealItem`).
+   */
+  sznMode?: boolean;
+  /** Which seat is the user occupying for this at-bat. */
+  sznUserSide?: "Batting" | "Pitching";
+  /**
+   * When `sznMode` seeds a player-as-card hand, tier base value is read from
+   * this roster (must be the active user run roster in SZN combat).
+   */
+  sznUserRoster?: RosterPlayer[];
 }
 
 function freshAtBat(opts: FreshAtBatOptions = {}): FreshAtBat {
@@ -845,8 +1010,36 @@ function freshAtBat(opts: FreshAtBatOptions = {}): FreshAtBat {
     opts.recent?.pitchers ?? [],
     batter,
   );
-  const rawBatter = dealHand(batter);
-  const rawPitcher = dealHand(pitcher);
+  // SZN Mode hand: the USER's seat starts with just the MlbPlayer-as-card
+  // and a Dugout drawer to deal items in. The non-user (ghost) seat is
+  // dealt normally. `sznUserSide` declares which seat is the user.
+  let sznBatterHand: CardDefinition[] | null = null;
+  let sznPitcherHand: CardDefinition[] | null = null;
+  if (opts.sznMode) {
+    if (opts.sznUserSide === "Batting") {
+      const slot = opts.sznUserRoster?.find((r) => r.player.id === batter.id);
+      const tierBase = slot ? TIER_BASE_VALUE[slot.tier] : TIER_BASE_VALUE.bronze;
+      sznBatterHand = [{ ...playerAsCard(batter), baseValue: tierBase }];
+    } else if (opts.sznUserSide === "Pitching") {
+      const slot = opts.sznUserRoster?.find((r) => r.player.id === pitcher.id);
+      const tierBase = slot ? TIER_BASE_VALUE[slot.tier] : TIER_BASE_VALUE.bronze;
+      sznPitcherHand = [{ ...playerAsCard(pitcher), baseValue: tierBase }];
+    }
+  }
+  // Hand overrides take precedence over SZN seeds (non-SZN-mode lanes
+  // still send full bag hands the legacy way).
+  const rawBatter =
+    opts.userBatterHandOverride && opts.userBatterHandOverride.length > 0
+      ? opts.userBatterHandOverride.slice(0, 5)
+      : sznBatterHand
+        ? sznBatterHand
+        : dealHand(batter);
+  const rawPitcher =
+    opts.userPitcherHandOverride && opts.userPitcherHandOverride.length > 0
+      ? opts.userPitcherHandOverride.slice(0, 5)
+      : sznPitcherHand
+        ? sznPitcherHand
+        : dealHand(pitcher);
 
   // Phase 2 ordering: roster mods (add/remove/swap) run BEFORE shape/value
   // transforms, so b-21 / p-31 / p-47 etc. see the final hand composition.
@@ -1070,6 +1263,10 @@ export const useGameStore = create<GameState>((set, get) => ({
   questTick: 0,
   questShakeRequestId: 0,
   ...QUEST_REWARD_INITIAL,
+
+  sznDugoutOpen: false,
+
+  run: null,
 
   reorderBatterHand: (cards) => set({ batterHand: cards }),
   reorderPitcherHand: (cards) => set({ pitcherHand: cards }),
@@ -1582,10 +1779,18 @@ export const useGameStore = create<GameState>((set, get) => ({
     // but a stray external call from a debug action shouldn't sneak past.
     if (s.tutorialActive) return;
     const pools = rosterPoolsFor(s);
+    // SZN Mode: keep the user's hand seeded with just the player card so
+    // every at-bat surfaces the new active batter/pitcher and the user
+    // re-deals items from the Dugout drawer per at-bat.
+    const sznMode = s.gameMode === "szn" && s.run !== null;
+    const userBattingNext = getUserSide(s) === "Batting";
     const ab = freshAtBat({
       recent: { batters: s.recentBatterIds, pitchers: s.recentPitcherIds },
       battersPool: pools.battersPool,
       pitchersPool: pools.pitchersPool,
+      sznMode,
+      sznUserSide: sznMode ? (userBattingNext ? "Batting" : "Pitching") : undefined,
+      sznUserRoster: sznMode ? s.run!.roster : undefined,
     });
     const userNext = getUserSide(s);
     let batterHand = ab.batterHand;
@@ -1625,6 +1830,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       revealUiUserSide: null,
       questWildcardNextBatterHand: false,
       questLegendaryCelebratePulse: false,
+      sznDugoutOpen: false,
     });
   },
 
@@ -1682,6 +1888,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       questTick: 0,
       questShakeRequestId: 0,
       ...QUEST_REWARD_INITIAL,
+      sznDugoutOpen: false,
     });
   },
 
@@ -1956,6 +2163,576 @@ export const useGameStore = create<GameState>((set, get) => ({
       // by `reset` or replaced by the next `startDraft`.
     });
   },
+
+  // =========================================================================
+  // SZN Mode actions (run-loop pivot).
+  // =========================================================================
+
+  startSznRun: (team) => {
+    const s = get();
+    const ab = freshAtBat();
+    const run = emptyRunState();
+    set({
+      gameMode: "szn",
+      userTeam: team,
+      phase: "selecting",
+      run,
+      // Reset gameplay surface so the pack-rip screen takes over visually.
+      inning: 1,
+      half: "top",
+      outs: 0,
+      isFirstAtBatOfInning: true,
+      homeScore: 0,
+      awayScore: 0,
+      bases: [false, false, false],
+      baseRunners: [null, null, null],
+      ...ab,
+      atBatId: s.atBatId + 1,
+      lastOutcome: null,
+      lastBatterScore: 0,
+      lastPitcherScore: 0,
+      lastResultMessage: "",
+      lastResolveLog: [],
+      lastBatterCardModifiers: {},
+      lastPitcherCardModifiers: {},
+      lastRevealMathSnapshot: null,
+      runnerMoves: [],
+      pendingDebuffs: [],
+      resolvedChoices: {},
+      activeChoiceCardId: null,
+      coinFlips: {},
+      affirmedSeams: new Set<string>(),
+      revealScript: [],
+      pendingResolvedPhase: null,
+      revealUiUserSide: null,
+      // Quests dormant in SZN Mode for v1.
+      activeQuests: [],
+      questProgress: {},
+      completedQuests: [],
+      questCelebrationQueue: [],
+      questTick: 0,
+      questShakeRequestId: 0,
+      ...QUEST_REWARD_INITIAL,
+      showStartScreen: false,
+      tutorialActive: false,
+      tutorialStepIndex: 0,
+      // Auction draft state irrelevant to SZN.
+      draft: null,
+    });
+  },
+
+  openStarterPack: () => {
+    const s = get();
+    if (!s.run) return;
+    // Pull a deterministic-ish but randomized starter 10: 9 batters + 1 pitcher.
+    const batterPool = [...PLAYERS.filter((p) => p.role === "Batter")];
+    const pitcherPool = [...PLAYERS.filter((p) => p.role === "Pitcher")];
+    const pickN = <T,>(pool: T[], n: number): T[] => {
+      const out: T[] = [];
+      for (let i = 0; i < n && pool.length > 0; i++) {
+        const idx = Math.floor(Math.random() * pool.length);
+        out.push(pool.splice(idx, 1)[0]);
+      }
+      return out;
+    };
+    const starterBatters = pickN(batterPool, STARTER_PACK_BATTERS);
+    const starterPitchers = pickN(pitcherPool, STARTER_PACK_PITCHERS);
+    const roster: RosterPlayer[] = [
+      ...starterBatters.map((p) => ({ player: p, tier: "bronze" as Tier, tag: p.tag })),
+      ...starterPitchers.map((p) => ({ player: p, tier: "bronze" as Tier, tag: p.tag })),
+    ];
+    // Generate Mon..Thu encounters off the new roster. Each day starts
+    // with picksUsed=0; the slate auto-refreshes after each pick.
+    // Brand-new run -> week 1 pricing (cheap floor so $10 starting cash
+    // can actually buy 2-3 items on day one).
+    const weekEncounters = FRONT_OFFICE_DAYS.map((day) => ({
+      day,
+      offers: rollDailyOffers(roster, 1),
+      picksUsed: 0,
+    }));
+    // Seed this week's ghost + Monday scouting report NOW so the
+    // opponent the user reads on Monday is the same roster they
+    // actually face Friday — not a freshly re-rolled clone at series
+    // start.
+    const interimRun: RunState = {
+      ...s.run,
+      roster,
+      weekEncounters,
+      day: "mon",
+    };
+    const ghost = buildGhostSnapshot(interimRun);
+    const weekendScouting = weekendScoutingFromGhost(ghost);
+    set({
+      run: {
+        ...s.run,
+        roster,
+        weekEncounters,
+        ghost,
+        weekendScouting,
+        weekScoutingAcknowledged: false,
+        // packRipPending stays true until the player taps "Head to the
+        // Front Office" -- otherwise the screen would unmount mid-reveal.
+        day: "mon",
+      },
+    });
+  },
+
+  dismissPackRip: () => {
+    const s = get();
+    if (!s.run) return;
+    set({ run: { ...s.run, packRipPending: false } });
+  },
+
+  acknowledgeWeekScouting: () => {
+    const s = get();
+    if (!s.run) return;
+    set({ run: { ...s.run, weekScoutingAcknowledged: true } });
+  },
+
+  /**
+   * Commit one of today's encounter slots. Bazaar-style: every pick
+   * burns one of the day's `MAX_PICKS_PER_DAY` slots AND replaces the
+   * full slate of three offers with a fresh roll. When all picks are
+   * spent the day auto-advances. Idempotent if called when no run is
+   * active or the day is already in series mode.
+   */
+  commitEncounter: () => {
+    const s = get();
+    if (!s.run || s.run.day === "series") return;
+    const dayKey = s.run.day as DayOfWeek;
+    const dayIdx = FRONT_OFFICE_DAYS.indexOf(dayKey);
+    if (dayIdx < 0) return;
+    const day = s.run.weekEncounters[dayIdx];
+    if (!day) return;
+    // Idempotency guard: if the budget is already at the cap, advance
+    // without burning another pick. Protects against a fast double-commit
+    // (e.g., re-render race) over-spending the day.
+    if (day.picksUsed >= MAX_PICKS_PER_DAY) {
+      get().advanceDay();
+      return;
+    }
+    // Clamp so picksUsed can never exceed the cap, even if a future
+    // caller bypasses the early-return above.
+    const nextPicksUsed = Math.min(day.picksUsed + 1, MAX_PICKS_PER_DAY);
+    const weekEncounters = [...s.run.weekEncounters];
+    if (nextPicksUsed >= MAX_PICKS_PER_DAY) {
+      // Day is over -- advance. We don't bother re-rolling first since
+      // the FrontOfficeScreen will route off this day anyway.
+      weekEncounters[dayIdx] = { ...day, picksUsed: nextPicksUsed };
+      set({ run: { ...s.run, weekEncounters } });
+      // Re-read state then advance via the same advanceDay action.
+      get().advanceDay();
+      return;
+    }
+    // Refresh all three offers so the user sees brand-new options.
+    // Pass the current week so prices stay on the run-loop curve as
+    // the user progresses past week 1.
+    weekEncounters[dayIdx] = {
+      ...day,
+      offers: rollDailyOffers(s.run.roster, s.run.week),
+      picksUsed: nextPicksUsed,
+    };
+    set({ run: { ...s.run, weekEncounters } });
+  },
+
+  purchaseFromMerchant: (slotIndex, listingIndex) => {
+    const s = get();
+    if (!s.run || s.run.day === "series") return false;
+    const dayKey = s.run.day as DayOfWeek;
+    const dayIdx = FRONT_OFFICE_DAYS.indexOf(dayKey);
+    if (dayIdx < 0) return false;
+    const day = s.run.weekEncounters[dayIdx];
+    const offer = day?.offers[slotIndex];
+    if (!offer || offer.kind !== "merchant") return false;
+    const listing = offer.listings[listingIndex];
+    if (!listing) return false;
+    if (s.run.cash < listing.price) return false;
+
+    let nextRoster = s.run.roster;
+    let nextBag = s.run.itemBag;
+
+    if (listing.rosterUpgrade) {
+      const idx = indexOfRosterPlayer(nextRoster, listing.rosterUpgrade.playerId);
+      if (idx < 0) return false;
+      const target = nextRoster[idx];
+      const expectedDup = target.tier;
+      if (listing.rosterUpgrade.isReplacement) {
+        // Direct same-player higher-tier replacement.
+        const upTier = listing.rosterUpgrade.duplicateTier;
+        if (nextRunTier(expectedDup) !== upTier) return false;
+        nextRoster = [...nextRoster];
+        nextRoster[idx] = { ...target, tier: upTier };
+      } else {
+        // One-duplicate upgrade: bumps tier by exactly one.
+        if (listing.rosterUpgrade.duplicateTier !== expectedDup) return false;
+        const up = nextRunTier(expectedDup);
+        if (!up) return false;
+        nextRoster = [...nextRoster];
+        nextRoster[idx] = { ...target, tier: up };
+      }
+    } else {
+      // Item add.
+      nextBag = [...nextBag, { instanceId: makeRunId("itm"), cardId: listing.cardId }];
+    }
+
+    set({
+      run: {
+        ...s.run,
+        cash: s.run.cash - listing.price,
+        roster: nextRoster,
+        itemBag: nextBag,
+      },
+    });
+    return true;
+  },
+
+  resolveEventChoice: (slotIndex, choiceId) => {
+    const s = get();
+    if (!s.run || s.run.day === "series") return;
+    const dayKey = s.run.day as DayOfWeek;
+    const dayIdx = FRONT_OFFICE_DAYS.indexOf(dayKey);
+    if (dayIdx < 0) return;
+    const day = s.run.weekEncounters[dayIdx];
+    const offer = day?.offers[slotIndex];
+    if (!offer || offer.kind !== "event") return;
+    const choice = offer.choices.find((c) => c.choiceId === choiceId);
+    if (!choice) return;
+
+    const eff: EventEffect = choice.effect;
+    let cash = s.run.cash;
+    let bag = s.run.itemBag;
+    if (eff.kind === "cash") cash = Math.max(0, cash + eff.delta);
+    else if (eff.kind === "addItemRandom") {
+      const cardId = rollRandomItemCardId(eff.pool);
+      bag = [...bag, { instanceId: makeRunId("itm"), cardId }];
+    } else if (eff.kind === "removeRandomItem") {
+      if (bag.length > 0) {
+        const idx = Math.floor(Math.random() * bag.length);
+        bag = bag.filter((_, i) => i !== idx);
+      }
+    }
+    set({
+      run: { ...s.run, cash, itemBag: bag },
+    });
+    // Note: we do NOT call commitEncounter here -- the EventEncounterView
+    // shows the resolution result first and commits via its Continue
+    // button. Callers that don't have a result phase (merchant / player
+    // market) should call commitEncounter themselves after the user
+    // dismisses the view.
+  },
+
+  advanceDay: () => {
+    const s = get();
+    if (!s.run) return;
+    if (s.run.day === "series") return;
+    const dayIdx = FRONT_OFFICE_DAYS.indexOf(s.run.day as DayOfWeek);
+    if (dayIdx < 0) return;
+    if (dayIdx < FRONT_OFFICE_DAYS.length - 1) {
+      set({
+        run: { ...s.run, day: FRONT_OFFICE_DAYS[dayIdx + 1] },
+      });
+      return;
+    }
+    // Last day -> head into the weekend series. Ghost was seeded Monday
+    // morning so the scouting report and the at-bats reference the same
+    // opponent snapshot.
+    set({
+      run: {
+        ...s.run,
+        day: "series",
+        series: {
+          gameIndex: 0,
+          userGameWins: 0,
+          ghostGameWins: 0,
+          gameInProgress: false,
+        },
+        ghost: s.run.ghost ?? buildGhostSnapshot(s.run),
+      },
+    });
+  },
+
+  startSeries: () => {
+    const s = get();
+    if (!s.run || s.run.day !== "series") return;
+    if (!s.run.series || !s.run.ghost) return;
+    // Seed an at-bat using the run roster (user) and ghost (opponent).
+    const userBatters = s.run.roster.filter((r) => r.player.role === "Batter").map((r) => r.player);
+    const userPitchers = s.run.roster.filter((r) => r.player.role === "Pitcher").map((r) => r.player);
+    const ghostBatters = s.run.ghost.roster.filter((r) => r.player.role === "Batter").map((r) => r.player);
+    const ghostPitchers = s.run.ghost.roster.filter((r) => r.player.role === "Pitcher").map((r) => r.player);
+    // The user is AWAY by default in SZN mode (bats top of the 1st).
+    const battersPool = s.userTeam === "AWAY" ? userBatters : ghostBatters;
+    const pitchersPool = s.userTeam === "AWAY" ? ghostPitchers : userPitchers;
+    // SZN: the user's seat starts with a hand of [playerCard]; items are
+    // dealt at runtime via the Dugout drawer. The opposite seat (ghost)
+    // is dealt normally so the AI behaves like any other opponent.
+    const userBatting = s.userTeam === "AWAY"; // top of 1st = AWAY batting
+    const ab = freshAtBat({
+      battersPool,
+      pitchersPool,
+      sznMode: true,
+      sznUserSide: userBatting ? "Batting" : "Pitching",
+      sznUserRoster: s.run.roster,
+    });
+    set({
+      phase: "selecting",
+      inning: 1,
+      half: "top",
+      outs: 0,
+      isFirstAtBatOfInning: true,
+      homeScore: 0,
+      awayScore: 0,
+      bases: [false, false, false],
+      baseRunners: [null, null, null],
+      ...ab,
+      atBatId: s.atBatId + 1,
+      lastOutcome: null,
+      lastBatterScore: 0,
+      lastPitcherScore: 0,
+      lastResultMessage: "",
+      lastResolveLog: [],
+      lastBatterCardModifiers: {},
+      lastPitcherCardModifiers: {},
+      lastRevealMathSnapshot: null,
+      runnerMoves: [],
+      pendingDebuffs: [],
+      resolvedChoices: {},
+      activeChoiceCardId: null,
+      coinFlips: {},
+      affirmedSeams: new Set<string>(),
+      revealScript: [],
+      pendingResolvedPhase: null,
+      revealUiUserSide: null,
+      // SZN series uses 3-inning games.
+      totalInnings: 3,
+      run: {
+        ...s.run,
+        series: { ...s.run.series, gameInProgress: true },
+      },
+      sznDugoutOpen: false,
+    });
+  },
+
+  reportSeriesGameResult: (userWonGame) => {
+    const s = get();
+    if (!s.run || !s.run.series) return;
+    const ser = s.run.series;
+    const userGameWins = ser.userGameWins + (userWonGame ? 1 : 0);
+    const ghostGameWins = ser.ghostGameWins + (userWonGame ? 0 : 1);
+    const seriesOver = userGameWins >= 2 || ghostGameWins >= 2 || ser.gameIndex >= 2;
+    if (!seriesOver) {
+      set({
+        run: {
+          ...s.run,
+          series: {
+            gameIndex: ser.gameIndex + 1,
+            userGameWins,
+            ghostGameWins,
+            gameInProgress: false,
+          },
+        },
+      });
+      return;
+    }
+    // Series over: increment W/L tally and either end the run or start a new week.
+    const userWonSeries = userGameWins > ghostGameWins;
+    const wins = s.run.wins + (userWonSeries ? 1 : 0);
+    const losses = s.run.losses + (userWonSeries ? 0 : 1);
+    let endState: RunState["endState"] = null;
+    if (wins >= RUN_WIN_TARGET) endState = "champion";
+    else if (losses >= RUN_LOSS_LIMIT) endState = "fired";
+    if (endState) {
+      set({
+        run: {
+          ...s.run,
+          wins,
+          losses,
+          endState,
+          series: null,
+          ghost: null,
+          weekendScouting: null,
+          weekScoutingAcknowledged: false,
+        },
+      });
+      return;
+    }
+    // Roll over to next week. Encounters generated for that week use
+    // the new week's pricing tier so the user feels the curve every
+    // Monday morning.
+    const nextWeek = Math.min(12, s.run.week + 1);
+    const nextEncounters = FRONT_OFFICE_DAYS.map((day) => ({
+      day,
+      offers: rollDailyOffers(s.run!.roster, nextWeek),
+      picksUsed: 0,
+    }));
+    const interimForGhost: RunState = {
+      ...s.run,
+      wins,
+      losses,
+      week: nextWeek,
+      day: "mon",
+      series: null,
+    };
+    const nextGhost = buildGhostSnapshot(interimForGhost);
+    const nextScouting = weekendScoutingFromGhost(nextGhost);
+    set({
+      run: {
+        ...s.run,
+        wins,
+        losses,
+        week: nextWeek,
+        day: "mon",
+        cash: s.run.cash + WEEKLY_CASH,
+        weekEncounters: nextEncounters,
+        series: null,
+        ghost: nextGhost,
+        weekendScouting: nextScouting,
+        weekScoutingAcknowledged: false,
+      },
+      // Reset gameplay surface so the empty-field Front Office screen
+      // doesn't show stale runners / scores from the just-finished series.
+      totalInnings: 9,
+      inning: 1,
+      half: "top",
+      outs: 0,
+      isFirstAtBatOfInning: true,
+      homeScore: 0,
+      awayScore: 0,
+      bases: [false, false, false],
+      baseRunners: [null, null, null],
+      lastOutcome: null,
+      runnerMoves: [],
+      lastResolveLog: [],
+    });
+  },
+
+  endRun: (reason) => {
+    const s = get();
+    if (!s.run) return;
+    set({
+      run: {
+        ...s.run,
+        endState: reason === "manual" ? "fired" : reason,
+      },
+    });
+  },
+
+  exitSznToMenu: () => {
+    set({ run: null, gameMode: null, showStartScreen: true, sznDugoutOpen: false });
+  },
+
+  upgradeWithDuplicate: (playerId, duplicateTier) => {
+    const s = get();
+    if (!s.run) return false;
+    const idx = indexOfRosterPlayer(s.run.roster, playerId);
+    if (idx < 0) return false;
+    const target = s.run.roster[idx];
+    if (target.tier !== duplicateTier) return false;
+    const up = nextRunTier(duplicateTier);
+    if (!up) return false;
+    const roster = [...s.run.roster];
+    roster[idx] = { ...target, tier: up };
+    set({ run: { ...s.run, roster } });
+    return true;
+  },
+
+  replaceWithHigherTier: (playerId, newTier) => {
+    const s = get();
+    if (!s.run) return false;
+    const idx = indexOfRosterPlayer(s.run.roster, playerId);
+    if (idx < 0) return false;
+    const target = s.run.roster[idx];
+    if (nextRunTier(target.tier) !== newTier) return false;
+    const roster = [...s.run.roster];
+    roster[idx] = { ...target, tier: newTier };
+    set({ run: { ...s.run, roster } });
+    return true;
+  },
+
+  sellPlayerForCash: (playerId) => {
+    const s = get();
+    if (!s.run) return 0;
+    const idx = indexOfRosterPlayer(s.run.roster, playerId);
+    if (idx < 0) return 0;
+    const target = s.run.roster[idx];
+    // Don't let the user empty the bench / mound. They need at least 1
+    // batter and 1 pitcher to stage a series.
+    const role = target.player.role;
+    const sameRoleCount = s.run.roster.filter((r) => r.player.role === role).length;
+    if (sameRoleCount <= 1) return 0;
+    // Sell value scales with tier (bronze 3 / silver 6 / gold 10 / diamond 15).
+    const tierValue: Record<Tier, number> = { bronze: 3, silver: 6, gold: 10, diamond: 15 };
+    const refund = tierValue[target.tier];
+    const roster = s.run.roster.filter((_, i) => i !== idx);
+    set({
+      run: { ...s.run, roster, cash: s.run.cash + refund },
+    });
+    return refund;
+  },
+
+  sznDealItem: (instanceId) => {
+    const s = get();
+    if (s.gameMode !== "szn" || !s.run) return;
+    if (s.phase !== "selecting") return;
+    const item = s.run.itemBag.find((i) => i.instanceId === instanceId);
+    if (!item) return;
+    const card = SESSION_CARDS.find((c) => c.id === item.cardId);
+    if (!card) return;
+    const userSide = getUserSide(s);
+    const handKey = userSide === "Batting" ? "batterHand" : "pitcherHand";
+    const hand = userSide === "Batting" ? s.batterHand : s.pitcherHand;
+    // Prevent the same card from being added twice. The chain engine
+    // keys cards by id, so duplicates would step on each other's modifiers.
+    if (hand.some((c) => c.id === card.id)) return;
+    // Hand cap mirrors the legacy 5-card max so the chain math stays sane.
+    if (hand.length >= 6) return;
+    set({ [handKey]: [...hand, card] } as Pick<GameState, "batterHand" | "pitcherHand">);
+  },
+
+  sznRecallItem: (cardId) => {
+    const s = get();
+    if (s.gameMode !== "szn" || !s.run) return;
+    if (s.phase !== "selecting") return;
+    // Don't let the user remove their own player card -- that would empty
+    // the hand seat and break the at-bat seed.
+    if (cardId.startsWith("player:")) return;
+    const userSide = getUserSide(s);
+    const handKey = userSide === "Batting" ? "batterHand" : "pitcherHand";
+    const hand = userSide === "Batting" ? s.batterHand : s.pitcherHand;
+    const next = hand.filter((c) => c.id !== cardId);
+    if (next.length === hand.length) return;
+    set({ [handKey]: next } as Pick<GameState, "batterHand" | "pitcherHand">);
+  },
+
+  setSznDugoutOpen: (open) => set({ sznDugoutOpen: open }),
+
+  buyPlayerFromMarket: (slotIndex, listingIndex) => {
+    const s = get();
+    if (!s.run || s.run.day === "series") return false;
+    const dayKey = s.run.day as DayOfWeek;
+    const dayIdx = FRONT_OFFICE_DAYS.indexOf(dayKey);
+    if (dayIdx < 0) return false;
+    const day = s.run.weekEncounters[dayIdx];
+    const offer = day?.offers[slotIndex];
+    if (!offer || offer.kind !== "playerMarket") return false;
+    const listing = offer.listings[listingIndex];
+    if (!listing) return false;
+    if (s.run.cash < listing.price) return false;
+    // Refuse duplicate id (the user already owns this player; they should
+    // use Scouting Director to upgrade tiers instead).
+    if (s.run.roster.some((r) => r.player.id === listing.playerId)) return false;
+    const player = PLAYERS.find((p) => p.id === listing.playerId);
+    if (!player) return false;
+    const newSlot: RosterPlayer = { player, tier: listing.tier, tag: player.tag };
+    set({
+      run: {
+        ...s.run,
+        cash: s.run.cash - listing.price,
+        roster: [...s.run.roster, newSlot],
+      },
+    });
+    return true;
+  },
 }));
 
 /**
@@ -2167,12 +2944,19 @@ export function buildRevealScript(
     for (const card of result.bestGroup) {
       const mod = result.cardModifiers[card.id];
       if (!mod) continue;
-      if (mod.value === card.baseValue) continue;
+      // One beat per best-chain card, stepping the pill by that card's full
+      // locked-in value. Previously we only emitted beats when mod.value !==
+      // card.baseValue (self-buffs only). Vanilla cards skipped, so the script
+      // summed to less than maxValue, computeBaseline recovered the missing
+      // chain sum as "baseline", and the score pill never ticked up through
+      // the chain -- especially obvious for SZN ghost bags vs item-light user
+      // hands. `baseValue: 0` keeps scoreDelta = mod.value while applyBeatStart
+      // still pins the card at `finalValue: mod.value`.
       beats.push({
         kind: "selfModifier",
         cardId: card.id,
         side,
-        baseValue: card.baseValue,
+        baseValue: 0,
         finalValue: mod.value,
       });
     }
@@ -2429,6 +3213,21 @@ function applySweepingSliderMutation(s: GameState): CardDefinition[] {
   );
 }
 
+/**
+ * SZN Mode: team tag-synergy bonuses (roster construction) stacked on the
+ * matchup total. Tier base value for the player-at-the-plate lives on the
+ * player-as-card `baseValue` (seeded in `freshAtBat`) so chain math, pills,
+ * and per-card readouts stay aligned.
+ */
+function sznSideBonus(s: GameState, side: "Batting" | "Pitching"): number {
+  if (s.gameMode !== "szn" || !s.run) return 0;
+  const userSide = getUserSide(s);
+  if (userSide !== side) return 0;
+  return side === "Batting"
+    ? teamBatterBonus(s.run.roster)
+    : teamPitcherBonus(s.run.roster);
+}
+
 function computeMatchup(
   s: GameState,
   batterResult: ScoringResult,
@@ -2458,13 +3257,25 @@ function computeMatchup(
 
   const guessPitchBonus = revealsGuess ? computeGuessPitchBonus(s) : 0;
 
+  // SZN Mode: team tag-synergy (roster construction) stacks on the chain
+  // total. Tier base for the player-at-the-plate is already in the chain via
+  // the player-as-card's `baseValue` (see `freshAtBat`).
+  // Non-SZN paths leave both bonuses at 0.
+  const sznBatterBonus = sznSideBonus(s, "Batting");
+  const sznPitcherBonus = sznSideBonus(s, "Pitching");
+
   const batterTotal =
-    batterResult.maxValue + effPitcherOpponentMod + effBatterDebuffDelta + guessPitchBonus;
+    batterResult.maxValue +
+    effPitcherOpponentMod +
+    effBatterDebuffDelta +
+    guessPitchBonus +
+    sznBatterBonus;
   const pitcherTotal =
     pitcherResult.maxValue +
     batterResult.opponentModifier +
     batterResult.pitcherCombinedDelta +
-    pitcherDebuffDelta;
+    pitcherDebuffDelta +
+    sznPitcherBonus;
 
   // Tie-breakers: pitchers (p-48 Lights Out, p-80 Umpire's Call) flip ties
   // to themselves; b-71 Manager's Challenge is the batter mirror and beats

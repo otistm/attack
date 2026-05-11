@@ -6,7 +6,7 @@ import { QuestCompleteOverlay } from './QuestCompleteOverlay';
 import { ScreenShake } from './effects/ScreenShake';
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Layers, LogOut, RotateCcw, ChevronDown, Trophy, Zap } from 'lucide-react';
+import { Calendar, Layers, LogOut, RotateCcw, ChevronDown, Trophy, Zap } from 'lucide-react';
 import { useGameStore, getUserSide, type Team, type GameMode } from '../lib/gameStore';
 
 const SPLASH_DURATION_MS = 3000;
@@ -37,6 +37,7 @@ export function UIOverlay() {
   const userTeam = useGameStore((s) => s.userTeam);
   const startDraft = useGameStore((s) => s.startDraft);
   const startQuickMatch = useGameStore((s) => s.startQuickMatch);
+  const startSznRun = useGameStore((s) => s.startSznRun);
   // Which lane the player committed to. The header's "New Game" button
   // rematches in the SAME lane so locking in cards mid-quick-match doesn't
   // surprise the player by punting them into an auction draft on the next
@@ -51,6 +52,17 @@ export function UIOverlay() {
   const tutorialExit = useGameStore((s) => s.tutorialExit);
   const setShowStartScreen = useGameStore((s) => s.setShowStartScreen);
   const questShakeRequestId = useGameStore((s) => s.questShakeRequestId);
+  // SZN Mode: while the user is in the Front Office (or pre-pack/pre-series
+  // splash), suppress the in-game header + gameplay overlay so the screen
+  // floats over an empty field. The dedicated SZN screens own that surface.
+  const sznOutsideGameplay = useGameStore((s) => {
+    if (s.gameMode !== 'szn' || !s.run) return false;
+    if (s.run.packRipPending) return true;
+    if (s.run.endState !== null) return true;
+    if (s.run.day !== 'series') return true;
+    if (s.run.series && !s.run.series.gameInProgress) return true;
+    return false;
+  });
 
   const phaseLabel: Record<typeof phase, string> = {
     drafting: 'Draft',
@@ -80,6 +92,7 @@ export function UIOverlay() {
     >
     <div className="absolute inset-0 pointer-events-none flex flex-col justify-between overflow-hidden font-sans text-slate-100">
 
+      {!sznOutsideGameplay && (
       <header className="w-full grid grid-cols-[minmax(220px,1fr)_auto_minmax(220px,1fr)] items-stretch gap-4 px-6 py-3 bg-slate-900/85 border-b border-slate-700 backdrop-blur-sm pointer-events-auto shadow-md">
         {/* Left: game mode badge. Was previously the at-bat / pitcher
             matchup nameplate; replaced because the batter and pitcher
@@ -143,10 +156,13 @@ export function UIOverlay() {
             <NewGamePicker
               onPick={(team) => {
                 // Rematch in the lane the player is already in. Quick Match
-                // stays Quick Match; auction Draft stays Draft; legacy null
-                // falls back to the auction path.
+                // stays Quick Match; auction Draft stays Draft; SZN Mode
+                // restarts a fresh run; legacy null falls back to the
+                // auction path.
                 if (gameMode === 'quick-match') {
                   startQuickMatch(team);
+                } else if (gameMode === 'szn') {
+                  startSznRun(team);
                 } else {
                   startDraft(team);
                 }
@@ -156,8 +172,9 @@ export function UIOverlay() {
           )}
         </div>
       </header>
+      )}
 
-      {cardsReady && (
+      {cardsReady && !sznOutsideGameplay && (
         <motion.div
           key="game-overlay"
           className="absolute inset-0 pointer-events-none"
@@ -177,9 +194,9 @@ export function UIOverlay() {
         {showCollection && <CollectionScreen key="collection-screen" onClose={() => setShowCollection(false)} />}
       </AnimatePresence>
 
-      {cardsReady && <PlayerChoiceModal />}
-      {cardsReady && <InfoRevealOverlay />}
-      {cardsReady && <InningTransitionBanner />}
+      {cardsReady && !sznOutsideGameplay && <PlayerChoiceModal />}
+      {cardsReady && !sznOutsideGameplay && <InfoRevealOverlay />}
+      {cardsReady && !sznOutsideGameplay && <InningTransitionBanner />}
     </div>
     <QuestCompleteOverlay />
     </ScreenShake>
@@ -502,6 +519,13 @@ function GameModeBadge({ gameMode }: { gameMode: GameMode }) {
           icon: <Trophy className="w-4 h-4" />,
           accent: 'from-rose-600/90 to-rose-700/90',
           iconColor: 'text-rose-300',
+        }
+      : gameMode === 'szn'
+      ? {
+          label: 'SZN Mode',
+          icon: <Calendar className="w-4 h-4" />,
+          accent: 'from-emerald-600/90 to-emerald-700/90',
+          iconColor: 'text-emerald-300',
         }
       : {
           label: 'Match',

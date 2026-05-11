@@ -3,11 +3,18 @@ import { createPortal } from 'react-dom';
 import { Reorder, motion, AnimatePresence } from 'motion/react';
 import { CardDefinition } from '../lib/cards';
 import { canConnect, shapeModeForSide, seamKey } from '../lib/connect';
-import { useGameStore, getUiUserSide, ResolutionBeat, Phase } from '../lib/gameStore';
+import { useGameStore, getUiUserSide, getUserSide, ResolutionBeat, Phase } from '../lib/gameStore';
 import { HitOutcome } from '../lib/scoring';
 import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
 import { PlayerHero } from './PlayerHero';
 import { QuestStrip } from './QuestStrip';
+import { teamPalette } from '../lib/teamColors';
+import { TIER_BASE_VALUE } from '../lib/run';
+import { activeSynergies, teamBatterBonus, teamPitcherBonus } from '../lib/synergies';
+import { X } from 'lucide-react';
+import { PLAYERS } from '../lib/players';
+import { SESSION_CARDS } from '../lib/cards';
+import { ItemCardPreview } from './ItemCardPreview';
 
 /**
  * Reveal-sequence orchestrator timing. Tuned so a typical 3-5 beat hand
@@ -326,17 +333,61 @@ const CardItem = ({
   const isConnectedLeft = dragActive ? false : rawIsConnectedLeft;
   const isConnectedRight = dragActive ? false : rawIsConnectedRight;
   const isConnected = isConnectedLeft || isConnectedRight;
-  const displayValue = valueOverride ?? modifier?.value ?? card.baseValue;
+  // SZN Mode: cards whose abilityType is "Player" represent an MLB player
+  // dropped into the hand strip. They're rendered with team colors, the
+  // tier-based combat value, and no ability tooltip. The id format is
+  // `player:${player.id}` (set by `playerAsCard` in connect.ts).
+  const isPlayerCard = card.abilityType === 'Player';
+  const playerForCard = isPlayerCard
+    ? PLAYERS.find((p) => `player:${p.id}` === card.id) ?? null
+    : null;
+  const playerTier = useGameStore((s) => {
+    if (!isPlayerCard || !playerForCard || !s.run) return 'bronze' as const;
+    // Look in both the user's roster and the ghost's roster so the AI
+    // hand also renders with the correct tier value during a series.
+    const inUser = s.run.roster.find((r) => r.player.id === playerForCard.id);
+    if (inUser) return inUser.tier;
+    const inGhost = s.run.ghost?.roster.find(
+      (r) => r.player.id === playerForCard.id,
+    );
+    return inGhost?.tier ?? 'bronze';
+  });
+  // SZN mode: the legacy `card.player` field on items is real-world
+  // attribution (e.g. "Mike Trout (2024)") that has nothing to do with
+  // the user's signed roster. Hide it on item cards so the only player
+  // names visible in SZN combat are the actual MlbPlayer cards. Player
+  // cards (`isPlayerCard`) skip this branch entirely -- they render
+  // their own portrait + team chrome.
+  const sznMode = useGameStore((s) => s.gameMode === 'szn');
+  const hideCardPlayer = sznMode && !isPlayerCard;
+  const playerPalette = playerForCard ? teamPalette(playerForCard.team) : null;
+  const playerBaseValue = isPlayerCard ? TIER_BASE_VALUE[playerTier] : null;
+  // Player cards: `modifier.value` comes from scoring (includes tier via
+  // `baseValue` on the SZN player-as-card). When a modifier exists,
+  // `playerBaseValue + playerDelta` equals `modifier.value`.
+  const playerDelta =
+    isPlayerCard && modifier ? modifier.value - card.baseValue : 0;
+  const displayValue = valueOverride ?? (
+    isPlayerCard && playerBaseValue != null
+      ? playerBaseValue + playerDelta
+      : modifier?.value ?? card.baseValue
+  );
   // General Draw cards take on their label color as their card body so they
   // stand out from signature cards (which stay white) on a busy field view.
   const isGeneralDraw = card.abilityType === 'General Draw';
-  const cardBgClass = isGeneralDraw && card.color ? card.color : 'bg-white';
-  const defaultValueColor = isGeneralDraw ? 'text-white' : 'text-slate-800';
+  const cardBgClass = isPlayerCard
+    ? '' // body color is applied via inline `style.background` for player cards
+    : isGeneralDraw && card.color ? card.color : 'bg-white';
+  const defaultValueColor = isPlayerCard
+    ? 'text-white'
+    : isGeneralDraw ? 'text-white' : 'text-slate-800';
   // Modifier colors recolor the value text to match the source ability -- but
   // only on signature cards. General cards keep white text to stay readable on
   // their colored body (an orange-tagged buff on an orange general would paint
-  // the value invisible against the background otherwise).
-  const valueColorClass = isGeneralDraw
+  // the value invisible against the background otherwise). Player cards
+  // (SZN Mode) also stay white so the team-color body never washes the
+  // tier value into a low-contrast smear.
+  const valueColorClass = isGeneralDraw || isPlayerCard
     ? defaultValueColor
     : modifier?.color
       ? TEXT_COLORS[modifier.color] || defaultValueColor
@@ -518,7 +569,7 @@ const CardItem = ({
             {card.abilityType}
           </div>
         </div>
-        {card.player && (
+        {!hideCardPlayer && card.player && (
           <div className="mb-1.5 text-[9px] font-semibold uppercase tracking-widest text-slate-400">
             {card.player}
           </div>
@@ -535,12 +586,12 @@ const CardItem = ({
         ref={cardSurfaceRef}
         data-tutorial={tutorialRegions ? 'card-shapes' : undefined}
         className={`
-        relative ${sz.card} ${cardBgClass} border-2
+        relative ${sz.card} ${cardBgClass} border-2 overflow-hidden
         flex flex-col items-center justify-center
         ${readOnly ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'}
       `}
-        onPointerEnter={openAbilityHover}
-        onPointerLeave={scheduleCloseAbilityHover}
+        onPointerEnter={isPlayerCard ? undefined : openAbilityHover}
+        onPointerLeave={isPlayerCard ? undefined : scheduleCloseAbilityHover}
         onPointerMove={() => {
           if (abilityHoverRef.current) syncAbilityAnchor();
         }}
@@ -549,6 +600,11 @@ const CardItem = ({
         style={{
           marginLeft: noMargin ? 0 : isConnectedLeft ? `${sz.connectedGap}px` : `${sz.gap}px`,
           marginRight: noMargin ? 0 : isConnectedRight ? `${sz.connectedGap}px` : `${sz.gap}px`,
+          ...(isPlayerCard && playerPalette
+            ? {
+                background: `linear-gradient(160deg, ${playerPalette.primary} 0%, ${playerPalette.secondary} 100%)`,
+              }
+            : {}),
         }}
       >
         <ShapeHalf
@@ -570,16 +626,65 @@ const CardItem = ({
         dragActive={dragActive}
       />
 
-      <div className={`absolute ${sz.topPad} left-0 right-0 flex flex-col items-center z-30 px-1 text-center w-full`}>
-        {card.player && (
-          <div className={`${sz.playerText} font-extrabold text-slate-400 uppercase tracking-widest leading-none mb-0.5 truncate max-w-[80%]`}>
-            {card.player.split(' (')[0]}
+      {isPlayerCard && playerForCard ? (
+        <>
+          {/* Diagonal sheen so the player card reads as a Topps-style card. */}
+          <div
+            aria-hidden
+            className="absolute inset-0 pointer-events-none z-0"
+            style={{
+              background:
+                'linear-gradient(135deg, rgba(255,255,255,0.18) 0%, rgba(255,255,255,0) 35%, rgba(0,0,0,0.18) 100%)',
+            }}
+          />
+          <div
+            className={`absolute ${sz.topPad} left-0 right-0 flex justify-between items-start z-30 px-2`}
+          >
+            <span
+              className={`${sz.playerText} font-black uppercase tracking-widest text-white/90`}
+              style={{ textShadow: '0 1px 2px rgba(0,0,0,0.6)' }}
+            >
+              {playerForCard.team}
+            </span>
+            <span
+              className={`${sz.playerText} font-black uppercase tracking-widest bg-black/40 rounded px-1 text-amber-200`}
+            >
+              {playerTier}
+            </span>
           </div>
-        )}
-        <div className={`${sz.nameText} leading-tight font-bold text-slate-700 uppercase tracking-wide bg-white/95 rounded px-1 py-0.5 line-clamp-2 text-center border border-slate-200 shadow-sm`} style={{ maxWidth: '70%' }}>
-          {card.name}
+          <div className="absolute left-0 right-0 z-30 flex justify-center" style={{ top: '36%' }}>
+            <span
+              className={`${sz.nameText} font-black uppercase tracking-tight text-white leading-tight bg-black/40 rounded px-1.5 py-0.5 max-w-[88%] line-clamp-2 text-center`}
+              style={{ textShadow: '0 1px 1px rgba(0,0,0,0.6)' }}
+            >
+              {card.name}
+            </span>
+          </div>
+          {/* "ON DECK" role pill so the user immediately reads the card as
+              their active batter/pitcher and not just a portrait. The text
+              comes straight off the underlying MLB role so a reliever and
+              a starter both surface "PITCHING" -- the seat IS the role. */}
+          <div className="absolute left-1/2 -translate-x-1/2 z-30" style={{ bottom: '20%' }}>
+            <span
+              className="text-[8px] font-black uppercase tracking-[0.2em] bg-emerald-400/90 text-emerald-950 rounded-full px-1.5 py-[1px] shadow-md"
+              style={{ textShadow: 'none' }}
+            >
+              {playerForCard.role === 'Pitcher' ? 'Pitching' : 'Batting'}
+            </span>
+          </div>
+        </>
+      ) : (
+        <div className={`absolute ${sz.topPad} left-0 right-0 flex flex-col items-center z-30 px-1 text-center w-full`}>
+          {!hideCardPlayer && card.player && (
+            <div className={`${sz.playerText} font-extrabold text-slate-400 uppercase tracking-widest leading-none mb-0.5 truncate max-w-[80%]`}>
+              {card.player.split(' (')[0]}
+            </div>
+          )}
+          <div className={`${sz.nameText} leading-tight font-bold text-slate-700 uppercase tracking-wide bg-white/95 rounded px-1 py-0.5 line-clamp-2 text-center border border-slate-200 shadow-sm`} style={{ maxWidth: '70%' }}>
+            {card.name}
+          </div>
         </div>
-      </div>
+      )}
       {/* The value text used to be keyed by `displayValue`, which forced a
           full remount + entry pop (scale 1.5 -> 1, opacity 0.5 -> 1) every
           time the number changed. Reorder.Group recomputes scoring on every
@@ -612,6 +717,16 @@ const CardItem = ({
 };
 
 export const CardGameOverlay = () => {
+  // SZN dugout state lives at the overlay level so the user-hand
+  // container can lift in response to the dugout opening (we want the
+  // hand to slide UP and out of the way of the dugout panel).
+  // `dugoutHeight` mirrors the actual rendered mat height (measured by
+  // the panel via ResizeObserver) so the hand slides up by exactly the
+  // mat's footprint -- no more no less. A hardcoded offset clipped on
+  // narrow viewports and left wasted headroom on tall ones.
+  const [dugoutHeight, setDugoutHeight] = useState(0);
+  const dugoutOpen = useGameStore((s) => s.sznDugoutOpen);
+  const handDropZoneRef = useRef<HTMLDivElement | null>(null);
   const batter = useGameStore((s) => s.batter);
   const pitcher = useGameStore((s) => s.pitcher);
   const batterHand = useGameStore((s) => s.batterHand);
@@ -622,6 +737,16 @@ export const CardGameOverlay = () => {
   const lockIn = useGameStore((s) => s.lockIn);
   const startNextAtBat = useGameStore((s) => s.startNextAtBat);
   const setShowStartScreen = useGameStore((s) => s.setShowStartScreen);
+  // SZN Mode: when the run is active and a series game just finished, the
+  // "New Game" button becomes "Continue Run" and reports the result back
+  // to the run controller (advances to game 2/3 or ends the series).
+  const sznRunActive = useGameStore((s) => s.gameMode === 'szn' && !!s.run);
+  const run = useGameStore((s) => s.run);
+  const reportSeriesGameResult = useGameStore((s) => s.reportSeriesGameResult);
+  const userWonThisGame = useGameStore((s) => {
+    const userBatting = s.userTeam === 'AWAY';
+    return userBatting ? s.awayScore > s.homeScore : s.homeScore > s.awayScore;
+  });
   const lastOutcome = useGameStore((s) => s.lastOutcome);
   const lastResolveLog = useGameStore((s) => s.lastResolveLog);
   const lastBatterScore = useGameStore((s) => s.lastBatterScore);
@@ -735,6 +860,7 @@ export const CardGameOverlay = () => {
   void scorePitcherFn;
 
   const isSelecting = phase === 'selecting';
+  const liftHandForDugout = dugoutOpen && isSelecting && sznRunActive;
   const isRevealing = phase === 'revealing';
   const isResolved = phase === 'between-at-bats' || phase === 'game-over';
   /** Opponent total stays hidden only while hands are still locked (selection). During
@@ -840,6 +966,24 @@ export const CardGameOverlay = () => {
 
   const batterCardIds = useMemo(() => new Set(batterHand.map((c) => c.id)), [batterHand]);
 
+  /** SZN: flat team tag bonus folded into the matchup pill via `sznSideBonus`. */
+  const userSznRosterSynergyAmount = useMemo(() => {
+    if (!sznRunActive || !run) return null;
+    const amt = userIsBatting ? teamBatterBonus(run.roster) : teamPitcherBonus(run.roster);
+    return amt > 0 ? amt : null;
+  }, [sznRunActive, run, userIsBatting]);
+
+  const userSznRosterSynergyTitle = useMemo(() => {
+    if (!run || userSznRosterSynergyAmount == null) return undefined;
+    const lines = activeSynergies(run.roster)
+      .filter((s) =>
+        userIsBatting ? s.threshold.batterBonus > 0 : s.threshold.pitcherBonus > 0,
+      )
+      .map((s) => s.threshold.label);
+    if (lines.length === 0) return 'Roster tag synergy — added to your matchup total.';
+    return `${lines.join(' · ')} — counted in your matchup total.`;
+  }, [run, userIsBatting, userSznRosterSynergyAmount]);
+
   return (
     <>
       {/* Big dramatic outcome banner -- pops over the field for a beat after
@@ -876,16 +1020,24 @@ export const CardGameOverlay = () => {
           value={hideOpponentTotals ? null : aiPillValue}
           role={userIsBatting ? 'PITCHER' : 'BATTER'}
           dimmed={hideOpponentTotals}
+          showTotalBesideCard={false}
         />
       </div>
-      <div className="hidden md:block pointer-events-none absolute left-8 bottom-32 z-20">
-        <PlayerHero
-          player={userIsBatting ? batter : pitcher}
-          value={userPillValue}
-          role={userIsBatting ? 'BATTER' : 'PITCHER'}
-          dimmed={false}
-        />
-      </div>
+      {/* SZN Mode: the user's player already shows as a card in the
+          bottom hand strip, so the left-rail hero would just duplicate
+          the same identity (same name, same team colors). Suppress it
+          for SZN runs to keep the player rail clean; non-SZN lanes keep
+          the hero rail because their hand is dealt cards (no player). */}
+      {!sznRunActive && (
+        <div className="hidden md:block pointer-events-none absolute left-8 bottom-32 z-20">
+          <PlayerHero
+            player={userIsBatting ? batter : pitcher}
+            value={userPillValue}
+            role={userIsBatting ? 'BATTER' : 'PITCHER'}
+            dimmed={false}
+          />
+        </div>
+      )}
 
       {/* AI hand - top of screen. Face-down during selection regardless of
           whether the AI is playing batter or pitcher this half (same
@@ -904,7 +1056,9 @@ export const CardGameOverlay = () => {
             outcomeStyle={outcomeBadgeStyle}
             compact
             banner={hideOpponentTotals ? null : aiBanner}
-            heroHasValue={!hideOpponentTotals}
+            /* Left-rail opponent hero omits the giant total (`showTotalBesideCard={false}`),
+             * so this pill must remain the canonical readout at every breakpoint. */
+            heroHasValue={false}
           />
           <div data-tutorial="opponent-hand">
             <FlipPitcherStrip
@@ -922,10 +1076,19 @@ export const CardGameOverlay = () => {
 
       {/* User hand - bottom of screen. Always interactive: drag, connect,
           lock-in. Whether the user is the batter or the pitcher this half
-          is decided by `userTeam` + `half` via getUserSide. */}
-      <div className="absolute inset-x-0 bottom-0 pointer-events-none flex flex-col items-center justify-end pb-8 bg-gradient-to-t from-slate-900/80 via-slate-900/40 to-transparent pt-32 h-80">
+          is decided by `userTeam` + `half` via getUserSide.
+          In SZN combat, when the user opens the dugout the entire hand
+          column lifts upward so the dugout mat has room to render. The
+          ref on the inner pointer-events container is a drop target for
+          dugout drag-to-deal -- when a bag card is released over this
+          rectangle the dugout panel calls `sznDealItem`. */}
+      <motion.div
+        animate={{ y: liftHandForDugout ? -dugoutHeight : 0 }}
+        transition={{ type: 'spring', stiffness: 220, damping: 28 }}
+        className="absolute inset-x-0 bottom-0 pointer-events-none flex flex-col items-center justify-end pb-8 bg-gradient-to-t from-slate-900/80 via-slate-900/40 to-transparent pt-32 h-80"
+      >
 
-        <div className="pointer-events-auto flex flex-col items-center gap-4">
+        <div ref={handDropZoneRef} className="pointer-events-auto flex flex-col items-center gap-4">
           <ScorePill
             label={userLabel}
             tone={userTone}
@@ -934,7 +1097,8 @@ export const CardGameOverlay = () => {
             outcomeStyle={outcomeBadgeStyle}
             atBatId={atBatId}
             banner={userBanner}
-            heroHasValue
+            // SZN hides the bottom PlayerHero rail; keep the matchup total in the pill at md+.
+            heroHasValue={!sznRunActive}
             // Hit Scale hint is a batter-only concept ("if you win, +N to
             // your hit"). Only show it when the user IS the batter.
             hitScaleHint={
@@ -942,6 +1106,8 @@ export const CardGameOverlay = () => {
                 ? matchup.batterHitScaleBonus
                 : null
             }
+            rosterSynergyHint={userSznRosterSynergyAmount}
+            rosterSynergyTitle={userSznRosterSynergyTitle}
           />
 
           {/* Math breakdown: explains why the pill differs from the visible
@@ -1078,6 +1244,13 @@ export const CardGameOverlay = () => {
                   >
                     Next At-Bat
                   </button>
+                ) : sznRunActive ? (
+                  <button
+                    onClick={() => reportSeriesGameResult(userWonThisGame)}
+                    className="px-10 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-full shadow-lg uppercase tracking-wider text-sm transition-all hover:scale-105 active:scale-95"
+                  >
+                    Continue Run
+                  </button>
                 ) : (
                   <button
                     onClick={() => setShowStartScreen(true)}
@@ -1090,7 +1263,17 @@ export const CardGameOverlay = () => {
             )}
           </AnimatePresence>
         </div>
-      </div>
+      </motion.div>
+
+      {/* SZN Mode: dugout panel + toggle. Mounted as a sibling of the
+          hand container so it can render below the lifted hand and own
+          its own click area. The drop-zone ref is the user-hand inner
+          container: when a bag card is released over that rect, the
+          dugout panel calls `sznDealItem`. */}
+      <SznDugoutPanel
+        onHeightChange={setDugoutHeight}
+        handDropZoneRef={handDropZoneRef}
+      />
     </>
   );
 };
@@ -1296,6 +1479,237 @@ const STATUS_CHIP_EXPLANATIONS: Record<string, string> = {
     'Stolen Base Threat — the pitcher cannot use any General cards this round (their generals are zeroed at scoring).',
 };
 
+/**
+ * SznDugoutPanel — full-bottom dugout drawer in SZN combat. Renders
+ * the user's bag items as the SAME `ItemCardPreview` they'd see in
+ * combat hand, so the visual identity carries straight from "I bought
+ * this at the merchant" through "I dealt it into my swing".
+ *
+ * Toggle lives in `RunHud` (above the week strip). This component only
+ * renders the expanded mat and bag grid.
+ *   - Closed: no UI here (RunHud owns the affordance).
+ *   - Open: a wide mat that lifts the user's hand strip above it and
+ *     exposes drag-and-drop between hand and bag.
+ *
+ * Drop targets:
+ *   - Drag a bag card UP into the hand zone -> `sznDealItem`
+ *   - Click a hand-mounted bag card -> `sznRecallItem`
+ *   (We also keep click-to-deal as a tap fallback for users who don't
+ *   discover the drag affordance.)
+ *
+ * `handDropZoneRef` points at the user-hand container in CardGameOverlay
+ * so onDragEnd can geometry-check whether the user released the bag
+ * card over the hand or just shuffled it around the dugout mat.
+ */
+function SznDugoutPanel({
+  onHeightChange,
+  handDropZoneRef,
+}: {
+  /**
+   * Reports the rendered mat height back up so `CardGameOverlay` can
+   * lift the user hand by exactly the right amount. Receives 0 when
+   * the mat is closed.
+   */
+  onHeightChange: (h: number) => void;
+  handDropZoneRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const sznActive = useGameStore(
+    (s) => s.gameMode === 'szn' && s.run !== null && s.phase === 'selecting',
+  );
+  const open = useGameStore((s) => s.sznDugoutOpen);
+  const setDugoutOpen = useGameStore((s) => s.setSznDugoutOpen);
+  const run = useGameStore((s) => s.run);
+  const userHand = useGameStore((s) =>
+    getUserSide(s) === 'Batting' ? s.batterHand : s.pitcherHand,
+  );
+  const dealItem = useGameStore((s) => s.sznDealItem);
+  const recall = useGameStore((s) => s.sznRecallItem);
+  // ResizeObserver-backed measurement of the mat. Mirrors the live
+  // height back to the parent so the user-hand strip can translate by
+  // the actual footprint instead of a hardcoded offset (which clipped
+  // on narrow viewports and left dead space on tall ones).
+  const matRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!sznActive || !open) {
+      onHeightChange(0);
+      return;
+    }
+    const el = matRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      onHeightChange(entry.contentRect.height);
+    });
+    ro.observe(el);
+    // Seed with the initial measurement before any resize fires.
+    onHeightChange(el.getBoundingClientRect().height);
+    return () => {
+      ro.disconnect();
+      onHeightChange(0);
+    };
+  }, [sznActive, open, onHeightChange]);
+
+  if (!sznActive || !run) return null;
+
+  // Card-id set of items already dealt into the hand. We use this to
+  // gate INTERACTION on bag entries -- not visibility -- so a duplicate
+  // card the user owns stays on screen (dimmed) instead of silently
+  // disappearing the moment its sibling is dealt.
+  const handCardIds = new Set(userHand.map((c) => c.id));
+  const dealtFromBag = userHand.filter((c) => !c.id.startsWith('player:'));
+
+  // Geometry-check helper: is the released pointer over the hand strip?
+  const droppedOverHand = (clientX: number, clientY: number) => {
+    const el = handDropZoneRef.current;
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return (
+      clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom
+    );
+  };
+
+  return (
+    <>
+      {/* Expanded mat. Sits at fixed bottom with translateY animation so
+          it slides up cleanly. Width is full so the cards have room to
+          breathe; height is content-driven (max 38vh). */}
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            key="szn-dugout-mat"
+            ref={matRef}
+            initial={{ y: 280, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: 280, opacity: 0 }}
+            transition={{ type: 'spring', stiffness: 220, damping: 28 }}
+            className="absolute inset-x-0 bottom-0 z-30 pointer-events-auto pb-16 pt-3 px-4 bg-gradient-to-t from-slate-950/98 via-slate-950/95 to-slate-950/85 border-t-2 border-emerald-500/40 shadow-[0_-20px_50px_-20px_rgba(0,0,0,0.8)]"
+          >
+            <div className="max-w-6xl mx-auto flex flex-col gap-3">
+              <div className="flex items-center justify-between px-1">
+                <div className="flex items-baseline gap-3">
+                  <span className="dugout-font-sport text-xl uppercase tracking-widest text-emerald-200">
+                    Dugout
+                  </span>
+                  <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
+                    Drag a card up onto your hand to deal it
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setDugoutOpen(false)}
+                  className="text-slate-400 hover:text-white p-1 rounded hover:bg-white/10"
+                  aria-label="Close dugout"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* In-hand cards -- click to recall back to the bag. We
+                  show them so the user can see at a glance which bag
+                  items are currently dealt. */}
+              {dealtFromBag.length > 0 && (
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-[9px] font-black uppercase tracking-widest text-amber-300/80 px-1">
+                    In hand · click to recall
+                  </span>
+                  <div className="flex flex-wrap gap-3">
+                    {dealtFromBag.map((c) => {
+                      const def = SESSION_CARDS.find((d) => d.id === c.id);
+                      if (!def) return null;
+                      return (
+                        <button
+                          key={`hand-${c.id}`}
+                          type="button"
+                          onClick={() => recall(c.id)}
+                          className="relative group"
+                          title="Recall to bag"
+                        >
+                          <ItemCardPreview
+                            card={def}
+                            compact
+                            badge="DEALT"
+                            badgeClass="bg-amber-500"
+                          />
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Available bag items -- draggable cards. Tap also deals
+                  for users who don't discover the drag gesture. We render
+                  every instance the user owns; duplicates whose `cardId`
+                  already lives in the hand are visible-but-dimmed so the
+                  user can see they exist without being able to deal them
+                  twice (the chain engine keys hand cards by id). */}
+              <div className="flex flex-col gap-1.5">
+                <span className="text-[9px] font-black uppercase tracking-widest text-emerald-300/80 px-1">
+                  In bag · drag up onto your hand or tap to deal
+                </span>
+                {run.itemBag.length > 0 ? (
+                  <div className="flex flex-wrap gap-3">
+                    {run.itemBag.map((it) => {
+                      const def = SESSION_CARDS.find((d) => d.id === it.cardId);
+                      if (!def) return null;
+                      const alreadyDealt = handCardIds.has(it.cardId);
+                      if (alreadyDealt) {
+                        return (
+                          <div
+                            key={`bag-${it.instanceId}`}
+                            title="Duplicate of a card already in your hand"
+                            className="cursor-not-allowed"
+                          >
+                            <ItemCardPreview
+                              card={def}
+                              dimmed
+                              badge="DUPLICATE"
+                              badgeClass="bg-slate-600"
+                            />
+                          </div>
+                        );
+                      }
+                      return (
+                        <motion.div
+                          key={`bag-${it.instanceId}`}
+                          drag
+                          dragSnapToOrigin
+                          dragElastic={0.4}
+                          dragMomentum={false}
+                          whileDrag={{ scale: 1.1, zIndex: 60 }}
+                          onClick={() => dealItem(it.instanceId)}
+                          onDragEnd={(_e, info) => {
+                            // info.point is the pointer in viewport coords
+                            // at release. Cross-check against the hand
+                            // container's bounding box so an actual hand
+                            // drop fires the deal action; otherwise the
+                            // card snaps back via dragSnapToOrigin.
+                            if (droppedOverHand(info.point.x, info.point.y)) {
+                              dealItem(it.instanceId);
+                            }
+                          }}
+                          className="cursor-grab active:cursor-grabbing"
+                        >
+                          <ItemCardPreview card={def} />
+                        </motion.div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className="text-xs text-slate-500 italic px-1 py-3">
+                    Bag is empty. Visit a merchant to stock up.
+                  </p>
+                )}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </>
+  );
+}
+
 const BatterStatusStrip = ({
   batterHand,
   pitcherHand,
@@ -1420,6 +1834,14 @@ interface ScorePillProps {
    */
   hitScaleHint?: number | null;
   /**
+   * SZN Mode: roster tag synergy bonus included in `value`. Shown as a small
+   * "+N ROSTER" chip when non-zero so the pill gap vs chain MLB card(s) reads
+   * intentionally.
+   */
+  rosterSynergyHint?: number | null;
+  /** Tooltip / a11y title for `rosterSynergyHint` (active synergy labels). */
+  rosterSynergyTitle?: string;
+  /**
    * Current at-bat id. Used to scope the outcome chip's exit-animation key so
    * that when `Next At-Bat` is clicked the prior chip ("ELLY DE LA CRUZ: OUT
    * (17 vs 24)") force-unmounts crisply instead of bleeding 200-300ms of
@@ -1460,6 +1882,8 @@ const ScorePill = ({
   compact = false,
   banner = null,
   hitScaleHint = null,
+  rosterSynergyHint = null,
+  rosterSynergyTitle,
   atBatId,
   heroHasValue = false,
 }: ScorePillProps) => {
@@ -1478,7 +1902,9 @@ const ScorePill = ({
   // wrappers above -- otherwise either the pill collapses while no hero
   // shows (no readout at all) or both render and the value is duplicated.
   const hasOutcomeChip = !!outcome;
-  const hasHintBadge = hitScaleHint !== null && hitScaleHint !== 0;
+  const hasRosterSynergyBadge = rosterSynergyHint !== null && rosterSynergyHint > 0;
+  const hasHintBadge =
+    (hitScaleHint !== null && hitScaleHint !== 0) || hasRosterSynergyBadge;
   const valueGroupClass = heroHasValue ? 'md:hidden' : '';
   const pillBgHiddenAtMd = heroHasValue && !hasOutcomeChip && !hasHintBadge;
 
@@ -1493,7 +1919,7 @@ const ScorePill = ({
     <div className="relative z-30 flex flex-col items-center">
       <motion.div
         layout
-        className={`bg-white/95 backdrop-blur rounded-full font-bold text-slate-900 shadow-xl border-2 border-white/50 flex items-center ${containerSize} ${pillBgHiddenAtMd ? 'md:hidden' : ''}`}
+        className={`bg-white/95 backdrop-blur rounded-full font-bold text-slate-900 shadow-xl border-2 border-white/50 flex flex-wrap items-center justify-center gap-1 ${containerSize} ${pillBgHiddenAtMd ? 'md:hidden' : ''}`}
       >
         <span className={`flex items-center gap-2 ${valueGroupClass}`}>
           <span className={compact ? 'text-[10px] font-extrabold uppercase tracking-widest text-slate-500' : 'text-xs font-extrabold uppercase tracking-widest text-slate-500'}>
@@ -1526,6 +1952,24 @@ const ScorePill = ({
               title="Hit Scale ladder bonus -- applies to your hit if you win"
             >
               {hitScaleHint > 0 ? `+${hitScaleHint}` : `${hitScaleHint}`} HIT
+            </motion.span>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {hasRosterSynergyBadge && (
+            <motion.span
+              key={`rsy-${rosterSynergyHint}`}
+              initial={{ opacity: 0, scale: 0.7 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.7 }}
+              transition={{ type: 'spring', stiffness: 340, damping: 22 }}
+              className={`font-black uppercase tracking-widest rounded-full ring-1 bg-emerald-600/95 text-white ring-emerald-300/50 ${
+                compact ? 'text-[9px] px-2 py-0.5' : 'text-[11px] px-2.5 py-0.5'
+              }`}
+              title={rosterSynergyTitle}
+            >
+              +{rosterSynergyHint} roster
             </motion.span>
           )}
         </AnimatePresence>

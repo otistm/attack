@@ -31,6 +31,17 @@ export function Stadium() {
   const lastOutcome = useGameStore((s) => s.lastOutcome);
   const phase = useGameStore((s) => s.phase);
   const runnerMoves = useGameStore((s) => s.runnerMoves);
+  // SZN Mode: while the player is in the Front Office or pack-rip flow,
+  // strip every figure from the diamond so the screen UI floats over a
+  // genuinely empty field. Combat (the weekend series) keeps the players.
+  const fieldEmpty = useGameStore((s) => {
+    if (s.gameMode !== "szn" || !s.run) return false;
+    if (s.run.packRipPending) return true;
+    if (s.run.day !== "series") return true;
+    if (s.run.series && !s.run.series.gameInProgress) return true;
+    if (s.run.endState !== null) return true;
+    return false;
+  });
   const questLegendaryCelebratePulse = useGameStore(
     (s) => s.questLegendaryCelebratePulse,
   );
@@ -141,7 +152,7 @@ export function Stadium() {
             recorded RunnerMove so the user can see them traverse the bases.
           - Otherwise (selecting / outs / game-over): render static runners on
             whichever bases are currently occupied. */}
-      {(() => {
+      {!fieldEmpty && (() => {
         const showAnimated =
           phase === 'between-at-bats' && lastOutcome && lastOutcome !== 'out' && runnerMoves.length > 0;
         if (showAnimated) {
@@ -179,6 +190,8 @@ export function Stadium() {
           </>
         );
       })()}
+      {/* Hide the result-pulse and any base highlighting in SZN's empty-field
+          mode -- nothing should be celebrating an at-bat that's not happening. */}
 
       {/* Result celebration: pulse arc above the bases when a hit just happened */}
       {phase === 'between-at-bats' && (
@@ -235,21 +248,25 @@ export function Stadium() {
          <boxGeometry args={[150, 20, 20]} />
       </mesh>
 
-      <Player position={[0, 0.5, 0]} role="Pitcher" color="#1E88E5" />
-      <Player position={[0, 0, homeToMound + 4]} role="Catcher" color="#1E88E5" />
-      <Player position={[-4, 0, homeToMound - 2]} role="Batter" color="#E53935" />
+      {!fieldEmpty && (
+        <>
+          <Player position={[0, 0.5, 0]} role="Pitcher" color="#1E88E5" />
+          <Player position={[0, 0, homeToMound + 4]} role="Catcher" color="#1E88E5" />
+          <Player position={[-4, 0, homeToMound - 2]} role="Batter" color="#E53935" />
 
-      {/* Corner infielders are pushed clearly off their bags (~18-20 ft) so a
-          new game can never look like it has a runner already standing on
-          1B / 3B. Standing right on the bag was causing first-time players to
-          report "the game started with a player on third base". */}
-      <Player position={[firstPos[0] - 14, 0, firstPos[2] - 14]} role="1B" color="#1E88E5" />
-      <Player position={[25, 0, homeToMound - homeToSecond + 15]} role="2B" color="#1E88E5" />
-      <Player position={[thirdPos[0] + 14, 0, thirdPos[2] - 14]} role="3B" color="#1E88E5" />
-      <Player position={[-25, 0, homeToMound - homeToSecond + 15]} role="SS" color="#1E88E5" />
-      <Player position={[-90, 0, homeToMound - 200]} role="LF" color="#1E88E5" />
-      <Player position={[0, 0, homeToMound - 250]} role="CF" color="#1E88E5" />
-      <Player position={[90, 0, homeToMound - 200]} role="RF" color="#1E88E5" />
+          {/* Corner infielders are pushed clearly off their bags (~18-20 ft) so a
+              new game can never look like it has a runner already standing on
+              1B / 3B. Standing right on the bag was causing first-time players to
+              report "the game started with a player on third base". */}
+          <Player position={[firstPos[0] - 14, 0, firstPos[2] - 14]} role="1B" color="#1E88E5" />
+          <Player position={[25, 0, homeToMound - homeToSecond + 15]} role="2B" color="#1E88E5" />
+          <Player position={[thirdPos[0] + 14, 0, thirdPos[2] - 14]} role="3B" color="#1E88E5" />
+          <Player position={[-25, 0, homeToMound - homeToSecond + 15]} role="SS" color="#1E88E5" />
+          <Player position={[-90, 0, homeToMound - 200]} role="LF" color="#1E88E5" />
+          <Player position={[0, 0, homeToMound - 250]} role="CF" color="#1E88E5" />
+          <Player position={[90, 0, homeToMound - 200]} role="RF" color="#1E88E5" />
+        </>
+      )}
       
       {/* Trees outside */}
       <Trees />
