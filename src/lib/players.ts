@@ -22,9 +22,9 @@ export interface MlbPlayer {
 }
 
 /**
- * SZN Mode class tag per player. Drives team-wide synergy buffs (see
- * `synergies.ts`). Defined here next to PLAYERS so adding a player can't
- * silently leak into SZN mode without a tag.
+ * SZN Mode class tag per player. Drives team-wide synergy when identical tags
+ * sit next to each other on the roster (see `synergies.ts`). Defined here next
+ * to PLAYERS so adding a player can't silently leak into SZN mode without a tag.
  */
 const PLAYER_TAGS: Record<string, ClassTag> = {
   judge: "Slugger",

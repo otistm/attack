@@ -18,14 +18,20 @@ import type {
   MerchantOffer,
   PlayerMarketOffer,
   RosterPlayer,
-  Tier,
+  Rarity,
 } from "./run";
-import { makeRunId, nextTier } from "./run";
+import { makeRunId, nextRarity, MAX_PICKS_PER_DAY } from "./run";
 import { PLAYERS } from "./players";
+import { ALL_SZN_PLAYERS } from "./sznPlayers";
+import { rollSznEncounterSlate } from "./sznEncounters";
 
-const BATTING_CARDS = SESSION_CARDS.filter((c) => c.type === "Batting");
-const PITCHING_CARDS = SESSION_CARDS.filter((c) => c.type === "Pitching");
-const ALL_CARDS = SESSION_CARDS;
+// Random-pool item rolls (addItemRandom event effect) and merchant
+// listings must never surface SZN encounter items -- those are granted
+// only through deliberate encounter dispatches.
+const isEncounterId = (id: string) => id.startsWith("enc-");
+const BATTING_CARDS = SESSION_CARDS.filter((c) => c.type === "Batting" && !isEncounterId(c.id));
+const PITCHING_CARDS = SESSION_CARDS.filter((c) => c.type === "Pitching" && !isEncounterId(c.id));
+const ALL_CARDS = SESSION_CARDS.filter((c) => !isEncounterId(c.id));
 
 function sample<T>(arr: T[], n: number): T[] {
   const pool = [...arr];
@@ -74,8 +80,11 @@ function weekFactor(week: number): number {
 
 function priceFor(card: CardDefinition, week: number): number {
   const raw = Math.round(units(card) * weekFactor(week));
+  // Week 1 caps every listing at $2 so the $14 starter cash always
+  // clears the early shop. Floor drops to $1 (was $2) so genuinely
+  // low-impact role cards can actually be cheap impulse buys.
   if (week === 1) return Math.min(2, Math.max(1, raw));
-  return Math.max(2, raw);
+  return Math.max(1, raw);
 }
 
 function listingForCard(
@@ -94,20 +103,25 @@ function listingForCard(
 
 /**
  * Roster duplicate / replacement prices. Week 1 max $2; later weeks scale
- * with record (bronze dup $2..5 through diamond replacement ~$22 by week 12).
+ * with record (common dup $2..5 through legend replacement ~$22 by week 12).
  */
-function dupPrice(tier: Tier, week: number): number {
+function dupPrice(rarity: Rarity, week: number): number {
   const base =
-    tier === "diamond" ? 9 : tier === "gold" ? 6 : tier === "silver" ? 4 : 2;
-  const p = Math.max(2, Math.round(base * weekFactor(week)));
+    rarity === "legend" ? 8 : rarity === "veteran" ? 5 : rarity === "allstar" ? 3 : 2;
+  // Floor dropped from $2 → $1 so Common dupes in mid-weeks can land at
+  // $1-$2 instead of always being clamped up — the user feels the
+  // pricing curve, the dupe market doesn't price-lock at the floor.
+  const p = Math.max(1, Math.round(base * weekFactor(week)));
   if (week === 1) return Math.min(2, p);
   return p;
 }
 
 /** Free-agent sign price by role. Week 1 max $2. */
 function signPrice(role: "Pitcher" | "Batter", week: number): number {
-  const base = role === "Pitcher" ? 4 : 3;
-  const p = Math.max(2, Math.round(base * weekFactor(week)));
+  // Was 4/3; now 3/2 so signing a fresh face is reachable on the same
+  // budget as a cheap item rather than a premium decision.
+  const base = role === "Pitcher" ? 3 : 2;
+  const p = Math.max(1, Math.round(base * weekFactor(week)));
   if (week === 1) return Math.min(2, p);
   return p;
 }
@@ -115,27 +129,32 @@ function signPrice(role: "Pitcher" | "Batter", week: number): number {
 /**
  * Build offers for the Scouting Director. Mostly roster duplicates that
  * upgrade existing players, with one filler item card. Falls back to pure
- * item listings when the roster is at full Diamond (no upgrades possible).
+ * item listings when the roster is at full Legend (no upgrades possible).
+ *
+ * Legacy `MlbPlayer` slots expose `signatureCardIds`; new SZN players
+ * don't (their "signature" is the player card itself), so we fall back
+ * to the player id as the duplicate cardId for SZN slots.
  */
 function scoutingOffer(roster: RosterPlayer[], week: number): MerchantOffer {
-  const upgradable = roster.filter((r) => nextTier(r.tier) !== null);
+  const upgradable = roster.filter((r) => nextRarity(r.rarity) !== null);
   const listings: MerchantListing[] = [];
   // Up to 3 roster upgrades.
   for (const target of sample(upgradable, 3)) {
-    // Half the time offer a same-tier duplicate, half a same-player
-    // higher-tier "replacement". The user pays for both the same way; the
-    // merge effect differs.
     const isReplacement = Math.random() < 0.5;
-    const dupTier = isReplacement
-      ? (nextTier(target.tier) as Tier)
-      : target.tier;
+    const dupRarity = isReplacement
+      ? (nextRarity(target.rarity) as Rarity)
+      : target.rarity;
+    const legacySig =
+      "signatureCardIds" in target.player
+        ? target.player.signatureCardIds[0]
+        : `player:${target.player.id}`;
     listings.push({
       listingId: makeRunId("lst"),
-      cardId: target.player.signatureCardIds[0],
-      price: dupPrice(dupTier, week),
+      cardId: legacySig,
+      price: dupPrice(dupRarity, week),
       rosterUpgrade: {
         playerId: target.player.id,
-        duplicateTier: dupTier,
+        duplicateRarity: dupRarity,
         isReplacement,
       },
     });
@@ -150,10 +169,11 @@ function scoutingOffer(roster: RosterPlayer[], week: number): MerchantOffer {
 }
 
 function shadyTrainerOffer(week: number): MerchantOffer {
-  // High baseValue cards at a slight premium.
+  // High baseValue cards at a slight premium. Week-1 listings clamp
+  // to the $2 cap; later weeks tack +1 on top of the standard price.
   const pool = ALL_CARDS.filter((c) => c.baseValue >= 4);
   const listings = sample(pool, 4).map((c) =>
-    listingForCard(c, week, priceFor(c, week) + 1),
+    listingForCard(c, week, week === 1 ? priceFor(c, week) : priceFor(c, week) + 1),
   );
   return { kind: "merchant", merchantId: "shady_trainer", listings };
 }
@@ -271,10 +291,18 @@ const ALL_MERCHANTS: MerchantId[] = [
 const ALL_EVENTS: EventId[] = ["ringing_phone", "microphone", "injury_report"];
 
 /**
- * Build a "Free Agency" offer — N fresh MLB players the user doesn't own
- * yet, priced at bronze-tier sign value. Falls back to anyone if all
- * players in the pool are already on the roster (unlikely with a 30+ pool
- * vs. a 10-man roster).
+ * Build a "Free Agency" offer — N fresh players the user doesn't own
+ * yet, priced at common-rarity sign value. Sources the pool from
+ * `ALL_SZN_PLAYERS` so the cards rendered on the market match the
+ * semantic-edge SZN player card design used everywhere else (combat
+ * lineup, footer rail, pack-rip reveal). The legacy `MlbPlayer` pool
+ * is kept as a safety fallback for the (currently impossible) case
+ * where every SZN player on the registry is already owned, so the
+ * market always has SOMEONE to sign even on degenerate save states.
+ *
+ * `preferRole` lets future callers bias the four listings toward
+ * batters or pitchers — useful when the user just sold a position
+ * and we want the next market refresh to surface a replacement.
  */
 function freeAgencyOffer(
   roster: RosterPlayer[],
@@ -282,53 +310,148 @@ function freeAgencyOffer(
   preferRole?: "Batter" | "Pitcher",
 ): PlayerMarketOffer {
   const owned = new Set(roster.map((r) => r.player.id));
-  let pool = PLAYERS.filter((p) => !owned.has(p.id));
+  let pool = ALL_SZN_PLAYERS.filter((p) => !owned.has(p.id));
   if (preferRole) {
     const filtered = pool.filter((p) => p.role === preferRole);
     if (filtered.length >= 3) pool = filtered;
   }
-  if (pool.length === 0) pool = PLAYERS;
-  const picks = sample(pool, 4);
+  // Last-ditch fallback: every SZN player is owned -> sample legacy
+  // MlbPlayers so the market isn't empty. In practice the NYY pool is
+  // 20 players and the roster cap is 10, so we never reach this.
+  let picks: { id: string; role: "Batter" | "Pitcher" }[];
+  if (pool.length === 0) {
+    const legacyPool = PLAYERS.filter((p) => !owned.has(p.id));
+    picks = sample(legacyPool, 4).map((p) => ({ id: p.id, role: p.role }));
+  } else {
+    picks = sample(pool, 4).map((p) => ({ id: p.id, role: p.role }));
+  }
   return {
     kind: "playerMarket",
     label: "Free Agency",
-    blurb: "Sign new MLB talent. Players come in at Bronze.",
+    blurb: "Sign new MLB talent. Players come in at Common.",
     listings: picks.map((p) => ({
       listingId: makeRunId("plst"),
       playerId: p.id,
-      tier: "bronze" as Tier,
+      rarity: "common" as Rarity,
       // Pitchers a touch more than bats; both ramp with the week.
       price: signPrice(p.role, week),
     })),
   };
 }
 
+
+function shuffleOffers<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 /**
- * Build the day's 3 encounter slots. Mix of merchants, events and (sometimes)
- * a free-agency player market. Roughly: 50% chance the day has a player
- * market slot replacing one of the merchant slots, so the user encounters
- * a player-shopping moment ~every other day.
+ * Week-1 introductory discount for encounter event-choice costs.
+ *
+ * The encounter spec hard-codes per-choice prices on top of the
+ * merchant listing curve (Drip Cleats $4, Corked Bat $5, etc.). Those
+ * prices are authored for mid-run feel; on opening week the user only
+ * has the $14 starter stipend, so a single $5 encounter wipes the
+ * budget for the rest of the week. We clamp every Week-1 encounter
+ * `costPreview` down to $2 so the user can actually take 2-3 encounter
+ * items on day one, AND rewrite the choice label so the UI matches
+ * the price the dispatcher will actually charge (otherwise the button
+ * says "($5)" but only $2 is deducted -- confusing instead of
+ * delightful). Pure cash choices (`kind: "cash"`) skip this branch
+ * because their delta is the effect, not a `costPreview`.
+ *
+ * Weeks 2+ leave the printed cost unchanged so the curve still bites.
+ */
+function applyWeekDiscountToOffers(
+  offers: EncounterOffer[],
+  week: number,
+): EncounterOffer[] {
+  if (week !== 1) return offers;
+  return offers.map((o) => {
+    if (o.kind !== "event") return o;
+    return {
+      ...o,
+      choices: o.choices.map((c) => {
+        if (!c.costPreview || c.costPreview <= 2) return c;
+        const newCost = 2;
+        return {
+          ...c,
+          costPreview: newCost,
+          // Rewrite the trailing "($N)" tag the encounter author
+          // baked into the label; safe no-op if the label doesn't
+          // have one.
+          label: c.label.replace(/\(\$\d+\)/, `($${newCost})`),
+        };
+      }),
+    };
+  });
+}
+
+/**
+ * Build the day's encounter slots (1–3). Mostly draws from the SZN
+ * encounter table (20 spec encounters in `sznEncounters.ts`); the
+ * legacy scouting-director / shady-trainer / equipment-manager /
+ * concessions merchants are retained as a small chance per day for
+ * the existing roster-upgrade / dupe market the SZN table doesn't
+ * cover. Free-agency player market still surfaces a fraction of the
+ * time so the user always has a "sign a fresh face" outlet.
+ *
+ * `excludeEncounterIds` is the week-level dedupe set. Callers pass the
+ * union of every encounter id already rendered this week (other days
+ * + previously committed picks) so the user never sees the same
+ * encounter twice across a single Monday→Thursday Front Office stretch.
+ * When the eligible pool is exhausted the slate quietly allows repeats
+ * so the day still surfaces `slotCount` offers.
  */
 export function rollDailyOffers(
   roster: RosterPlayer[],
   week: number,
+  slotCount: number = MAX_PICKS_PER_DAY,
+  excludeEncounterIds?: ReadonlySet<string>,
 ): EncounterOffer[] {
-  const offers: EncounterOffer[] = [];
-  const merchants = sample(ALL_MERCHANTS, 2);
-  for (const m of merchants) offers.push(buildMerchantOffer(m, roster, week));
-  offers.push(buildEventOffer(sample(ALL_EVENTS, 1)[0]));
-  if (Math.random() < 0.55) {
-    // Replace one of the merchant slots with a free-agency player market.
-    // Index 0 or 1 (we just pushed two merchants in those positions).
-    const idx = Math.random() < 0.5 ? 0 : 1;
-    offers[idx] = freeAgencyOffer(roster, week);
+  const n = Math.max(1, Math.min(MAX_PICKS_PER_DAY, Math.floor(slotCount)));
+  const slate = rollSznEncounterSlate(week, n, excludeEncounterIds);
+
+  // Sprinkle in legacy front-office offers so roster upgrades, the
+  // free-agency lane, and the legacy event flavors still appear:
+  //   - 35% chance one slot becomes a legacy merchant (preserves the
+  //     Scouting Director's roster upgrade path that the SZN table
+  //     doesn't replicate).
+  //   - 20% chance one slot becomes a Free Agency player market.
+  // Sampling is over the SZN slate to keep slot count constant.
+  // Legacy merchants and the Free Agency market are ALSO filtered
+  // against the week-level dedupe set (matching by their
+  // `encounterOfferId` -- `merchant:concessions`, `market:Free Agency`,
+  // etc.) so the no-repeat-this-week rule covers them too. Without
+  // this filter a Concessions merchant rolled on Monday could
+  // resurface on a Tuesday re-roll because the SZN-table dedupe
+  // only knows about SZN encounter ids.
+  const offers: EncounterOffer[] = [...slate];
+  if (offers.length > 0 && Math.random() < 0.35) {
+    const merchantCandidates = ALL_MERCHANTS.filter(
+      (id) => !excludeEncounterIds?.has(`merchant:${id}`),
+    );
+    if (merchantCandidates.length > 0) {
+      const idx = Math.floor(Math.random() * offers.length);
+      offers[idx] = buildMerchantOffer(
+        sample(merchantCandidates, 1)[0],
+        roster,
+        week,
+      );
+    }
   }
-  // Shuffle so the event slot isn't always last.
-  for (let i = offers.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [offers[i], offers[j]] = [offers[j], offers[i]];
+  if (offers.length > 0 && Math.random() < 0.2) {
+    const market = freeAgencyOffer(roster, week);
+    if (!excludeEncounterIds?.has(`market:${market.label}`)) {
+      const idx = Math.floor(Math.random() * offers.length);
+      offers[idx] = market;
+    }
   }
-  return offers;
+  return shuffleOffers(applyWeekDiscountToOffers(offers, week));
 }
 
 /**

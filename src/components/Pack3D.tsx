@@ -34,6 +34,21 @@ import { PlayerCard } from "./PlayerCard";
 interface Pack3DProps {
   roster: RosterPlayer[];
   onComplete: () => void;
+  /**
+   * Fired whenever the internal pack state changes (PACK → OPENING →
+   * REVEALED). Lets the parent (e.g. `PackRipScreen`) hang controller
+   * bindings off the current phase without reaching into the
+   * SceneManager.
+   */
+  onStateChange?: (state: PackState) => void;
+  /**
+   * Optional ref-callback bound to an imperative "rip" trigger. The
+   * parent stores the callback and invokes it on CROSS so the pack
+   * advances from PACK → OPENING even when the user can't reach the
+   * canvas with a pointer (controller-only flow). Calling after the
+   * pack is already opening / revealed is a no-op.
+   */
+  onRequestRip?: (rip: () => void) => void;
 }
 
 type PackState = "PACK" | "OPENING" | "REVEALED";
@@ -461,10 +476,36 @@ class SceneManager {
   }
 }
 
-export function Pack3D({ roster, onComplete }: Pack3DProps) {
+export function Pack3D({
+  roster,
+  onComplete,
+  onStateChange,
+  onRequestRip,
+}: Pack3DProps) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const managerRef = useRef<SceneManager | null>(null);
   const [packState, setPackState] = useState<PackState>("PACK");
+
+  // Bridge state changes up to the parent so external surfaces (the
+  // controller binding inside `PackRipScreen`) can render the right
+  // CTA semantics. Effect — not inline call — to avoid setState
+  // during render.
+  useEffect(() => {
+    onStateChange?.(packState);
+  }, [packState, onStateChange]);
+
+  // Hand the parent an imperative "rip" trigger that mirrors the
+  // tap-to-rip fallback button. Stable identity (no deps) so the
+  // parent can register once and forget.
+  useEffect(() => {
+    if (!onRequestRip) return;
+    const rip = () => {
+      const m = managerRef.current;
+      if (m) m.setState("OPENING");
+      else setPackState("REVEALED");
+    };
+    onRequestRip(rip);
+  }, [onRequestRip]);
 
   useEffect(() => {
     if (!mountRef.current) return;
@@ -554,7 +595,7 @@ export function Pack3D({ roster, onComplete }: Pack3DProps) {
                 >
                   <PlayerCard
                     player={slot.player}
-                    tier={slot.tier}
+                    rarity={slot.rarity}
                     showSockets={false}
                     large
                   />

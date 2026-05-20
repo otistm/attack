@@ -1,10 +1,10 @@
 import { create } from "zustand";
-import { CardDefinition, SESSION_CARDS } from "./cards";
+import { CardDefinition, SESSION_CARDS, randomizeCardEdges } from "./cards";
 import { BATTERS, dealHand, MlbPlayer, PITCHERS, PLAYERS } from "./players";
 import { HitOutcome, resolveHitScale, scoreHand, ScoringContext, ScoringResult } from "./scoring";
-import { canConnect, playerAsCard, seamKey } from "./connect";
+import { canConnect, canConnectAny, playerAsCard, seamKey } from "./connect";
 import { applyCardEffect, EffectContext, highestValueCard } from "./cardEffects";
-import { applyHandTransforms } from "./handTransforms";
+import { applyHandTransforms, HAND_TRANSFORMS } from "./handTransforms";
 import { applyDealEffects } from "./dealEffects";
 import { applyResolveStep, PendingDebuff, RunnerSlot } from "./resolveStep";
 import type { ShapeType } from "../components/cardShapes";
@@ -37,15 +37,18 @@ import { playSfx } from "./sfx";
 import {
   emptyRunState,
   FRONT_OFFICE_DAYS,
-  MAX_PICKS_PER_DAY,
+  dayPickBudget,
   indexOfRosterPlayer,
   makeRunId,
-  nextTier as nextRunTier,
+  MAX_BAG_SIZE,
+  nextRarity as nextRunRarity,
+  rollWeekPickBudgets,
   RUN_LOSS_LIMIT,
   RUN_WIN_TARGET,
   STARTER_PACK_BATTERS,
   STARTER_PACK_PITCHERS,
-  TIER_BASE_VALUE,
+  STARTER_PACK_TOTAL,
+  RARITY_BASE_VALUE,
   WEEKLY_CASH,
   type DayOfWeek,
   type EncounterOffer,
@@ -53,10 +56,17 @@ import {
   type Item,
   type RosterPlayer,
   type RunState,
-  type Tier,
+  type Rarity,
+  type SeriesSummary,
+  type SeriesScoreline,
 } from "./run";
+import { MLB_TEAMS, type MlbTeamId } from "./sznTeams";
+import { SZN_PLAYERS_BY_TEAM, asMlbPlayerCompat, getSznPlayer, isSznPlayer, type SznPlayer } from "./sznPlayers";
+import { BADGES, isSnapTrigger, type BadgeId } from "./badges";
 import { rollDailyOffers, rollRandomItemCardId } from "./items";
-import { buildGhostSnapshot, weekendScoutingFromGhost } from "./ghost";
+import { encounterOfferId } from "./sznEncounters";
+import { buildGhostSnapshot, ghostTriggerItems } from "./ghost";
+import { rollWeeklyScout } from "./scouting";
 import { teamBatterBonus, teamPitcherBonus } from "./synergies";
 
 export type Half = "top" | "bottom";
@@ -176,6 +186,151 @@ export function getUiUserSide(s: {
   half: Half;
 }): Side {
   return s.revealUiUserSide ?? getUserSide(s);
+}
+
+/**
+ * True when the user is actively in a SZN weekend at-bat (not pack rip,
+ * not Front Office, not the series intro splash, not end-of-run).
+ * Centralizes the "should SZN combat-only interactions fire?" gate so
+ * the always-on `SznFooterDecks` doesn't mutate hand state during the
+ * pre-combat screens (where `phase` legitimately sits at `'selecting'`
+ * for the dormant placeholder at-bat).
+ *
+ * Mirror of the visibility selector inside `UIOverlay`/`RunHud` so the
+ * footer's "interactive" gate stays in lock-step with the screens that
+ * actually own combat (PackRip / Front Office / SeriesIntro all suppress
+ * the in-game overlay).
+ */
+export function isInSznCombat(s: {
+  gameMode: GameMode;
+  run: RunState | null;
+  phase: Phase;
+}): boolean {
+  if (s.gameMode !== "szn" || !s.run) return false;
+  if (s.run.packRipPending) return false;
+  if (s.run.endState !== null) return false;
+  if (s.run.day !== "series") return false;
+  if (!s.run.series?.gameInProgress) return false;
+  return s.phase === "selecting";
+}
+
+/**
+ * "Low leverage" gate used by the Quick Resolve toggle to decide whether
+ * the next at-bat is boring enough to auto-advance. The rule purposely
+ * errs on the side of NOT auto-resolving: any swing that could plausibly
+ * change the game's outcome (tied late, RISP, loaded bases, an open USE
+ * prompt) is treated as high leverage and the player gets the normal
+ * Lock In UX.
+ *
+ * SZN Games of the Week are 3 innings (`SERIES_GAME_INNINGS`), so the
+ * thresholds below are tuned for that short format -- "inning >= 2" is
+ * already mid-to-late game, and a 3-run lead is comfortable.
+ *
+ * Inputs are intentionally a wide `GameState`-shaped object (and not the
+ * full `GameState` type) so callers that just have the slice they care
+ * about can pass it without pulling in everything.
+ */
+export function isLowLeverageAtBat(s: {
+  gameMode: GameMode;
+  run: RunState | null;
+  phase: Phase;
+  inning: number;
+  totalInnings: number;
+  half: Half;
+  outs: number;
+  bases: Bases;
+  homeScore: number;
+  awayScore: number;
+  userTeam: Team;
+  pendingChoices: PendingChoice[];
+  activeChoiceCardId: string | null;
+  tutorialActive: boolean;
+}): boolean {
+  if (!isInSznCombat(s)) return false;
+  // Tutorial owns its own pacing; never auto-advance through it.
+  if (s.tutorialActive) return false;
+  // Any open or queued player-choice modal is by definition meaningful --
+  // auto-resolving past it would steal the player's decision.
+  if (s.activeChoiceCardId !== null) return false;
+  if (s.pendingChoices.length > 0) return false;
+
+  const userIsAway = s.userTeam === "AWAY";
+  const userScore = userIsAway ? s.awayScore : s.homeScore;
+  const ghostScore = userIsAway ? s.homeScore : s.awayScore;
+  const diff = userScore - ghostScore;
+  const absDiff = Math.abs(diff);
+  const tied = diff === 0;
+  const [on1, on2, on3] = s.bases;
+  const risp = on2 || on3;
+  const loaded = on1 && on2 && on3;
+
+  // ---- HARD EXCLUSIONS: meaningful spots, always play manually. ----
+  // Tied game in the final inning (or extras) -- every at-bat matters.
+  if (tied && s.inning >= s.totalInnings) return false;
+  // Runner in scoring position from inning 2 onward (would-be tying /
+  // go-ahead runner is one swing away).
+  if (risp && s.inning >= 2) return false;
+  // Bases loaded ever -- the swing is always high-leverage.
+  if (loaded) return false;
+  // Final inning, one-run game either way (walk-off / tying spot).
+  if (s.inning >= s.totalInnings && absDiff <= 1) return false;
+
+  const userSide = getUserSide(s);
+
+  // ---- SOFT INCLUSIONS: clear "blowout" or "garbage time" markers. ----
+  // SZN weekend games are 3 innings, so the old "inning >= 2 + 3 run gap"
+  // thresholds almost never tripped in practice -- final scores cluster
+  // around 4-3 and the toggle felt like dead UI. Loosened across the board
+  // to match the shorter format, while keeping the hard exclusions above
+  // (tied late / RISP from inning 2 / loaded / 1-run final inning) as the
+  // safety net for genuinely meaningful spots.
+  // (A) Mid-game gap: 2+ run differential from inning 2 onward. In a
+  //     3-inning game a 2-run gap with one full inning left is already
+  //     "garbage time" cadence -- the player isn't going to flip it with
+  //     one defensive snap.
+  if (s.inning >= 2 && absDiff >= 2) return true;
+  // (B) User pitching with ANY lead from inning 2+ -- defensive half is
+  //     mostly ceremony; the player isn't making the meaningful decisions.
+  //     Tied (diff === 0) is excluded so a 0-0 inning 2 defensive half
+  //     still plays manually.
+  if (userSide === "Pitching" && diff >= 1 && s.inning >= 2) return true;
+  // (C) Empty bases, two outs, not tied, inning 2+ -- worst case the
+  //     half-inning ends one swing later with no runners affected.
+  if (s.outs === 2 && !on1 && !on2 && !on3 && !tied && s.inning >= 2) return true;
+  // (D) Final inning, already up by 2+ -- math is mostly settled. (The
+  //     `absDiff <= 1` exclusion above guards the 1-run-game walk-off
+  //     spot, so leaving D at >= 2 is correct.)
+  if (s.inning >= s.totalInnings && diff >= 2) return true;
+  // (E) Pitching cleanup with 2 outs, empty bases, and a non-tied
+  //     score -- snap the inning shut regardless of how many runs we're
+  //     ahead/behind. We're one out from a fresh half either way.
+  if (
+    userSide === "Pitching" &&
+    s.outs === 2 &&
+    !on1 && !on2 && !on3 &&
+    !tied
+  ) return true;
+
+  return false;
+}
+
+/**
+ * Sibling of `isInSznCombat`: true when the user is in any Front
+ * Office day (mon..thu), meaning the encounter grid + persistent
+ * footer are the only foreground surfaces. Used by the footer to
+ * decide when to surface the FO-only widgets (synergy strip, sell
+ * tray) and by the SQUARE handler to enable batter/pitcher toggle on
+ * the LEFT deck. Excludes the post-rip / pre-rip transient states and
+ * the weekend series (combat owns those).
+ */
+export function isInSznFrontOffice(s: {
+  gameMode: GameMode;
+  run: RunState | null;
+}): boolean {
+  if (s.gameMode !== "szn" || !s.run) return false;
+  if (s.run.packRipPending) return false;
+  if (s.run.endState !== null) return false;
+  return s.run.day !== "series";
 }
 
 /**
@@ -547,10 +702,45 @@ export interface GameState {
   questShakeRequestId: number;
 
   /**
-   * SZN weekend combat: item bag ("Dugout") drawer open. Toggle is rendered
-   * in RunHud (above the week/series strip) so it never stacks on Lock In.
+   * Live-measured height (in px) of the always-on `SznFooterDecks` strip.
+   * `CardGameOverlay` reads this to lift the user-hand container by
+   * exactly the footer's footprint so the score pill / lock-in button
+   * never disappear behind the deck. Set to 0 whenever the footer is
+   * not mounted (out-of-SZN, etc.).
    */
-  sznDugoutOpen: boolean;
+  sznFooterHeight: number;
+
+  /**
+   * SZN-only Quick Resolve flag. When `true`, `CardGameOverlay` auto-runs
+   * the lock-in -> reveal -> next-at-bat chain on any at-bat where
+   * `isLowLeverageAtBat()` reports the spot as boring (blowout late,
+   * empty-bases two-outs, user pitching with a comfortable lead, etc.).
+   * The toggle is hand-on-a-dead-man's-switch: the moment leverage spikes
+   * (RISP, tied late, an open USE prompt), the auto-chain stops and the
+   * player gets the normal Lock In UX. Defaults to `false` so the very
+   * first SZN at-bat always requires a manual lock-in.
+   */
+  quickResolveEnabled: boolean;
+
+  /**
+   * Unified SZN gamepad focus surface. `'screen'` means the screen-level
+   * handlers (FrontOfficeScreen tile grid, EndRunScreen CTAs, etc.) own
+   * input; `'footer'` means the persistent `SznFooterDecks` row owns
+   * input (D-PAD navigates cards, L1/R1 switch decks, Triangle toggles
+   * collapse, etc.).
+   *
+   * Transition contract — owned by `SznFooterDecks` via its priority-50
+   * focus-router handler:
+   *   - `DPAD_DOWN` in `'screen'` mode → flip to `'footer'`
+   *   - `DPAD_UP`   in `'footer'` mode → flip back to `'screen'`
+   * Modals at priority 100+ sit ABOVE the router and consume their own
+   * input first, so the focus never transitions while a modal is open.
+   *
+   * Defaults to `'screen'` (and is reset to `'screen'` on every SZN
+   * mode transition) so the very first input the player gives always
+   * goes to the visible screen, not the silent footer.
+   */
+  sznGamepadFocus: 'screen' | 'hand' | 'footer';
 
   // Actions.
   reorderBatterHand: (cards: CardDefinition[]) => void;
@@ -611,6 +801,13 @@ export interface GameState {
    */
   showStartScreen: boolean;
   setShowStartScreen: (open: boolean) => void;
+  /**
+   * Whether the SZN-mode MLB team-selection overlay is mounted. Opened
+   * when the user clicks the SZN lane on the StartGameScreen; closed
+   * implicitly by `startSznRun` (which also closes the start screen).
+   */
+  showSznTeamSelect: boolean;
+  setShowSznTeamSelect: (open: boolean) => void;
 
   // ----- Learn-to-Play tutorial -----
   /**
@@ -707,11 +904,14 @@ export interface GameState {
    */
   run: RunState | null;
   /**
-   * Lane entry: kicks off a fresh SZN run. Sets `gameMode: "szn"`,
-   * initializes `run` to a starter run-state, and triggers the pack-rip
-   * reveal screen.
+   * Lane entry: kicks off a fresh SZN run with the user's chosen MLB
+   * franchise. Sets `gameMode: "szn"`, initializes `run` to a starter
+   * run-state seeded with the team's passive badge, and triggers the
+   * pack-rip reveal screen. The user is always parked in the AWAY
+   * (batting first) seat for SZN; the franchise choice drives the
+   * starter pool, not the seat.
    */
-  startSznRun: (team: Team) => void;
+  startSznRun: (mlbTeamId: MlbTeamId) => void;
   /** Pack-rip: reveal the starter 10 and seed Week 1 Mon. */
   openStarterPack: () => void;
   /** Pack-rip: dismiss the reveal screen and route to the Front Office. */
@@ -719,10 +919,10 @@ export interface GameState {
   /** Monday: dismiss the scouting report overlay for the current week. */
   acknowledgeWeekScouting: () => void;
   /**
-   * Front Office: commit a pick. Bumps `picksUsed`, re-rolls the slate,
-   * and auto-advances the day when the cap (`MAX_PICKS_PER_DAY`) is
-   * reached. Caller is responsible for closing any open modal first --
-   * the offers will replace mid-flight if the modal stays mounted.
+   * Front Office: commit a pick. Bumps `picksUsed`, re-rolls the slate
+   * (same slot count as that day's `pickBudget`), and auto-advances the day
+   * when the budget is reached. Caller is responsible for closing any open
+   * modal first — the offers will replace mid-flight if the modal stays mounted.
    */
   commitEncounter: () => void;
   /**
@@ -734,26 +934,53 @@ export interface GameState {
    */
   purchaseFromMerchant: (slotIndex: number, listingIndex: number) => boolean;
   /** Event view: pick one of the choice branches. */
-  resolveEventChoice: (slotIndex: number, choiceId: string) => void;
+  /**
+   * Resolve an event choice. `targetPlayerId` is an optional override
+   * filled in by the EventEncounterView's picker before dispatch -- it
+   * gets stamped onto the chosen `EventEffect.playerId` field for the
+   * effects that need a target (mutateRosterEdge, swapPlayerEdges,
+   * scoreOverridePlayer, pokerPlayerWager).
+   */
+  resolveEventChoice: (slotIndex: number, choiceId: string, targetPlayerId?: string) => void;
   /** Front Office: advance to the next day (or the weekend series). */
   advanceDay: () => void;
   /** Weekend: kick off the Bo3 series with a generated ghost. */
   startSeries: () => void;
-  /** Weekend: register the just-finished game's outcome and either move to game 2/3 or end the series. */
-  reportSeriesGameResult: (userWonGame: boolean) => void;
+  /**
+   * Weekend: register the just-finished game's outcome and either move
+   * to game 2/3 or end the series.
+   *
+   * Result tri-state:
+   *   - `"user"`  — user won this game (counts toward 2-of-3 series win)
+   *   - `"ghost"` — ghost won this game
+   *   - `"draw"`  — game ended tied (one extra inning, still even).
+   *                Series gameIndex advances but neither side gets a
+   *                game-win. Series tiebreaker (when reached) uses run
+   *                differential summed across played games — handled
+   *                separately by the reducer that tracks aggregate runs.
+   */
+  reportSeriesGameResult: (
+    result: "user" | "ghost" | "draw",
+    userScore: number,
+    ghostScore: number,
+  ) => void;
   /** End the run early (Quit / shame leave). */
   endRun: (reason: "champion" | "fired" | "manual") => void;
+  /**
+   * Acknowledge and dismiss the one-shot SeriesResultScreen snapshot.
+   * The SeriesResultScreen calls this on "Continue" so the Monday
+   * Front Office (or EndRunScreen for `endState !== null`) takes over.
+   * Idempotent; safe to call when `lastSeriesSummary` is already null.
+   */
+  dismissSeriesSummary: () => void;
   /**
    * Exit the SZN run completely back to the start-screen lane chooser.
    * Clears `run` and `gameMode` so the App-level routing falls back to the
    * legacy non-SZN paths and the StartGameScreen overlay can paint again.
    */
   exitSznToMenu: () => void;
-  /** Tier upgrade helpers — direct entry points (used by RosterDrawer). */
-  upgradeWithDuplicate: (playerId: string, duplicateTier: Tier) => boolean;
-  replaceWithHigherTier: (playerId: string, newTier: Tier) => boolean;
   /**
-   * Sell a roster player back for cash (Roster Drawer entry point).
+   * Sell a roster player back for cash (Front Office Sell tray entry point).
    * Returns the cash gained, or 0 if the player can't be sold.
    * Refuses to sell the last batter or last pitcher so the user always
    * has a viable lineup for the upcoming series.
@@ -762,7 +989,7 @@ export interface GameState {
   /**
    * Front Office: buy a fresh MLB player onto the roster from the player
    * market merchant. The store validates cash, checks for duplicates, and
-   * adds the new RosterPlayer at Bronze tier (using the player's intrinsic
+   * adds the new RosterPlayer at Common rarity (using the player's intrinsic
    * class tag). Returns `true` when the signing actually applied so
    * callers can gate "pick spent" UI state on a real transaction.
    */
@@ -780,7 +1007,60 @@ export interface GameState {
    * they're the seat's identity for the at-bat.
    */
   sznRecallItem: (cardId: string) => void;
-  setSznDugoutOpen: (open: boolean) => void;
+  /**
+   * SZN Mode combat: hot-swap the player currently at the plate (or on
+   * the mound, if the user is pitching) for another player on the run
+   * roster. The dealt items in the hand are preserved -- only the
+   * `player:` anchor card and the upstream `batter` / `pitcher` slot
+   * change. Affirmed seams are cleared because the swap mutates the
+   * shape sockets on the anchor card.
+   *
+   * Returns `true` when the swap succeeded, `false` otherwise (invalid
+   * phase, target not on roster, wrong role for the user's seat, etc.).
+   */
+  sznSwapPlayer: (playerId: string) => boolean;
+  /**
+   * Encounter-driven roster cull. Removes the named player from the
+   * run roster without a refund. Used by `RosterReleasePicker` when a
+   * player grant would push the roster past `STARTER_PACK_TOTAL`. No-
+   * op if the roster has only one of that role (we never empty a side).
+   * Returns true on success.
+   */
+  releaseRosterPlayer: (playerId: string) => boolean;
+  /**
+   * Footer "move mode" -- swap two roster players by id so the user
+   * can curate the order of their footer rail during Front Office. The
+   * swap is gated to FO (`isInSznFrontOffice`) because reshuffling the
+   * roster mid-at-bat would race with the suspension / role filters
+   * the combat code reads off the same array. No-op if either id is
+   * absent. Returns `true` on success so the footer can re-clamp focus
+   * around the moved card.
+   */
+  sznSwapRoster: (idA: string, idB: string) => boolean;
+  /**
+   * Footer "move mode" -- swap two bag items by instance id. Same FO
+   * gating rationale as `sznSwapRoster`. Bag order is purely a UI
+   * preference today; the combat path never indexes the bag, so this
+   * is a safe rearrangement.
+   */
+  sznSwapItemBag: (idA: string, idB: string) => boolean;
+  /** Reports the rendered footer-deck height up to the store. */
+  setSznFooterHeight: (h: number) => void;
+
+  /**
+   * Sets which SZN surface owns gamepad input. Almost always called
+   * from the `SznFooterDecks` focus router; other callers should
+   * generally let the router drive transitions so D-PAD nav stays
+   * predictable.
+   */
+  setSznGamepadFocus: (focus: 'screen' | 'hand' | 'footer') => void;
+
+  /**
+   * Flips the SZN Quick Resolve toggle. Pure preference setter -- the
+   * actual auto-advance loop lives in `CardGameOverlay` and reacts to
+   * this flag plus `isLowLeverageAtBat()`.
+   */
+  setQuickResolveEnabled: (enabled: boolean) => void;
 }
 
 export interface MatchupPreview {
@@ -905,6 +1185,69 @@ function pushRecent(list: string[], id: string, limit: number): string[] {
  * BATTERS / PITCHERS lists, preserving back-compat for tests and the
  * INITIAL_AT_BAT seed.
  */
+/**
+ * Resolve any `suspend:Batting` / `suspend:Pitching` sentinels in the
+ * suspension list into concrete player ids. Sentinels are written by the
+ * Clubhouse Prank "Suspend Instigators" branch and the poker-cash wager
+ * loss path; they intentionally defer the "who is the top scorer" pick
+ * to series-start time so the encounter copy ("top scorer suspended
+ * next series") can be evaluated against the live roster.
+ *
+ * We treat baseValue (rarity-derived) as the proxy for "top scorer"
+ * since rarity is the only score input known at suspension time;
+ * permanentBoost + scoreOverride are additive and don't change which
+ * slot a sentinel resolves to in practice (a Legend always outranks a
+ * boosted Common).
+ *
+ * The resolved list is idempotent — calling on an already-resolved list
+ * is a no-op (and returns the same reference so callers can short-
+ * circuit a setState).
+ */
+function resolveSuspensionSentinels(
+  current: string[],
+  roster: RosterPlayer[],
+): string[] {
+  if (current.length === 0) return current;
+  const hasSentinel = current.some(
+    (id) => id === "suspend:Batting" || id === "suspend:Pitching",
+  );
+  if (!hasSentinel) return current;
+  const topByRole = (role: "Batter" | "Pitcher"): string | null => {
+    let best: RosterPlayer | null = null;
+    let bestVal = -Infinity;
+    for (const slot of roster) {
+      if (slot.player.role !== role) continue;
+      const val =
+        RARITY_BASE_VALUE[slot.rarity] +
+        (slot.permanentBoost ?? 0) +
+        (slot.scoreOverride ?? 0);
+      if (val > bestVal) {
+        best = slot;
+        bestVal = val;
+      }
+    }
+    return best?.player.id ?? null;
+  };
+  const next: string[] = [];
+  const seen = new Set<string>();
+  for (const id of current) {
+    let resolved = id;
+    if (id === "suspend:Batting") {
+      const top = topByRole("Batter");
+      if (top) resolved = top;
+      else continue;
+    } else if (id === "suspend:Pitching") {
+      const top = topByRole("Pitcher");
+      if (top) resolved = top;
+      else continue;
+    }
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    next.push(resolved);
+  }
+  return next;
+}
+
 function rosterPoolsFor(s: {
   draft: DraftState | null;
   userTeam: Team;
@@ -920,18 +1263,32 @@ function rosterPoolsFor(s: {
   // global BATTERS / PITCHERS catalog, which would break SZN tier seeding on
   // the player-as-card (`freshAtBat` matches roster ids for `baseValue`).
   if (s.gameMode === "szn" && s.run && s.run.ghost) {
-    const userBatters = s.run.roster
-      .filter((r) => r.player.role === "Batter")
-      .map((r) => r.player);
-    const userPitchers = s.run.roster
-      .filter((r) => r.player.role === "Pitcher")
-      .map((r) => r.player);
+    // Suspended players (Clubhouse Prank "Suspend Instigators", poker
+    // wager loss) are filtered from the user's at-bat pool. We never
+    // empty a role -- if every entry would be suspended we fall back to
+    // the full roster so the at-bat still seats someone.
+    const suspended = new Set(s.run.suspendedPlayerIds ?? []);
+    const filterSuspended = <T extends { id: string }>(pool: T[]): T[] => {
+      if (suspended.size === 0) return pool;
+      const next = pool.filter((p) => !suspended.has(p.id));
+      return next.length > 0 ? next : pool;
+    };
+    const userBatters = filterSuspended(
+      s.run.roster
+        .filter((r) => r.player.role === "Batter")
+        .map((r) => asMlbPlayerCompat(r.player)),
+    );
+    const userPitchers = filterSuspended(
+      s.run.roster
+        .filter((r) => r.player.role === "Pitcher")
+        .map((r) => asMlbPlayerCompat(r.player)),
+    );
     const ghostBatters = s.run.ghost.roster
       .filter((r) => r.player.role === "Batter")
-      .map((r) => r.player);
+      .map((r) => asMlbPlayerCompat(r.player));
     const ghostPitchers = s.run.ghost.roster
       .filter((r) => r.player.role === "Pitcher")
-      .map((r) => r.player);
+      .map((r) => asMlbPlayerCompat(r.player));
     const battingTeam: Team = s.half === "top" ? "AWAY" : "HOME";
     const userBatting = battingTeam === s.userTeam;
     return {
@@ -990,8 +1347,8 @@ interface FreshAtBatOptions {
   /**
    * SZN Mode: when set, the BATTER's hand is replaced with these cards
    * instead of being dealt. Used so the user's purchased item bag drives
-   * the play instead of a generated 5-card hand. Falls back to the normal
-   * deal when undefined / empty so non-SZN paths are unaffected.
+   * the play instead of a randomly generated hand. Falls back to the
+   * normal deal when undefined / empty so non-SZN paths are unaffected.
    */
   userBatterHandOverride?: CardDefinition[];
   /** Same shape, for the pitcher seat. */
@@ -999,16 +1356,40 @@ interface FreshAtBatOptions {
   /**
    * SZN Mode flag: when true, the user's seat starts with ONLY the
    * MlbPlayer-as-card in their hand. Items are added to the hand at
-   * runtime via the Dugout drawer (`sznDealItem`).
+   * runtime via the persistent `SznFooterDecks` drag-to-deal (which
+   * calls `sznDealItem` against the user's `itemBag`). Hand cap is 6
+   * including the player anchor card.
    */
   sznMode?: boolean;
   /** Which seat is the user occupying for this at-bat. */
   sznUserSide?: "Batting" | "Pitching";
   /**
-   * When `sznMode` seeds a player-as-card hand, tier base value is read from
+   * When `sznMode` seeds a player-as-card hand, rarity base value is read from
    * this roster (must be the active user run roster in SZN combat).
    */
   sznUserRoster?: RosterPlayer[];
+  /**
+   * Ghost-side roster + bag for SZN combat parity. When set the
+   * non-user seat also gets seeded with `playerAsCard` + tier base (so
+   * the ghost hits / pitches off their own player anchor), then
+   * `ghostTriggerItems` auto-deals a subset of bag items on top so the
+   * AI fights with the inventory it accumulated this run.
+   *
+   * Without these, the ghost defaulted to a vanilla `dealHand` — full
+   * random hand from the global card pool — and the entire ghost item
+   * bag was dead code.
+   */
+  sznGhostRoster?: RosterPlayer[];
+  sznGhostBag?: Item[];
+  /** Score state at the start of the at-bat, used to drive ghost item triggers. */
+  sznGhostContext?: { inning: number; ghostScore: number; userScore: number };
+  /**
+   * Flat additive boost to the user's anchor card base value for the
+   * upcoming series. Populated by Hold-the-Line encounter; cleared at
+   * week rollover. Ghost anchors are NEVER boosted (this is a user-only
+   * buff bought from a Front Office encounter).
+   */
+  sznUserNextGameBoost?: number;
 }
 
 function freshAtBat(opts: FreshAtBatOptions = {}): FreshAtBat {
@@ -1020,20 +1401,86 @@ function freshAtBat(opts: FreshAtBatOptions = {}): FreshAtBat {
     opts.recent?.pitchers ?? [],
     batter,
   );
-  // SZN Mode hand: the USER's seat starts with just the MlbPlayer-as-card
-  // and a Dugout drawer to deal items in. The non-user (ghost) seat is
-  // dealt normally. `sznUserSide` declares which seat is the user.
+  // SZN Mode hand seeding: both the user AND the ghost seat start with
+  // their `playerAsCard` anchor at the tier base value from their
+  // respective rosters. The user's seat stays at [anchor] — items are
+  // added at runtime via the SznFooterDecks deal action. The ghost's
+  // seat additionally auto-deals a subset of the ghost item bag via
+  // `ghostTriggerItems` so the AI plays with the inventory it built
+  // through the run (otherwise the ghost bag is dead code and the
+  // ghost fights with a hollow [anchor] hand).
   let sznBatterHand: CardDefinition[] | null = null;
   let sznPitcherHand: CardDefinition[] | null = null;
   if (opts.sznMode) {
-    if (opts.sznUserSide === "Batting") {
-      const slot = opts.sznUserRoster?.find((r) => r.player.id === batter.id);
-      const tierBase = slot ? TIER_BASE_VALUE[slot.tier] : TIER_BASE_VALUE.bronze;
-      sznBatterHand = [{ ...playerAsCard(batter), baseValue: tierBase }];
+    const userIsBatting = opts.sznUserSide === "Batting";
+
+    const seedSeat = (
+      player: MlbPlayer,
+      roster: RosterPlayer[] | undefined,
+      isGhost: boolean,
+    ): CardDefinition[] => {
+      const slot = roster?.find((r) => r.player.id === player.id);
+      // Stack rarity base + roster-locked rookie-veteran boost +
+      // encounter-applied permanent score override (Special Dirt,
+      // Statcast Optimizer, etc.). All three are additive.
+      // The user-only nextGameRosterBoost (Hold-the-Line encounter)
+      // layers on top of rarity + permanent boost + score override so
+      // every user player swings harder for the duration of the
+      // upcoming series. Ghost anchors never receive the boost.
+      const nextGameBoost = !isGhost ? (opts.sznUserNextGameBoost ?? 0) : 0;
+      const rarityBase = slot
+        ? RARITY_BASE_VALUE[slot.rarity] + (slot.permanentBoost ?? 0) + (slot.scoreOverride ?? 0) + nextGameBoost
+        : RARITY_BASE_VALUE.common + nextGameBoost;
+      // playerAsCard now consumes optional roster overrides so the
+      // dealt anchor card carries the live (encounter-mutated) edges
+      // and the synthetic team-logo resolves to the player's real
+      // franchise logo.
+      const overrides = slot
+        ? {
+            leftEdgeOverride: slot.leftEdgeOverride,
+            rightEdgeOverride: slot.rightEdgeOverride,
+          }
+        : undefined;
+      const anchor: CardDefinition = {
+        ...playerAsCard(player, overrides),
+        baseValue: rarityBase,
+      };
+      if (!isGhost) return [anchor];
+
+      // Ghost: layer item-bag draws on top of the anchor.
+      const bag = opts.sznGhostBag ?? [];
+      const ctx = opts.sznGhostContext;
+      const ghostScore = ctx?.ghostScore ?? 0;
+      const userScore = ctx?.userScore ?? 0;
+      const triggered = ghostTriggerItems({
+        inning: ctx?.inning ?? 1,
+        trailingBy: Math.max(0, userScore - ghostScore),
+        bagCardIds: bag.map((b) => b.cardId),
+      });
+      const items: CardDefinition[] = [];
+      const seen = new Set<string>([anchor.id]);
+      for (const cardId of triggered) {
+        if (seen.has(cardId)) continue;
+        const card = SESSION_CARDS.find((c) => c.id === cardId);
+        if (!card) continue;
+        seen.add(cardId);
+        items.push(card);
+        // Match the user seat's 6-card cap (anchor + 5 items).
+        if (items.length >= 5) break;
+      }
+      return [anchor, ...items];
+    };
+
+    if (userIsBatting) {
+      sznBatterHand = seedSeat(batter, opts.sznUserRoster, false);
+      if (opts.sznGhostRoster) {
+        sznPitcherHand = seedSeat(pitcher, opts.sznGhostRoster, true);
+      }
     } else if (opts.sznUserSide === "Pitching") {
-      const slot = opts.sznUserRoster?.find((r) => r.player.id === pitcher.id);
-      const tierBase = slot ? TIER_BASE_VALUE[slot.tier] : TIER_BASE_VALUE.bronze;
-      sznPitcherHand = [{ ...playerAsCard(pitcher), baseValue: tierBase }];
+      sznPitcherHand = seedSeat(pitcher, opts.sznUserRoster, false);
+      if (opts.sznGhostRoster) {
+        sznBatterHand = seedSeat(batter, opts.sznGhostRoster, true);
+      }
     }
   }
   // Hand overrides take precedence over SZN seeds (non-SZN-mode lanes
@@ -1126,6 +1573,73 @@ function derivePendingChoices(
   return out;
 }
 
+/**
+ * Re-derive every "what's in the hand changed" piece of state after a
+ * mid-at-bat hand mutation (SZN deal / recall / player swap). Without
+ * this pass, choice cards / reveal cards dealt mid-at-bat silently never
+ * fire because `pendingChoices` / `pendingReveals` were frozen at deal
+ * time (b-65 Guess Pitch, b-12 Switch Hitter, p-56 Pinpoint Control,
+ * b-7 / b-121 / p-51 / p-59 reveals).
+ *
+ * When `newlyDealt` is provided, the new card's HAND_TRANSFORMS (if any)
+ * are applied surgically so that p-31 / p-35 / p-42 / b-21 / etc. fire
+ * on the existing hand. We deliberately do NOT re-run every transform
+ * (which would double-apply non-idempotent effects like b-21 destroy
+ * highest general or b-119 -2 to generals).
+ *
+ * `activeChoiceCardId` is cleared when its target card left the hand
+ * (e.g. the user recalled a card that had an open modal).
+ */
+function reconcileSznHandState(
+  s: GameState,
+  newlyDealt?: { card: CardDefinition; side: "Batting" | "Pitching" },
+): Partial<GameState> {
+  let bh = s.batterHand;
+  let ph = s.pitcherHand;
+  const impacting = new Set(s.pitcherTransformsImpactingBatter);
+
+  if (newlyDealt) {
+    const transform = HAND_TRANSFORMS[newlyDealt.card.id];
+    if (transform) {
+      const patch = transform();
+      if (newlyDealt.side === "Batting") {
+        if (patch.ownHandPatch) bh = patch.ownHandPatch(bh);
+        if (patch.opponentHandPatch) ph = patch.opponentHandPatch(ph);
+      } else {
+        if (patch.ownHandPatch) ph = patch.ownHandPatch(ph);
+        if (patch.opponentHandPatch) {
+          const batterIgnores = bh.some((c) => c.id === "b-9");
+          if (!batterIgnores) {
+            const before = bh;
+            bh = patch.opponentHandPatch(bh);
+            if (before !== bh) impacting.add(newlyDealt.card.id);
+          }
+        }
+      }
+    }
+  }
+
+  const pendingChoices = derivePendingChoices(bh, ph);
+  const pendingReveals = derivePendingReveals(bh, ph);
+
+  let activeChoiceCardId = s.activeChoiceCardId;
+  if (activeChoiceCardId) {
+    const inHand =
+      bh.some((c) => c.id === activeChoiceCardId) ||
+      ph.some((c) => c.id === activeChoiceCardId);
+    if (!inHand) activeChoiceCardId = null;
+  }
+
+  return {
+    batterHand: bh,
+    pitcherHand: ph,
+    pitcherTransformsImpactingBatter: Array.from(impacting),
+    pendingChoices,
+    pendingReveals,
+    activeChoiceCardId,
+  };
+}
+
 export function derivePendingReveals(
   batterHand: CardDefinition[],
   pitcherHand: CardDefinition[],
@@ -1144,6 +1658,59 @@ export function derivePendingReveals(
     out.push({ forSide: "Pitching", reveal: "opponentLayout", source: "Nasty Slider" });
   }
   return out;
+}
+
+/**
+ * Centralized "wipe everything the next lane shouldn't inherit" reset.
+ * Returned as a `Partial<GameState>` so the caller can spread it into a
+ * single `set()` alongside any lane-specific seeds. Covers state that
+ * historically leaked across SZN -> Quick Match / Draft / menu transitions
+ * (e.g. `totalInnings: 3` from a SZN series, the live `sznFooterHeight`
+ * snapshot, leftover runners, etc.).
+ *
+ * Callers that need to keep a specific slice (e.g. preserve `userTeam`
+ * across a reset) should spread their override AFTER this object so the
+ * "keep" wins.
+ */
+function resetEphemeralGameplay(): Partial<GameState> {
+  return {
+    phase: "selecting",
+    totalInnings: 9,
+    sznFooterHeight: 0,
+    // Always start a fresh gameplay session with focus on the screen
+    // so the very first DPAD press lands on a visible target (FO grid /
+    // EndRun CTA / etc.) and not the silent footer.
+    sznGamepadFocus: 'screen',
+    // Quick Resolve is intentionally a per-session opt-in -- never
+    // carry it across SZN -> Quick Match / Draft / menu transitions
+    // so a fresh game always starts with full manual control.
+    quickResolveEnabled: false,
+    inning: 1,
+    half: "top",
+    outs: 0,
+    isFirstAtBatOfInning: true,
+    homeScore: 0,
+    awayScore: 0,
+    bases: [false, false, false],
+    baseRunners: [null, null, null],
+    lastOutcome: null,
+    lastBatterScore: 0,
+    lastPitcherScore: 0,
+    lastResultMessage: "",
+    lastResolveLog: [],
+    lastBatterCardModifiers: {},
+    lastPitcherCardModifiers: {},
+    lastRevealMathSnapshot: null,
+    runnerMoves: [],
+    pendingDebuffs: [],
+    resolvedChoices: {},
+    activeChoiceCardId: null,
+    coinFlips: {},
+    affirmedSeams: new Set<string>(),
+    revealScript: [],
+    pendingResolvedPhase: null,
+    revealUiUserSide: null,
+  };
 }
 
 function seedQuestState(): {
@@ -1234,6 +1801,8 @@ export const useGameStore = create<GameState>((set, get) => ({
   // player commits via `startDraft` / `startQuickMatch`; reopens from the
   // game-over screen via `setShowStartScreen(true)`.
   showStartScreen: true,
+  // Stay hidden until the user explicitly clicks the SZN lane.
+  showSznTeamSelect: false,
 
   // Tutorial defaults to off. Activated by `startTutorial()` (called
   // immediately after `startQuickMatch('AWAY')` from the Learn to Play
@@ -1280,7 +1849,9 @@ export const useGameStore = create<GameState>((set, get) => ({
   questShakeRequestId: 0,
   ...QUEST_REWARD_INITIAL,
 
-  sznDugoutOpen: false,
+  sznFooterHeight: 0,
+  sznGamepadFocus: 'screen',
+  quickResolveEnabled: false,
 
   run: null,
 
@@ -1308,19 +1879,19 @@ export const useGameStore = create<GameState>((set, get) => ({
         const a = hand[i - 1];
         const b = hand[i];
         const key = seamKey(a.id, b.id);
-        if (s.affirmedSeams.has(key) && canConnect(a, b)) {
+        if (s.affirmedSeams.has(key) && canConnectAny(a, b)) {
           next.add(key);
         }
       }
       if (idx > 0) {
         const left = hand[idx - 1];
         const me = hand[idx];
-        if (canConnect(left, me)) next.add(seamKey(left.id, me.id));
+        if (canConnectAny(left, me)) next.add(seamKey(left.id, me.id));
       }
       if (idx < hand.length - 1) {
         const me = hand[idx];
         const right = hand[idx + 1];
-        if (canConnect(me, right)) next.add(seamKey(me.id, right.id));
+        if (canConnectAny(me, right)) next.add(seamKey(me.id, right.id));
       }
       return { affirmedSeams: next };
     }),
@@ -1427,6 +1998,10 @@ export const useGameStore = create<GameState>((set, get) => ({
       opponentAffirmedSeams: getUserSide(s) === "Pitching" ? s.affirmedSeams : null,
       questHitScaleBonus:
         s.questPendingBattingHitScale > 0 ? s.questPendingBattingHitScale : undefined,
+      sznRallyFireActive:
+        s.gameMode === "szn" &&
+        getUserSide(s) === "Batting" &&
+        (s.run?.rallyFireWeeksLeft ?? 0) > 0,
     };
     return scoreHand(s.batterHand, ctx);
   },
@@ -1492,6 +2067,10 @@ export const useGameStore = create<GameState>((set, get) => ({
       affirmedSeams: getUserSide(s) === "Pitching" ? s.affirmedSeams : null,
       // Opposite seat's seams (see scoreBatter for rationale).
       opponentAffirmedSeams: getUserSide(s) === "Batting" ? s.affirmedSeams : null,
+      sznRallyFireActive:
+        s.gameMode === "szn" &&
+        getUserSide(s) === "Pitching" &&
+        (s.run?.rallyFireWeeksLeft ?? 0) > 0,
     };
     return scoreHand(s.pitcherHand, ctx);
   },
@@ -1592,12 +2171,26 @@ export const useGameStore = create<GameState>((set, get) => ({
 
     // Re-derive scoring against the (possibly mutated) batter hand. We pass
     // the working hand through a temporary state shim so scoreBatter sees it.
-    const batterResult = workingBatterHand === s.batterHand
+    const rawBatterResult = workingBatterHand === s.batterHand
       ? s.scoreBatter()
       : scoreHandFor(s, workingBatterHand, "Batting");
     const pitcherResult = s.scorePitcher();
 
+    // SZN Deception edge: 25% chance per Deception snap on the defender's
+    // chain to shatter the opposing chain. We roll once at lock-in so the
+    // preview pill doesn't leak the outcome (random per-render rolls would
+    // also be unfair). Non-SZN paths return the raw batterResult intact.
+    const { batterResult, shattered: deceptionShattered } =
+      s.gameMode === "szn"
+        ? maybeApplyDeception(rawBatterResult, pitcherResult)
+        : { batterResult: rawBatterResult, shattered: false };
+    void deceptionShattered;
+
     const m = computeMatchup(s, batterResult, pitcherResult);
+
+    // SZN side effects that mutate the run state (cash queue, Veteran
+    // permanent boosts, Movement debuff stacks). No-op outside SZN.
+    const sznSide = applySznLockInSideEffects(s, batterResult, pitcherResult);
 
     const consumedForceHomer =
       s.questForceHomerunOnce && m.batterWins && !batterResult.forcedOutcome;
@@ -1705,7 +2298,11 @@ export const useGameStore = create<GameState>((set, get) => ({
     const drainedDebuffs = s.pendingDebuffs
       .map((d) => ({ ...d, remainingAtBats: d.remainingAtBats - 1 }))
       .filter((d) => d.remainingAtBats > 0);
-    const nextDebuffs = [...drainedDebuffs, ...resolveDelta.pendingDebuffs];
+    const nextDebuffs = [
+      ...drainedDebuffs,
+      ...resolveDelta.pendingDebuffs,
+      ...sznSide.extraDebuffs,
+    ];
 
     // Reveal-sequence orchestrator: park the at-bat in `revealing` while the
     // UI animates each scoring beat. The resolved-state phase (between-at-bats
@@ -1736,9 +2333,15 @@ export const useGameStore = create<GameState>((set, get) => ({
       },
     };
 
+    const sznRunPatch =
+      sznSide.runPatch && s.run
+        ? { run: { ...s.run, ...sznSide.runPatch } }
+        : null;
+
     set({
       ...next,
       ...questPatch,
+      ...(sznRunPatch ?? {}),
       lastOutcome: outcome,
       // Persist the COMPREHENSIVE display values (not the raw head-to-head
       // totals) so the resolved view matches the live preview pill.
@@ -1799,9 +2402,15 @@ export const useGameStore = create<GameState>((set, get) => ({
     const pools = rosterPoolsFor(s);
     // SZN Mode: keep the user's hand seeded with just the player card so
     // every at-bat surfaces the new active batter/pitcher and the user
-    // re-deals items from the Dugout drawer per at-bat.
+    // re-deals items from the Dugout drawer per at-bat. The ghost seat
+    // also gets seeded (playerAsCard + tier + auto-dealt items) so the
+    // opponent fights with their run inventory instead of a vanilla hand.
     const sznMode = s.gameMode === "szn" && s.run !== null;
     const userBattingNext = getUserSide(s) === "Batting";
+    const sznGhost = sznMode ? s.run!.ghost : null;
+    const ghostIsHome = s.userTeam === "AWAY";
+    const ghostScore = ghostIsHome ? s.homeScore : s.awayScore;
+    const userScore = ghostIsHome ? s.awayScore : s.homeScore;
     const ab = freshAtBat({
       recent: { batters: s.recentBatterIds, pitchers: s.recentPitcherIds },
       battersPool: pools.battersPool,
@@ -1809,6 +2418,12 @@ export const useGameStore = create<GameState>((set, get) => ({
       sznMode,
       sznUserSide: sznMode ? (userBattingNext ? "Batting" : "Pitching") : undefined,
       sznUserRoster: sznMode ? s.run!.roster : undefined,
+      sznGhostRoster: sznGhost?.roster,
+      sznGhostBag: sznGhost?.itemBag,
+      sznGhostContext: sznGhost
+        ? { inning: s.inning, ghostScore, userScore }
+        : undefined,
+      sznUserNextGameBoost: sznMode ? s.run!.nextGameRosterBoost ?? 0 : 0,
     });
     const userNext = getUserSide(s);
     let batterHand = ab.batterHand;
@@ -1848,7 +2463,6 @@ export const useGameStore = create<GameState>((set, get) => ({
       revealUiUserSide: null,
       questWildcardNextBatterHand: false,
       questLegendaryCelebratePulse: false,
-      sznDugoutOpen: false,
     });
   },
 
@@ -1906,13 +2520,13 @@ export const useGameStore = create<GameState>((set, get) => ({
       questTick: 0,
       questShakeRequestId: 0,
       ...QUEST_REWARD_INITIAL,
-      sznDugoutOpen: false,
     });
   },
 
   setUserTeam: (team) => set({ userTeam: team }),
 
   setShowStartScreen: (open) => set({ showStartScreen: open }),
+  setShowSznTeamSelect: (open) => set({ showSznTeamSelect: open }),
 
   startTutorial: () => set({ tutorialActive: true, tutorialStepIndex: 0 }),
 
@@ -1952,41 +2566,19 @@ export const useGameStore = create<GameState>((set, get) => ({
     // Full gameplay reset (matches `reset`) so leftover bases / scores /
     // reveal scripts from a prior game can't bleed through the overlay.
     // Without this, the backdrop visibly carried runners and a half-finished
-    // inning into a fresh draft.
+    // inning into a fresh draft. Also wipes SZN-only leakage (totalInnings,
+    // sznFooterHeight) so a SZN -> Draft transition starts from baseline.
     set({
+      ...resetEphemeralGameplay(),
       phase: "drafting",
       userTeam: team,
       gameMode: "draft",
       draft,
-      inning: 1,
-      half: "top",
-      outs: 0,
-      isFirstAtBatOfInning: true,
-      homeScore: 0,
-      awayScore: 0,
-      bases: [false, false, false],
-      baseRunners: [null, null, null],
+      run: null,
       ...ab,
       atBatId: s.atBatId + 1,
-      lastOutcome: null,
-      lastBatterScore: 0,
-      lastPitcherScore: 0,
-      lastResultMessage: "",
-      lastResolveLog: [],
-      lastBatterCardModifiers: {},
-      lastPitcherCardModifiers: {},
-      lastRevealMathSnapshot: null,
-      runnerMoves: [],
-      pendingDebuffs: [],
-      resolvedChoices: {},
-      activeChoiceCardId: null,
-      coinFlips: {},
-      affirmedSeams: new Set<string>(),
       recentBatterIds: [ab.batter.id],
       recentPitcherIds: [ab.pitcher.id],
-      revealScript: [],
-      pendingResolvedPhase: null,
-      revealUiUserSide: null,
       activeQuests: [],
       questProgress: {},
       completedQuests: [],
@@ -2010,7 +2602,9 @@ export const useGameStore = create<GameState>((set, get) => ({
     // designed to be indistinguishable from a finished auction once we
     // reach gameplay, so we mirror every reset field `completeDraft`
     // sets, just with `phase: "selecting"` directly (no drafting beat
-    // in between).
+    // in between). `resetEphemeralGameplay` also wipes SZN-only state
+    // (totalInnings: 3, sznFooterHeight) so a SZN-to-QuickMatch jump
+    // starts from the baseline 9-inning game.
     const battingTeam: Team = "AWAY"; // half === "top" on a fresh game
     const battingSide = battingTeam === team ? "user" : "ai";
     const fieldingSide = battingSide === "user" ? "ai" : "user";
@@ -2019,44 +2613,21 @@ export const useGameStore = create<GameState>((set, get) => ({
       pitchersPool: draft.roster[fieldingSide].pitchers,
     });
     set({
+      ...resetEphemeralGameplay(),
       phase: "shop",
       userTeam: team,
       gameMode: "quick-match",
       draft,
+      run: null,
       seasonWins: 0,
       seasonLosses: 0,
       teamBudget: 1000,
       inventory: [],
       equippedItems: {},
-      inning: 1,
-      half: "top",
-      outs: 0,
-      isFirstAtBatOfInning: true,
-      homeScore: 0,
-      awayScore: 0,
-      bases: [false, false, false],
-      baseRunners: [null, null, null],
       ...ab,
       atBatId: s.atBatId + 1,
-      lastOutcome: null,
-      lastBatterScore: 0,
-      lastPitcherScore: 0,
-      lastResultMessage: "",
-      lastResolveLog: [],
-      lastBatterCardModifiers: {},
-      lastPitcherCardModifiers: {},
-      lastRevealMathSnapshot: null,
-      runnerMoves: [],
-      pendingDebuffs: [],
-      resolvedChoices: {},
-      activeChoiceCardId: null,
-      coinFlips: {},
-      affirmedSeams: new Set<string>(),
       recentBatterIds: [ab.batter.id],
       recentPitcherIds: [ab.pitcher.id],
-      revealScript: [],
-      pendingResolvedPhase: null,
-      revealUiUserSide: null,
       ...(questSlate && questSlate.length === 3
         ? questStateFromManualIds(questSlate)
         : seedQuestState()),
@@ -2191,43 +2762,38 @@ export const useGameStore = create<GameState>((set, get) => ({
   // SZN Mode actions (run-loop pivot).
   // =========================================================================
 
-  startSznRun: (team) => {
+  startSznRun: (mlbTeamId) => {
     const s = get();
     const ab = freshAtBat();
-    const run = emptyRunState();
+    const team = MLB_TEAMS[mlbTeamId];
+    // Per-run SZN edge remix. Mutates SESSION_CARDS in place so every
+    // downstream consumer (merchant rolls, random rewards, hand
+    // dealings) picks up the new sznLeftEdge / sznRightEdge for this
+    // run. Encounter items (`enc-*`) are skipped inside the
+    // randomizer so their curated edges (mega-seam, defense-shield,
+    // etc.) stay authoritative. We do this BEFORE openStarterPack
+    // rolls Mon..Thu offers so the first encounters render with
+    // run-fresh edges instead of leftover (or undefined) ones.
+    const runSeed = Math.floor(Math.random() * 0x7fffffff);
+    randomizeCardEdges(SESSION_CARDS, runSeed);
+    if (typeof console !== "undefined") {
+      console.info(`[dugout] szn run edge seed = ${runSeed}`);
+    }
+    const run: RunState = {
+      ...emptyRunState(),
+      selectedTeamId: mlbTeamId,
+      badges: team ? [team.passiveBadgeId] : [],
+    };
     set({
+      ...resetEphemeralGameplay(),
       gameMode: "szn",
-      userTeam: team,
-      phase: "selecting",
+      // SZN runs always plant the user in the AWAY (batting first) seat;
+      // the MLB franchise picked at the start screen drives the player
+      // pool, not the away/home seat distinction.
+      userTeam: "AWAY",
       run,
-      // Reset gameplay surface so the pack-rip screen takes over visually.
-      inning: 1,
-      half: "top",
-      outs: 0,
-      isFirstAtBatOfInning: true,
-      homeScore: 0,
-      awayScore: 0,
-      bases: [false, false, false],
-      baseRunners: [null, null, null],
       ...ab,
       atBatId: s.atBatId + 1,
-      lastOutcome: null,
-      lastBatterScore: 0,
-      lastPitcherScore: 0,
-      lastResultMessage: "",
-      lastResolveLog: [],
-      lastBatterCardModifiers: {},
-      lastPitcherCardModifiers: {},
-      lastRevealMathSnapshot: null,
-      runnerMoves: [],
-      pendingDebuffs: [],
-      resolvedChoices: {},
-      activeChoiceCardId: null,
-      coinFlips: {},
-      affirmedSeams: new Set<string>(),
-      revealScript: [],
-      pendingResolvedPhase: null,
-      revealUiUserSide: null,
       // Quests dormant in SZN Mode for v1.
       activeQuests: [],
       questProgress: {},
@@ -2237,64 +2803,133 @@ export const useGameStore = create<GameState>((set, get) => ({
       questShakeRequestId: 0,
       ...QUEST_REWARD_INITIAL,
       showStartScreen: false,
+      showSznTeamSelect: false,
       tutorialActive: false,
       tutorialStepIndex: 0,
       // Auction draft state irrelevant to SZN.
       draft: null,
     });
+    // Skip the 3D pack-rip cinematic and deal the starter roster +
+    // Mon..Thu encounters + ghost + Monday scouting RIGHT NOW so the
+    // user lands directly in the Front Office where the SZN footer
+    // rail shows their 10-player roster (with SZN edge halves) as
+    // the "here are your players" moment. `openStarterPack` is
+    // idempotent against an already-populated roster but on a fresh
+    // run it does all the meaningful work (roster deal, week
+    // encounters, ghost snapshot, scouting report).
+    get().openStarterPack();
+    const seeded = get().run;
+    if (seeded) {
+      set({ run: { ...seeded, packRipPending: false } });
+    }
   },
 
   openStarterPack: () => {
     const s = get();
     if (!s.run) return;
-    // Pull a deterministic-ish but randomized starter 10: 9 batters + 1 pitcher.
-    const batterPool = [...PLAYERS.filter((p) => p.role === "Batter")];
-    const pitcherPool = [...PLAYERS.filter((p) => p.role === "Pitcher")];
+    // Pull the SZN player pool for the selected team. Each team's pool
+    // is up to 20 players; we deal a random 10 with at least 1 pitcher
+    // guaranteed so the roster has a starting arm. Fallback to the
+    // legacy MlbPlayer pool when running with a team whose SZN pool
+    // hasn't been built yet (the picker should prevent this, but the
+    // fallback keeps the SZN flow bootable for placeholder teams).
     const pickN = <T,>(pool: T[], n: number): T[] => {
       const out: T[] = [];
-      for (let i = 0; i < n && pool.length > 0; i++) {
-        const idx = Math.floor(Math.random() * pool.length);
-        out.push(pool.splice(idx, 1)[0]);
+      const work = [...pool];
+      for (let i = 0; i < n && work.length > 0; i++) {
+        const idx = Math.floor(Math.random() * work.length);
+        out.push(work.splice(idx, 1)[0]);
       }
       return out;
     };
-    const starterBatters = pickN(batterPool, STARTER_PACK_BATTERS);
-    const starterPitchers = pickN(pitcherPool, STARTER_PACK_PITCHERS);
-    const roster: RosterPlayer[] = [
-      ...starterBatters.map((p) => ({ player: p, tier: "bronze" as Tier, tag: p.tag })),
-      ...starterPitchers.map((p) => ({ player: p, tier: "bronze" as Tier, tag: p.tag })),
-    ];
+
+    const teamId = s.run.selectedTeamId;
+    const sznPool = teamId ? SZN_PLAYERS_BY_TEAM[teamId] ?? [] : [];
+
+    let roster: RosterPlayer[] = [];
+    if (sznPool.length >= STARTER_PACK_TOTAL) {
+      const batters = sznPool.filter((p) => p.role === "Batter");
+      const pitchers = sznPool.filter((p) => p.role === "Pitcher");
+      const starterBatters = pickN(batters, STARTER_PACK_BATTERS);
+      const starterPitchers = pickN(pitchers, STARTER_PACK_PITCHERS);
+      // Pitchers first so the footer rail's underlying array order
+      // matches the visual default (pitchers anchor the left deck).
+      // Footer "move mode" reorders this array directly; the runtime
+      // sort that used to flip batters->pitchers has been removed so
+      // user-curated order isn't clobbered every render.
+      roster = [
+        ...starterPitchers.map((p) => ({
+          player: p as SznPlayer,
+          rarity: "common" as Rarity,
+          tag: p.tag,
+        })),
+        ...starterBatters.map((p) => ({
+          player: p as SznPlayer,
+          rarity: "common" as Rarity,
+          tag: p.tag,
+        })),
+      ];
+    } else {
+      // Legacy fallback for un-built placeholder teams.
+      const batterPool = [...PLAYERS.filter((p) => p.role === "Batter")];
+      const pitcherPool = [...PLAYERS.filter((p) => p.role === "Pitcher")];
+      const starterBatters = pickN(batterPool, STARTER_PACK_BATTERS);
+      const starterPitchers = pickN(pitcherPool, STARTER_PACK_PITCHERS);
+      roster = [
+        ...starterPitchers.map((p) => ({ player: p, rarity: "common" as Rarity, tag: p.tag })),
+        ...starterBatters.map((p) => ({ player: p, rarity: "common" as Rarity, tag: p.tag })),
+      ];
+    }
     // Generate Mon..Thu encounters off the new roster. Each day starts
     // with picksUsed=0; the slate auto-refreshes after each pick.
-    // Brand-new run -> week 1 pricing (cheap floor so $10 starting cash
-    // can actually buy 2-3 items on day one).
-    const weekEncounters = FRONT_OFFICE_DAYS.map((day) => ({
-      day,
-      offers: rollDailyOffers(roster, 1),
-      picksUsed: 0,
-    }));
-    // Seed this week's ghost + Monday scouting report NOW so the
-    // opponent the user reads on Monday is the same roster they
-    // actually face Friday — not a freshly re-rolled clone at series
-    // start.
+    // Brand-new run -> week 1 pricing (cheap floor so $14 starting cash
+    // can actually buy 3 items on day one). Cumulative dedupe set so
+    // no encounter id appears more than once across the entire
+    // Monday→Thursday slate (per the "no encounter twice in a week"
+    // rule); each day's roll filters against everything earlier days
+    // already produced.
+    const pickBudgets = rollWeekPickBudgets();
+    const seenThisWeek = new Set<string>();
+    const weekEncounters = FRONT_OFFICE_DAYS.map((day, i) => {
+      const offers = rollDailyOffers(roster, 1, pickBudgets[i], seenThisWeek);
+      for (const o of offers) seenThisWeek.add(encounterOfferId(o));
+      return {
+        day,
+        offers,
+        picksUsed: 0,
+        pickBudget: pickBudgets[i],
+      };
+    });
+    // Seed this week's ghost + Monday scouting report NOW. The ghost
+    // still exists for the Friday series; the scouting report is no
+    // longer ABOUT the ghost (it's worldbuilding flavor + foreshadow
+    // for what shows up in the week's encounters), so we build it
+    // from the run state AFTER the week's encounters are stamped on
+    // -- that way the ability / player hints can foreshadow the
+    // actual upcoming merchant + market listings.
     const interimRun: RunState = {
       ...s.run,
       roster,
       weekEncounters,
       day: "mon",
+      seenEncountersThisWeek: Array.from(seenThisWeek),
     };
     const ghost = buildGhostSnapshot(interimRun);
-    const weekendScouting = weekendScoutingFromGhost(ghost);
+    const weeklyScout = rollWeeklyScout(interimRun);
     set({
       run: {
         ...s.run,
         roster,
         weekEncounters,
         ghost,
-        weekendScouting,
+        weeklyScout,
         weekScoutingAcknowledged: false,
-        // packRipPending stays true until the player taps "Head to the
-        // Front Office" -- otherwise the screen would unmount mid-reveal.
+        seenEncountersThisWeek: Array.from(seenThisWeek),
+        // packRipPending is flipped to false by the `startSznRun`
+        // caller IMMEDIATELY after this action so the Front Office
+        // mounts directly without the 3D pack-rip cinematic. The
+        // field is retained on the type for backwards-compatibility
+        // and so we can resurrect the pack-rip flow later if desired.
         day: "mon",
       },
     });
@@ -2314,8 +2949,8 @@ export const useGameStore = create<GameState>((set, get) => ({
 
   /**
    * Commit one of today's encounter slots. Bazaar-style: every pick
-   * burns one of the day's `MAX_PICKS_PER_DAY` slots AND replaces the
-   * full slate of three offers with a fresh roll. When all picks are
+   * burns one of the day's `pickBudget` slots (1–3 per day) AND replaces the
+   * full slate with a fresh roll at the same slot count. When all picks are
    * spent the day auto-advances. Idempotent if called when no run is
    * active or the day is already in series mode.
    */
@@ -2327,18 +2962,19 @@ export const useGameStore = create<GameState>((set, get) => ({
     if (dayIdx < 0) return;
     const day = s.run.weekEncounters[dayIdx];
     if (!day) return;
+    const budget = dayPickBudget(day);
     // Idempotency guard: if the budget is already at the cap, advance
     // without burning another pick. Protects against a fast double-commit
     // (e.g., re-render race) over-spending the day.
-    if (day.picksUsed >= MAX_PICKS_PER_DAY) {
+    if (day.picksUsed >= budget) {
       get().advanceDay();
       return;
     }
     // Clamp so picksUsed can never exceed the cap, even if a future
     // caller bypasses the early-return above.
-    const nextPicksUsed = Math.min(day.picksUsed + 1, MAX_PICKS_PER_DAY);
+    const nextPicksUsed = Math.min(day.picksUsed + 1, budget);
     const weekEncounters = [...s.run.weekEncounters];
-    if (nextPicksUsed >= MAX_PICKS_PER_DAY) {
+    if (nextPicksUsed >= budget) {
       // Day is over -- advance. We don't bother re-rolling first since
       // the FrontOfficeScreen will route off this day anyway.
       weekEncounters[dayIdx] = { ...day, picksUsed: nextPicksUsed };
@@ -2347,15 +2983,41 @@ export const useGameStore = create<GameState>((set, get) => ({
       get().advanceDay();
       return;
     }
-    // Refresh all three offers so the user sees brand-new options.
-    // Pass the current week so prices stay on the run-loop curve as
-    // the user progresses past week 1.
+    // Build the cumulative "no encounter twice in a week" exclude set
+    // BEFORE re-rolling: prior week-level history + every offer still
+    // sitting in OTHER days' slates + the offers about to be replaced
+    // in THIS day's slate. Without this the re-roll could resurface
+    // an encounter the user just saw two seconds ago on the same row.
+    const excludeIds = new Set<string>(s.run.seenEncountersThisWeek ?? []);
+    s.run.weekEncounters.forEach((d, i) => {
+      if (i === dayIdx) return;
+      for (const o of d.offers) excludeIds.add(encounterOfferId(o));
+    });
+    for (const o of day.offers) excludeIds.add(encounterOfferId(o));
+    // Refresh offers — same pick budget / slot count as this calendar day.
+    const nextOffers = rollDailyOffers(
+      s.run.roster,
+      s.run.week,
+      budget,
+      excludeIds,
+    );
     weekEncounters[dayIdx] = {
       ...day,
-      offers: rollDailyOffers(s.run.roster, s.run.week),
+      offers: nextOffers,
       picksUsed: nextPicksUsed,
     };
-    set({ run: { ...s.run, weekEncounters } });
+    // Append every freshly-generated id into the week's history so
+    // future re-rolls (and other days, if any encounter is still
+    // unseen there) can't reintroduce the same encounter again.
+    const nextSeen = new Set<string>(excludeIds);
+    for (const o of nextOffers) nextSeen.add(encounterOfferId(o));
+    set({
+      run: {
+        ...s.run,
+        weekEncounters,
+        seenEncountersThisWeek: Array.from(nextSeen),
+      },
+    });
   },
 
   purchaseFromMerchant: (slotIndex, listingIndex) => {
@@ -2373,28 +3035,62 @@ export const useGameStore = create<GameState>((set, get) => ({
 
     let nextRoster = s.run.roster;
     let nextBag = s.run.itemBag;
+    let nextMlbScoutingIntel = s.run.mlbScoutingIntel;
+
+    // Encounter intel items resolve at purchase time -- they have no
+    // playable effect in-hand (sznLeftEdge / sznRightEdge = "blank",
+    // baseValue = 0), so dumping them in the bag would just clog a
+    // 6-slot inventory. Faded Scouting Report instead peeks one item
+    // from the opponent's bag (or names a roster anchor when the bag
+    // is empty) and stashes the readout for the SeriesIntro chip.
+    if (listing.cardId === "enc-faded-scouting-report") {
+      const ghost = s.run.ghost;
+      let intel = "Intel: opponent looks unscoutable.";
+      if (ghost) {
+        const bagPick = ghost.itemBag.length > 0
+          ? ghost.itemBag[Math.floor(Math.random() * ghost.itemBag.length)]
+          : null;
+        if (bagPick) {
+          const card = SESSION_CARDS.find((c) => c.id === bagPick.cardId);
+          if (card) intel = `Intel: opponent is likely to deploy ${card.name} next series.`;
+        } else {
+          const anchor = ghost.roster[Math.floor(Math.random() * ghost.roster.length)];
+          if (anchor) intel = `Intel: opponent leans on ${anchor.player.name} (${anchor.rarity.toUpperCase()}).`;
+        }
+      }
+      set({
+        run: { ...s.run, cash: s.run.cash - listing.price, mlbScoutingIntel: intel },
+      });
+      return true;
+    }
 
     if (listing.rosterUpgrade) {
       const idx = indexOfRosterPlayer(nextRoster, listing.rosterUpgrade.playerId);
       if (idx < 0) return false;
       const target = nextRoster[idx];
-      const expectedDup = target.tier;
+      const expectedDup = target.rarity;
       if (listing.rosterUpgrade.isReplacement) {
-        // Direct same-player higher-tier replacement.
-        const upTier = listing.rosterUpgrade.duplicateTier;
-        if (nextRunTier(expectedDup) !== upTier) return false;
+        // Direct same-player higher-rarity replacement.
+        const upRarity = listing.rosterUpgrade.duplicateRarity;
+        if (nextRunRarity(expectedDup) !== upRarity) return false;
         nextRoster = [...nextRoster];
-        nextRoster[idx] = { ...target, tier: upTier };
+        nextRoster[idx] = { ...target, rarity: upRarity };
       } else {
-        // One-duplicate upgrade: bumps tier by exactly one.
-        if (listing.rosterUpgrade.duplicateTier !== expectedDup) return false;
-        const up = nextRunTier(expectedDup);
+        // One-duplicate upgrade: bumps rarity by exactly one.
+        if (listing.rosterUpgrade.duplicateRarity !== expectedDup) return false;
+        const up = nextRunRarity(expectedDup);
         if (!up) return false;
         nextRoster = [...nextRoster];
-        nextRoster[idx] = { ...target, tier: up };
+        nextRoster[idx] = { ...target, rarity: up };
       }
     } else {
-      // Item add.
+      // Item add. Hard caps so the SZN footer Abilities column and the
+      // chain math never see an unbounded inventory:
+      //   - No duplicate cardIds (the engine keys cards by id; a second
+      //     copy would silently never be dealable, see audit P0 dup item).
+      //   - Max bag size = `MAX_BAG_SIZE` (6).
+      if (nextBag.some((it) => it.cardId === listing.cardId)) return false;
+      if (nextBag.length >= MAX_BAG_SIZE) return false;
       nextBag = [...nextBag, { instanceId: makeRunId("itm"), cardId: listing.cardId }];
     }
 
@@ -2404,12 +3100,13 @@ export const useGameStore = create<GameState>((set, get) => ({
         cash: s.run.cash - listing.price,
         roster: nextRoster,
         itemBag: nextBag,
+        mlbScoutingIntel: nextMlbScoutingIntel,
       },
     });
     return true;
   },
 
-  resolveEventChoice: (slotIndex, choiceId) => {
+  resolveEventChoice: (slotIndex, choiceId, targetPlayerId) => {
     const s = get();
     if (!s.run || s.run.day === "series") return;
     const dayKey = s.run.day as DayOfWeek;
@@ -2421,21 +3118,226 @@ export const useGameStore = create<GameState>((set, get) => ({
     const choice = offer.choices.find((c) => c.choiceId === choiceId);
     if (!choice) return;
 
-    const eff: EventEffect = choice.effect;
+    // Overlay any picker-resolved playerId onto the effect before
+    // dispatch. The encounter table ships effects with `playerId: ""`
+    // for picker-driven choices; without this step the dispatcher
+    // would no-op them.
+    let eff: EventEffect = choice.effect;
+    if (targetPlayerId && "playerId" in eff) {
+      eff = { ...eff, playerId: targetPlayerId } as EventEffect;
+    }
+    // Local mutable run patch built up across effect branches so a
+    // single dispatch only writes once at the end. Karma 2x doubles
+    // cash + badge deltas; we apply it inside the cash/queueNextWeekCash
+    // branches because per-snap badge triggers fan-out separately in
+    // applySznLockInSideEffects.
+    const karmaMul = s.run.karmaDoubleTriggers ? 2 : 1;
     let cash = s.run.cash;
     let bag = s.run.itemBag;
-    if (eff.kind === "cash") cash = Math.max(0, cash + eff.delta);
-    else if (eff.kind === "addItemRandom") {
-      const cardId = rollRandomItemCardId(eff.pool);
-      bag = [...bag, { instanceId: makeRunId("itm"), cardId }];
+    let roster = s.run.roster;
+    let badges = s.run.badges;
+    let defenseShields = s.run.defenseShields;
+    let bangingSchemeWeeksLeft = s.run.bangingSchemeWeeksLeft;
+    let karmaDoubleTriggers = s.run.karmaDoubleTriggers;
+    let rallyFireWeeksLeft = s.run.rallyFireWeeksLeft;
+    let suspendedPlayerIds = s.run.suspendedPlayerIds;
+    let nextGameRosterBoost = s.run.nextGameRosterBoost;
+    let nextWeekCashBonus = s.run.nextWeekCashBonus;
+    let mlbScoutingIntel = s.run.mlbScoutingIntel;
+
+    // Single-player overrides are written in place; we clone the slot
+    // before mutating so React identity changes trigger re-renders.
+    const mutateRoster = (id: string, patch: Partial<RosterPlayer>) => {
+      roster = roster.map((r) => (r.player.id === id ? { ...r, ...patch } : r));
+    };
+
+    // Choices marked with `costPreview` charge the user up-front (used
+    // by encounter "buy" choices that resolve into non-cash effects
+    // like queueDefenseShields / mutateRosterEdge / grantItem). Pure
+    // `kind: "cash"` effects already encode their own delta and skip
+    // this branch. We silently clamp at 0; the EventEncounterView is
+    // responsible for hiding/disabling unaffordable choices.
+    if (choice.costPreview && choice.costPreview > 0 && eff.kind !== "cash") {
+      cash = Math.max(0, cash - choice.costPreview);
+    }
+
+    if (eff.kind === "cash") {
+      cash = Math.max(0, cash + eff.delta * karmaMul);
+    } else if (eff.kind === "addItemRandom") {
+      // Same bag-cap and dedupe contract as merchant purchases — a "free
+      // item" reward silently drops when the bag is full or already
+      // holds that cardId rather than overflowing or stamping a dead
+      // duplicate.
+      if (bag.length < MAX_BAG_SIZE) {
+        let rolled: string | null = null;
+        for (let attempt = 0; attempt < 8; attempt++) {
+          const candidate = rollRandomItemCardId(eff.pool);
+          if (!bag.some((it) => it.cardId === candidate)) {
+            rolled = candidate;
+            break;
+          }
+        }
+        if (rolled) {
+          bag = [...bag, { instanceId: makeRunId("itm"), cardId: rolled }];
+        }
+      }
     } else if (eff.kind === "removeRandomItem") {
       if (bag.length > 0) {
         const idx = Math.floor(Math.random() * bag.length);
         bag = bag.filter((_, i) => i !== idx);
       }
+    } else if (eff.kind === "grantItem") {
+      // Encounter-specific grant. Skip if the bag already holds the
+      // same cardId (chain engine keys items by cardId; duplicates
+      // would silently never deal) OR if the bag is full. Both
+      // failures are quiet -- the user sees the result blurb either
+      // way; the encounter just doesn't land if they're capped.
+      if (bag.length < MAX_BAG_SIZE && !bag.some((it) => it.cardId === eff.cardId)) {
+        bag = [...bag, { instanceId: makeRunId("itm"), cardId: eff.cardId }];
+      }
+    } else if (eff.kind === "mutateRosterEdge") {
+      // Side selector lets a single encounter stamp left, right, or
+      // both. `alsoBlank` is a follow-up that blanks the opposite
+      // side (Statcast Optimizer: stamp contact on left, blank right).
+      const slot = roster.find((r) => r.player.id === eff.playerId);
+      if (slot) {
+        const patch: Partial<RosterPlayer> = {};
+        if (eff.side === "left" || eff.side === "both") {
+          patch.leftEdgeOverride = eff.edge;
+        }
+        if (eff.side === "right" || eff.side === "both") {
+          patch.rightEdgeOverride = eff.edge;
+        }
+        if (eff.alsoBlank === "left") {
+          patch.leftEdgeOverride = "blank";
+        } else if (eff.alsoBlank === "right") {
+          patch.rightEdgeOverride = "blank";
+        }
+        mutateRoster(eff.playerId, patch);
+      }
+    } else if (eff.kind === "swapPlayerEdges") {
+      const slot = roster.find((r) => r.player.id === eff.playerId);
+      if (slot && isSznPlayer(slot.player)) {
+        const liveLeft = slot.leftEdgeOverride ?? slot.player.leftEdge;
+        const liveRight = slot.rightEdgeOverride ?? slot.player.rightEdge;
+        mutateRoster(eff.playerId, {
+          leftEdgeOverride: liveRight,
+          rightEdgeOverride: liveLeft,
+        });
+      }
+    } else if (eff.kind === "scoreOverridePlayer") {
+      const slot = roster.find((r) => r.player.id === eff.playerId);
+      if (slot) {
+        mutateRoster(eff.playerId, {
+          scoreOverride: (slot.scoreOverride ?? 0) + eff.delta,
+        });
+      }
+    } else if (eff.kind === "boostNextGameAll") {
+      nextGameRosterBoost += eff.delta;
+    } else if (eff.kind === "permanentBoostAll") {
+      roster = roster.map((r) => ({
+        ...r,
+        scoreOverride: (r.scoreOverride ?? 0) + eff.delta,
+      }));
+    } else if (eff.kind === "addBadge") {
+      if (!badges.includes(eff.badgeId)) {
+        badges = [...badges, eff.badgeId];
+      }
+    } else if (eff.kind === "setKarmaDouble") {
+      karmaDoubleTriggers = eff.on;
+    } else if (eff.kind === "queueDefenseShields") {
+      defenseShields += eff.count;
+    } else if (eff.kind === "queueBangingScheme") {
+      bangingSchemeWeeksLeft += eff.weeks;
+    } else if (eff.kind === "queueNextWeekCash") {
+      nextWeekCashBonus += eff.delta * karmaMul;
+    } else if (eff.kind === "queueRallyFire") {
+      rallyFireWeeksLeft += eff.weeks;
+    } else if (eff.kind === "randomizeRosterEdges") {
+      // Clubhouse Prank "chaos" branch: pick `count` random roster
+      // slots and roll each one a fresh wildcard edge on each side.
+      // We constrain to known-safe SZN edges (no encounter-specific
+      // syntheticas) so the resulting overrides actually snap.
+      const safe: import("./sznEdges").SznEdgeId[] = [
+        "power", "speed", "contact", "patience",
+        "velocity", "movement", "control", "deception",
+        "infield", "outfield", "battery",
+      ];
+      const indices: number[] = [];
+      while (indices.length < Math.min(eff.count, roster.length)) {
+        const idx = Math.floor(Math.random() * roster.length);
+        if (!indices.includes(idx)) indices.push(idx);
+      }
+      const next = roster.slice();
+      for (const idx of indices) {
+        const pickEdge = () => safe[Math.floor(Math.random() * safe.length)];
+        next[idx] = {
+          ...next[idx],
+          leftEdgeOverride: pickEdge(),
+          rightEdgeOverride: pickEdge(),
+        };
+      }
+      roster = next;
+    } else if (eff.kind === "suspendTopScorers") {
+      // Marker only: the actual scoring-prediction happens at series
+      // intro time; here we just record the intent. We synthesize a
+      // sentinel id "suspend:Batting" / "suspend:Pitching" the
+      // series-setup code will resolve into a concrete player.
+      const sentinels = eff.sides.map((side) => `suspend:${side}`);
+      suspendedPlayerIds = [...suspendedPlayerIds, ...sentinels];
+    } else if (eff.kind === "pokerCashWager") {
+      // Coin flip: 50/50 net payout vs lose-and-exhaust. Pitcher
+      // exhaustion is encoded as a suspended id sentinel that the
+      // series-setup code resolves into the actual top pitcher.
+      const win = Math.random() < 0.5;
+      if (win) {
+        cash = Math.max(0, cash + eff.winPayout * karmaMul);
+      } else {
+        cash = Math.max(0, cash - eff.bet);
+        suspendedPlayerIds = [...suspendedPlayerIds, "suspend:Pitching"];
+      }
+    } else if (eff.kind === "pokerPlayerWager") {
+      const win = Math.random() < 0.5;
+      if (win) {
+        mutateRoster(eff.playerId, {
+          leftEdgeOverride: "wildcard",
+          rightEdgeOverride: "wildcard",
+        });
+      } else {
+        // Loss: blank edges and zero out the score. We don't drop the
+        // slot because that would orphan the encounter UI; instead the
+        // player becomes a 0-score chain-ender until the run ends.
+        mutateRoster(eff.playerId, {
+          leftEdgeOverride: "blank",
+          rightEdgeOverride: "blank",
+          scoreOverride: -1000,
+        });
+      }
+    } else if (eff.kind === "noop") {
+      // Intentional no-op; the resultBlurb is the entire effect.
     }
+
+    // Intel writes are routed through here so it's discoverable. Used
+    // by Faded Scouting Report (encounter #20) to seed a peek-style
+    // pre-series HUD pill; cleared at series end.
+    void mlbScoutingIntel;
+
     set({
-      run: { ...s.run, cash, itemBag: bag },
+      run: {
+        ...s.run,
+        cash,
+        itemBag: bag,
+        roster,
+        badges,
+        defenseShields,
+        bangingSchemeWeeksLeft,
+        karmaDoubleTriggers,
+        rallyFireWeeksLeft,
+        suspendedPlayerIds,
+        nextGameRosterBoost,
+        nextWeekCashBonus,
+        mlbScoutingIntel,
+      },
     });
     // Note: we do NOT call commitEncounter here -- the EventEncounterView
     // shows the resolution result first and commits via its Continue
@@ -2478,24 +3380,62 @@ export const useGameStore = create<GameState>((set, get) => ({
     const s = get();
     if (!s.run || s.run.day !== "series") return;
     if (!s.run.series || !s.run.ghost) return;
-    // Seed an at-bat using the run roster (user) and ghost (opponent).
-    const userBatters = s.run.roster.filter((r) => r.player.role === "Batter").map((r) => r.player);
-    const userPitchers = s.run.roster.filter((r) => r.player.role === "Pitcher").map((r) => r.player);
-    const ghostBatters = s.run.ghost.roster.filter((r) => r.player.role === "Batter").map((r) => r.player);
-    const ghostPitchers = s.run.ghost.roster.filter((r) => r.player.role === "Pitcher").map((r) => r.player);
+    // Resolve any suspension sentinels (`suspend:Batting` /
+    // `suspend:Pitching`) into concrete player ids before the first
+    // at-bat is seated. We pick the highest-baseValue player on each
+    // role from the user's roster, so the encounter copy ("top scorer
+    // suspended") lands. The resolved id replaces the sentinel so the
+    // HUD / future filters reference a real player rather than a tag.
+    const resolvedSuspended = resolveSuspensionSentinels(
+      s.run.suspendedPlayerIds ?? [],
+      s.run.roster,
+    );
+    const persistRun =
+      resolvedSuspended === s.run.suspendedPlayerIds
+        ? s.run
+        : { ...s.run, suspendedPlayerIds: resolvedSuspended };
+    // Filter pools through the resolved suspension set (the gameStore
+    // setter further down also persists the resolved list back to the
+    // run so subsequent at-bats see the same suspensions).
+    const suspended = new Set(resolvedSuspended);
+    const filterSuspended = <T extends { id: string }>(pool: T[]): T[] => {
+      if (suspended.size === 0) return pool;
+      const next = pool.filter((p) => !suspended.has(p.id));
+      return next.length > 0 ? next : pool;
+    };
+    const userBatters = filterSuspended(
+      s.run.roster.filter((r) => r.player.role === "Batter").map((r) => asMlbPlayerCompat(r.player)),
+    );
+    const userPitchers = filterSuspended(
+      s.run.roster.filter((r) => r.player.role === "Pitcher").map((r) => asMlbPlayerCompat(r.player)),
+    );
+    const ghostBatters = s.run.ghost.roster.filter((r) => r.player.role === "Batter").map((r) => asMlbPlayerCompat(r.player));
+    const ghostPitchers = s.run.ghost.roster.filter((r) => r.player.role === "Pitcher").map((r) => asMlbPlayerCompat(r.player));
     // The user is AWAY by default in SZN mode (bats top of the 1st).
     const battersPool = s.userTeam === "AWAY" ? userBatters : ghostBatters;
     const pitchersPool = s.userTeam === "AWAY" ? ghostPitchers : userPitchers;
     // SZN: the user's seat starts with a hand of [playerCard]; items are
-    // dealt at runtime via the Dugout drawer. The opposite seat (ghost)
-    // is dealt normally so the AI behaves like any other opponent.
-    const userBatting = s.userTeam === "AWAY"; // top of 1st = AWAY batting
+    // dealt at runtime via the persistent SznFooterDecks rail. The
+    // opposite seat (ghost) is dealt normally so the AI behaves like
+    // any other opponent.
+    // `userIsAway` -> the user's team identity is AWAY, which means
+    // they bat in the top of the 1st (the first half of every series
+    // opener). This is a stable per-run trait, not a per-half flip.
+    const userIsAway = s.userTeam === "AWAY";
     const ab = freshAtBat({
       battersPool,
       pitchersPool,
       sznMode: true,
-      sznUserSide: userBatting ? "Batting" : "Pitching",
+      sznUserSide: userIsAway ? "Batting" : "Pitching",
       sznUserRoster: s.run.roster,
+      sznGhostRoster: s.run.ghost.roster,
+      sznGhostBag: s.run.ghost.itemBag,
+      // Series Game 1 always starts 0-0 in the top of the 1st, so the
+      // ghost trigger heuristic sees the standard "no comeback needed"
+      // baseline. Mid-series games re-seed via startNextAtBat with the
+      // live score.
+      sznGhostContext: { inning: 1, ghostScore: 0, userScore: 0 },
+      sznUserNextGameBoost: persistRun.nextGameRosterBoost ?? 0,
     });
     set({
       phase: "selecting",
@@ -2529,52 +3469,114 @@ export const useGameStore = create<GameState>((set, get) => ({
       // SZN series uses 3-inning games.
       totalInnings: 3,
       run: {
-        ...s.run,
-        series: { ...s.run.series, gameInProgress: true },
+        ...persistRun,
+        series: { ...persistRun.series!, gameInProgress: true },
+        // The "Last series: 2-1" FO chip is scoped to the gap between
+        // series. Clearing it on series start keeps the HUD honest --
+        // the chip should never co-exist with an in-progress series.
+        lastSeriesScoreline: null,
       },
-      sznDugoutOpen: false,
     });
   },
 
-  reportSeriesGameResult: (userWonGame) => {
+  reportSeriesGameResult: (result, userScore, ghostScore) => {
     const s = get();
     if (!s.run || !s.run.series) return;
+    // Safety guard: only the game-over reducer should advance a series.
+    // Without this, devtools / future callers could double-advance the
+    // series mid-game (e.g. game-2 onClick firing while game-1 is still
+    // wrapping up its reveal).
+    if (s.phase !== "game-over") return;
+    if (!s.run.series.gameInProgress) return;
     const ser = s.run.series;
-    const userGameWins = ser.userGameWins + (userWonGame ? 1 : 0);
-    const ghostGameWins = ser.ghostGameWins + (userWonGame ? 0 : 1);
-    const seriesOver = userGameWins >= 2 || ghostGameWins >= 2 || ser.gameIndex >= 2;
-    if (!seriesOver) {
-      set({
-        run: {
-          ...s.run,
-          series: {
-            gameIndex: ser.gameIndex + 1,
-            userGameWins,
-            ghostGameWins,
-            gameInProgress: false,
-          },
-        },
-      });
-      return;
+    const userGameWins = ser.userGameWins + (result === "user" ? 1 : 0);
+    const ghostGameWins = ser.ghostGameWins + (result === "ghost" ? 1 : 0);
+    const userRunsTotal = (ser.userRunsTotal ?? 0) + Math.max(0, userScore);
+    const ghostRunsTotal = (ser.ghostRunsTotal ?? 0) + Math.max(0, ghostScore);
+    // The weekend is now a single Game of the Week (not a best-of-3),
+    // so any completed game ends the "series" and rolls the week.
+    // The legacy "advance to game 2 / game 3" branch was removed —
+    // there is no next game inside the same weekend.
+    // Series over: decide the winner. Game-wins are the primary axis;
+    // when wins are equal (a series like W/D/L for both sides) the
+    // tiebreaker is aggregate run differential.
+    let userWonSeries: boolean;
+    if (userGameWins !== ghostGameWins) {
+      userWonSeries = userGameWins > ghostGameWins;
+    } else {
+      // Tiebreaker: aggregate runs across the series. If runs are also
+      // equal, the user takes the series (mirrors the legacy "ties go
+      // to the home/user side" convention so the run never gets stuck).
+      userWonSeries = userRunsTotal >= ghostRunsTotal;
     }
-    // Series over: increment W/L tally and either end the run or start a new week.
-    const userWonSeries = userGameWins > ghostGameWins;
     const wins = s.run.wins + (userWonSeries ? 1 : 0);
     const losses = s.run.losses + (userWonSeries ? 0 : 1);
     let endState: RunState["endState"] = null;
     if (wins >= RUN_WIN_TARGET) endState = "champion";
     else if (losses >= RUN_LOSS_LIMIT) endState = "fired";
+
+    // ------------------------------------------------------------------
+    // Capture the end-of-series snapshot BEFORE we mutate buff timers /
+    // cash so the SeriesResultScreen can render "Rally Fire 2w → 1w"
+    // without re-deriving from post-rollover state. Shared by both the
+    // end-run path and the normal week-rollover path below.
+    // ------------------------------------------------------------------
+    const cashBefore = s.run.cash;
+    const triggerBonus = s.run.nextWeekCashBonus;
+    const cashAfterIfRollover = cashBefore + WEEKLY_CASH + triggerBonus;
+    const summary: SeriesSummary = {
+      userWonSeries,
+      userGameWins,
+      ghostGameWins,
+      userRunsTotal,
+      ghostRunsTotal,
+      weekJustPlayed: s.run.week,
+      newWins: wins,
+      newLosses: losses,
+      endState,
+      cashBefore,
+      cashAfter: endState ? cashBefore : cashAfterIfRollover,
+      weeklyRefill: endState ? 0 : WEEKLY_CASH,
+      triggerBonus: endState ? 0 : triggerBonus,
+      ghostLabel: s.run.ghost?.label ?? null,
+      bangingSchemeBefore: s.run.bangingSchemeWeeksLeft,
+      bangingSchemeAfter: endState ? s.run.bangingSchemeWeeksLeft : Math.max(0, s.run.bangingSchemeWeeksLeft - 1),
+      rallyFireBefore: s.run.rallyFireWeeksLeft,
+      rallyFireAfter: endState ? s.run.rallyFireWeeksLeft : Math.max(0, s.run.rallyFireWeeksLeft - 1),
+      nextGameBoostExpired: s.run.nextGameRosterBoost > 0,
+      scoutingIntelExpired: s.run.mlbScoutingIntel !== null,
+      suspensionsExpired: s.run.suspendedPlayerIds.length,
+      karmaActive: s.run.karmaDoubleTriggers,
+      defenseShieldsActive: s.run.defenseShields,
+    };
+    const scoreline: SeriesScoreline = {
+      userWon: userWonSeries,
+      userGameWins,
+      ghostGameWins,
+      weekJustPlayed: s.run.week,
+    };
+
     if (endState) {
       set({
+        // Phase reset so the SeriesResultScreen and EndRunScreen aren't
+        // racing the lingering `game-over` mode (the lock-in overlay
+        // would otherwise re-render on top of either screen).
+        phase: "selecting",
+        // Series day is meaningless post-run; flip back to Monday so
+        // any "is it a Front Office day" check renders clean (also
+        // matches the rollover path's `day: "mon"`).
         run: {
           ...s.run,
           wins,
           losses,
           endState,
+          day: "mon",
           series: null,
           ghost: null,
-          weekendScouting: null,
+          weeklyScout: null,
           weekScoutingAcknowledged: false,
+          lastSeriesSummary: summary,
+          lastSeriesScoreline: scoreline,
         },
       });
       return;
@@ -2583,11 +3585,27 @@ export const useGameStore = create<GameState>((set, get) => ({
     // the new week's pricing tier so the user feels the curve every
     // Monday morning.
     const nextWeek = Math.min(12, s.run.week + 1);
-    const nextEncounters = FRONT_OFFICE_DAYS.map((day) => ({
-      day,
-      offers: rollDailyOffers(s.run!.roster, nextWeek),
-      picksUsed: 0,
-    }));
+    const pickBudgets = rollWeekPickBudgets();
+    // Fresh dedupe window: every Monday the encounter table reopens in
+    // full. Cumulative seenSet across Mon→Thu enforces the
+    // "no encounter twice in a week" rule on the initial roll exactly
+    // the same way startSznRun + commitEncounter do.
+    const nextSeenThisWeek = new Set<string>();
+    const nextEncounters = FRONT_OFFICE_DAYS.map((day, i) => {
+      const offers = rollDailyOffers(
+        s.run!.roster,
+        nextWeek,
+        pickBudgets[i],
+        nextSeenThisWeek,
+      );
+      for (const o of offers) nextSeenThisWeek.add(encounterOfferId(o));
+      return {
+        day,
+        offers,
+        picksUsed: 0,
+        pickBudget: pickBudgets[i],
+      };
+    });
     const interimForGhost: RunState = {
       ...s.run,
       wins,
@@ -2595,22 +3613,56 @@ export const useGameStore = create<GameState>((set, get) => ({
       week: nextWeek,
       day: "mon",
       series: null,
+      weekEncounters: nextEncounters,
+      seenEncountersThisWeek: Array.from(nextSeenThisWeek),
     };
     const nextGhost = buildGhostSnapshot(interimForGhost);
-    const nextScouting = weekendScoutingFromGhost(nextGhost);
+    // Scouting report is rolled from the run snapshot AFTER the new
+    // week's encounters are seeded above (see the override on
+    // `weekEncounters` in `interimForGhost`) so the ability + player
+    // hint generators can foreshadow actual upcoming offers.
+    const nextScouting = rollWeeklyScout(interimForGhost);
     set({
+      // Phase reset matches the end-run branch above -- the lock-in
+      // overlay sticks around in `game-over` mode and would otherwise
+      // paint over the SeriesResultScreen / Monday FO.
+      phase: "selecting",
       run: {
         ...s.run,
         wins,
         losses,
         week: nextWeek,
         day: "mon",
-        cash: s.run.cash + WEEKLY_CASH,
+        // Drain queued badge-trigger cash (Bronx Bombers etc.) into the
+        // weekly cash refill. Cleared so it can re-accumulate next week.
+        cash: cashAfterIfRollover,
+        nextWeekCashBonus: 0,
         weekEncounters: nextEncounters,
+        // Reset the cumulative encounter dedupe set the moment the new
+        // week's encounters are stamped on -- each week reopens the
+        // full encounter table, then `commitEncounter` re-rolls
+        // accrete back into this list across Mon→Thu.
+        seenEncountersThisWeek: Array.from(nextSeenThisWeek),
         series: null,
         ghost: nextGhost,
-        weekendScouting: nextScouting,
+        weeklyScout: nextScouting,
         weekScoutingAcknowledged: false,
+        // Encounter timers decrement at series rollover. Hold-the-line
+        // / Rally Fire / Banging Scheme are all bought to last "the
+        // next N games"; the rollover is the natural tick.
+        bangingSchemeWeeksLeft: Math.max(0, s.run.bangingSchemeWeeksLeft - 1),
+        rallyFireWeeksLeft: Math.max(0, s.run.rallyFireWeeksLeft - 1),
+        // One-game flat boost and ad-hoc scouting intel are scoped to
+        // the just-finished series; drain both so the next week starts
+        // clean.
+        nextGameRosterBoost: 0,
+        mlbScoutingIntel: null,
+        // Suspensions expire after the next series. Sentinel ids
+        // ("suspend:Batting" / "suspend:Pitching") never resolved into
+        // a real player are cleared too.
+        suspendedPlayerIds: [],
+        lastSeriesSummary: summary,
+        lastSeriesScoreline: scoreline,
       },
       // Reset gameplay surface so the empty-field Front Office screen
       // doesn't show stale runners / scores from the just-finished series.
@@ -2640,36 +3692,25 @@ export const useGameStore = create<GameState>((set, get) => ({
     });
   },
 
+  dismissSeriesSummary: () => {
+    const s = get();
+    if (!s.run || !s.run.lastSeriesSummary) return;
+    set({
+      run: { ...s.run, lastSeriesSummary: null },
+    });
+  },
+
   exitSznToMenu: () => {
-    set({ run: null, gameMode: null, showStartScreen: true, sznDugoutOpen: false });
-  },
-
-  upgradeWithDuplicate: (playerId, duplicateTier) => {
-    const s = get();
-    if (!s.run) return false;
-    const idx = indexOfRosterPlayer(s.run.roster, playerId);
-    if (idx < 0) return false;
-    const target = s.run.roster[idx];
-    if (target.tier !== duplicateTier) return false;
-    const up = nextRunTier(duplicateTier);
-    if (!up) return false;
-    const roster = [...s.run.roster];
-    roster[idx] = { ...target, tier: up };
-    set({ run: { ...s.run, roster } });
-    return true;
-  },
-
-  replaceWithHigherTier: (playerId, newTier) => {
-    const s = get();
-    if (!s.run) return false;
-    const idx = indexOfRosterPlayer(s.run.roster, playerId);
-    if (idx < 0) return false;
-    const target = s.run.roster[idx];
-    if (nextRunTier(target.tier) !== newTier) return false;
-    const roster = [...s.run.roster];
-    roster[idx] = { ...target, tier: newTier };
-    set({ run: { ...s.run, roster } });
-    return true;
+    // Wipe combat surface AND lane identity so the next lane the user
+    // picks starts from a clean slate (no leftover SZN totalInnings: 3,
+    // no stale footer height, no half-finished at-bat carried into
+    // QuickMatch via the StartGameScreen).
+    set({
+      ...resetEphemeralGameplay(),
+      run: null,
+      gameMode: null,
+      showStartScreen: true,
+    });
   },
 
   sellPlayerForCash: (playerId) => {
@@ -2683,9 +3724,9 @@ export const useGameStore = create<GameState>((set, get) => ({
     const role = target.player.role;
     const sameRoleCount = s.run.roster.filter((r) => r.player.role === role).length;
     if (sameRoleCount <= 1) return 0;
-    // Sell value scales with tier (bronze 3 / silver 6 / gold 10 / diamond 15).
-    const tierValue: Record<Tier, number> = { bronze: 3, silver: 6, gold: 10, diamond: 15 };
-    const refund = tierValue[target.tier];
+    // Sell value scales with rarity (common 3 / allstar 6 / veteran 10 / legend 15).
+    const rarityValue: Record<Rarity, number> = { common: 3, allstar: 6, veteran: 10, legend: 15 };
+    const refund = rarityValue[target.rarity];
     const roster = s.run.roster.filter((_, i) => i !== idx);
     set({
       run: { ...s.run, roster, cash: s.run.cash + refund },
@@ -2695,27 +3736,61 @@ export const useGameStore = create<GameState>((set, get) => ({
 
   sznDealItem: (instanceId) => {
     const s = get();
-    if (s.gameMode !== "szn" || !s.run) return;
-    if (s.phase !== "selecting") return;
-    const item = s.run.itemBag.find((i) => i.instanceId === instanceId);
+    // Hand mutations only fire in actual weekend combat (not pack rip /
+    // Front Office / series intro). `phase === 'selecting'` alone is too
+    // loose because `startSznRun` parks the placeholder at-bat in
+    // `selecting` from pack-rip onwards.
+    if (!isInSznCombat(s)) return;
+    const item = s.run!.itemBag.find((i) => i.instanceId === instanceId);
     if (!item) return;
     const card = SESSION_CARDS.find((c) => c.id === item.cardId);
     if (!card) return;
     const userSide = getUserSide(s);
-    const handKey = userSide === "Batting" ? "batterHand" : "pitcherHand";
     const hand = userSide === "Batting" ? s.batterHand : s.pitcherHand;
     // Prevent the same card from being added twice. The chain engine
     // keys cards by id, so duplicates would step on each other's modifiers.
     if (hand.some((c) => c.id === card.id)) return;
-    // Hand cap mirrors the legacy 5-card max so the chain math stays sane.
+    // Hand cap = 6 cards including the player anchor; matches the legacy
+    // 5-item cap once you account for the `player:` slot the SZN seat
+    // always occupies.
     if (hand.length >= 6) return;
-    set({ [handKey]: [...hand, card] } as Pick<GameState, "batterHand" | "pitcherHand">);
+    // Stamp the dealt instanceId onto the card so the bag filter in
+    // SznFooterDecks can distinguish duplicate copies (without this, both
+    // bag rows hide when one copy is dealt — second copy is unusable).
+    const dealt: CardDefinition = { ...card, sznInstanceId: instanceId };
+    const nextHand = [...hand, dealt];
+    const handKey = userSide === "Batting" ? "batterHand" : "pitcherHand";
+
+    // Auto-snap on deal. SZN's whole at-bat loop is "click an ability ->
+    // it joins your chain", so dealing a card has to fire the same snap
+    // affirmation that Quick Play gets from drag-end. Without this, the
+    // dealt card lands cold at the end of the hand: scoring's buildGroups
+    // sees an unaffirmed seam, drops the card into its own group, and the
+    // chain readout silently ignores the +baseValue the user just paid /
+    // dealt for. We only affirm seams the engine ACTUALLY allows
+    // (canConnectAny); incompatible edges fall through to the legacy
+    // "drag to override" path so the player can still rearrange manually.
+    //
+    // The card is always appended, so the only fresh seam to consider is
+    // the one between the previous last card and the newly-dealt card.
+    const nextAffirmed = new Set(s.affirmedSeams);
+    if (nextHand.length >= 2) {
+      const left = nextHand[nextHand.length - 2];
+      if (canConnectAny(left, dealt)) {
+        nextAffirmed.add(seamKey(left.id, dealt.id));
+      }
+    }
+
+    set({ [handKey]: nextHand } as Pick<GameState, "batterHand" | "pitcherHand">);
+    set({ affirmedSeams: nextAffirmed });
+    // Re-derive choice / reveal / impact state so cards added mid-at-bat
+    // actually fire (b-65 guess, b-12, p-56, b-7, b-121, p-51, p-59).
+    set(reconcileSznHandState(get(), { card: dealt, side: userSide }));
   },
 
   sznRecallItem: (cardId) => {
     const s = get();
-    if (s.gameMode !== "szn" || !s.run) return;
-    if (s.phase !== "selecting") return;
+    if (!isInSznCombat(s)) return;
     // Don't let the user remove their own player card -- that would empty
     // the hand seat and break the at-bat seed.
     if (cardId.startsWith("player:")) return;
@@ -2724,10 +3799,184 @@ export const useGameStore = create<GameState>((set, get) => ({
     const hand = userSide === "Batting" ? s.batterHand : s.pitcherHand;
     const next = hand.filter((c) => c.id !== cardId);
     if (next.length === hand.length) return;
+    // Drop any affirmed seam that referenced the recalled card. Mirrors
+    // the affirmDraggedCard convention: a seam survives only if BOTH
+    // endpoints are still adjacent AND still mechanically connectable.
+    // We deliberately do NOT auto-affirm the newly-adjacent pair that
+    // sits where the recalled card used to be — fresh adjacency is a
+    // fresh decision the user has to make (drag or re-deal to confirm).
+    const nextAffirmed = new Set<string>();
+    for (let i = 1; i < next.length; i++) {
+      const a = next[i - 1];
+      const b = next[i];
+      const key = seamKey(a.id, b.id);
+      if (s.affirmedSeams.has(key) && canConnectAny(a, b)) {
+        nextAffirmed.add(key);
+      }
+    }
     set({ [handKey]: next } as Pick<GameState, "batterHand" | "pitcherHand">);
+    set({ affirmedSeams: nextAffirmed });
+    // Recalled cards leave any open modal stranded; reconcile clears it.
+    // We don't try to undo the recalled card's hand transforms — undoing
+    // arbitrary transforms is intractable, and the player accepted that
+    // when they recalled. The dropped derived choices / reveals reflect
+    // the current hand.
+    set(reconcileSznHandState(get()));
   },
 
-  setSznDugoutOpen: (open) => set({ sznDugoutOpen: open }),
+  sznSwapPlayer: (playerId) => {
+    const s = get();
+    if (!isInSznCombat(s)) return false;
+    const userSide = getUserSide(s);
+    // Roster lookup: must be on the user's run roster AND match the
+    // user's current seat (Batter for Batting, Pitcher for Pitching).
+    const slot = s.run!.roster.find((r) => r.player.id === playerId);
+    if (!slot) return false;
+    const desiredRole = userSide === "Batting" ? "Batter" : "Pitcher";
+    if (slot.player.role !== desiredRole) return false;
+    // No-op when the user picks the player already at the plate/mound.
+    const current = userSide === "Batting" ? s.batter : s.pitcher;
+    if (current && current.id === playerId) return false;
+
+    const rarityBase =
+      RARITY_BASE_VALUE[slot.rarity] +
+      (slot.permanentBoost ?? 0) +
+      (slot.scoreOverride ?? 0);
+    const anchor = {
+      ...playerAsCard(slot.player, {
+        leftEdgeOverride: slot.leftEdgeOverride,
+        rightEdgeOverride: slot.rightEdgeOverride,
+      }),
+      baseValue: rarityBase,
+    };
+    const compatPlayer = asMlbPlayerCompat(slot.player);
+    // Auto-snap the new anchor to the leftmost surviving item, plus carry
+    // forward any item-to-item seams the previous anchor wasn't part of.
+    // This mirrors the deal-time snap so a player swap doesn't silently
+    // strip the chain the user already built — the new anchor falls into
+    // the same slot, and if its edge matches the first item, the seam
+    // affirms automatically (the user can drag it apart afterward).
+    const buildSwappedAffirmed = (
+      prevHand: CardDefinition[],
+      newHand: CardDefinition[],
+    ): Set<string> => {
+      const next = new Set<string>();
+      // 1. Preserve item-to-item seams that survive in the new layout.
+      for (let i = 1; i < prevHand.length; i++) {
+        const a = prevHand[i - 1];
+        const b = prevHand[i];
+        if (a.id.startsWith("player:") || b.id.startsWith("player:")) continue;
+        const key = seamKey(a.id, b.id);
+        if (s.affirmedSeams.has(key) && canConnectAny(a, b)) {
+          next.add(key);
+        }
+      }
+      // 2. Auto-affirm the new anchor's seam with items[0] when valid.
+      if (newHand.length >= 2) {
+        const left = newHand[0];
+        const right = newHand[1];
+        if (canConnectAny(left, right)) {
+          next.add(seamKey(left.id, right.id));
+        }
+      }
+      return next;
+    };
+    if (userSide === "Batting") {
+      // Preserve dealt items: keep everything in the hand that isn't the
+      // outgoing `player:` anchor card.
+      const items = s.batterHand.filter((c) => !c.id.startsWith("player:"));
+      const nextHand = [anchor, ...items];
+      set({
+        batter: compatPlayer,
+        batterHand: nextHand,
+        affirmedSeams: buildSwappedAffirmed(s.batterHand, nextHand),
+      });
+    } else {
+      const items = s.pitcherHand.filter((c) => !c.id.startsWith("player:"));
+      const nextHand = [anchor, ...items];
+      set({
+        pitcher: compatPlayer,
+        pitcherHand: nextHand,
+        affirmedSeams: buildSwappedAffirmed(s.pitcherHand, nextHand),
+      });
+    }
+    // Swapped-in player cards have no HAND_TRANSFORMS but their presence
+    // can re-derive pendingChoices/reveals against the items still in
+    // the hand.
+    set(reconcileSznHandState(get()));
+    return true;
+  },
+
+  releaseRosterPlayer: (playerId) => {
+    const s = get();
+    if (!s.run) return false;
+    const idx = indexOfRosterPlayer(s.run.roster, playerId);
+    if (idx < 0) return false;
+    // Never drop below 1-of-role so the next series can always seed
+    // both a batter at the plate and a pitcher on the mound.
+    const role = s.run.roster[idx].player.role;
+    const sameRoleCount = s.run.roster.filter((r) => r.player.role === role).length;
+    if (sameRoleCount <= 1) return false;
+    const roster = s.run.roster.filter((_, i) => i !== idx);
+    set({ run: { ...s.run, roster } });
+    return true;
+  },
+
+  sznSwapRoster: (idA, idB) => {
+    const s = get();
+    if (!s.run) return false;
+    // FO gating: the combat code reads role / suspension filters
+    // off this same array, so reshuffling mid at-bat would race the
+    // pool builder and could re-order an already-dealt anchor card.
+    if (!isInSznFrontOffice(s)) return false;
+    if (idA === idB) return false;
+    const roster = s.run.roster;
+    const ia = roster.findIndex((rp) => rp.player.id === idA);
+    const ib = roster.findIndex((rp) => rp.player.id === idB);
+    if (ia < 0 || ib < 0) return false;
+    const next = roster.slice();
+    [next[ia], next[ib]] = [next[ib], next[ia]];
+    set({ run: { ...s.run, roster: next } });
+    return true;
+  },
+
+  sznSwapItemBag: (idA, idB) => {
+    const s = get();
+    if (!s.run) return false;
+    if (!isInSznFrontOffice(s)) return false;
+    if (idA === idB) return false;
+    const bag = s.run.itemBag;
+    const ia = bag.findIndex((it) => it.instanceId === idA);
+    const ib = bag.findIndex((it) => it.instanceId === idB);
+    if (ia < 0 || ib < 0) return false;
+    const next = bag.slice();
+    [next[ia], next[ib]] = [next[ib], next[ia]];
+    set({ run: { ...s.run, itemBag: next } });
+    return true;
+  },
+
+  setSznFooterHeight: (h) => {
+    // Round to the nearest pixel and short-circuit no-op writes so
+    // ResizeObserver microbursts don't trigger pointless re-renders on
+    // every CardGameOverlay subscriber.
+    const next = Math.max(0, Math.round(h));
+    if (get().sznFooterHeight === next) return;
+    set({ sznFooterHeight: next });
+  },
+
+  setSznGamepadFocus: (focus) => {
+    // No-op writes are extremely common here (every DPAD_LEFT/RIGHT
+    // press calls into the router which then re-applies the same
+    // 'footer' value), so guard the set call to avoid waking every
+    // subscriber on no-change.
+    if (get().sznGamepadFocus === focus) return;
+    set({ sznGamepadFocus: focus });
+  },
+
+  setQuickResolveEnabled: (enabled) => {
+    if (get().quickResolveEnabled === enabled) return;
+    set({ quickResolveEnabled: enabled });
+  },
 
   buyPlayerFromMarket: (slotIndex, listingIndex) => {
     const s = get();
@@ -2741,12 +3990,23 @@ export const useGameStore = create<GameState>((set, get) => ({
     const listing = offer.listings[listingIndex];
     if (!listing) return false;
     if (s.run.cash < listing.price) return false;
+    // Hard cap at the starter-pack roster size (9 + 1). The UI surfaces
+    // a "ROSTER FULL — sell to sign" badge when this gate triggers.
+    if (s.run.roster.length >= STARTER_PACK_TOTAL) return false;
     // Refuse duplicate id (the user already owns this player; they should
-    // use Scouting Director to upgrade tiers instead).
+    // use Scouting Director to upgrade rarities instead).
     if (s.run.roster.some((r) => r.player.id === listing.playerId)) return false;
-    const player = PLAYERS.find((p) => p.id === listing.playerId);
+    // SZN players are the primary signing catalog (the market rolls
+    // from `ALL_SZN_PLAYERS` -- see `freeAgencyOffer` in items.ts);
+    // legacy `MlbPlayer` is the safety fallback for degenerate save
+    // states. Either path produces a valid `RosterPlayer` -- the
+    // discriminated union lets combat treat both shapes identically
+    // via `isSznPlayer` at every snap site.
+    const player =
+      getSznPlayer(listing.playerId) ??
+      PLAYERS.find((p) => p.id === listing.playerId);
     if (!player) return false;
-    const newSlot: RosterPlayer = { player, tier: listing.tier, tag: player.tag };
+    const newSlot: RosterPlayer = { player, rarity: listing.rarity, tag: player.tag };
     set({
       run: {
         ...s.run,
@@ -2869,6 +4129,14 @@ function scoreHandFor(
       isBatting && s.questPendingBattingHitScale > 0
         ? s.questPendingBattingHitScale
         : undefined,
+    // SZN Encounter #7 Rally Fire: scoreGroup auras +10% on neighbors
+    // of `team-logo` cards while the run flag is hot. Only fires for
+    // the user's own seat -- the ghost doesn't carry SZN encounter
+    // state, so flagging it would falsely boost the opponent.
+    sznRallyFireActive:
+      s.gameMode === "szn" &&
+      side === getUserSide(s) &&
+      (s.run?.rallyFireWeeksLeft ?? 0) > 0,
   };
   return scoreHand(hand, ctx);
 }
@@ -3270,18 +4538,305 @@ function applySweepingSliderMutation(s: GameState): CardDefinition[] {
 }
 
 /**
- * SZN Mode: team tag-synergy bonuses (roster construction) stacked on the
- * matchup total. Tier base value for the player-at-the-plate lives on the
- * player-as-card `baseValue` (seeded in `freshAtBat`) so chain math, pills,
- * and per-card readouts stay aligned.
+ * SZN Mode: team tag-synergy bonuses (adjacent identical tags on the roster,
+ * see `synergies.ts`) stacked on the matchup total. Tier base value for the
+ * player-at-the-plate lives on the player-as-card `baseValue` (seeded in
+ * `freshAtBat`) so chain math, pills, and per-card readouts stay aligned.
+ *
+ * Reads from whichever roster owns the seat: the user's `run.roster` when
+ * the user is in that seat this half, the `run.ghost.roster` when the
+ * ghost is. Without the ghost branch, ghost-side roster synergies never
+ * applied — the audit flagged that as "asymmetric power level".
  */
 function sznSideBonus(s: GameState, side: "Batting" | "Pitching"): number {
   if (s.gameMode !== "szn" || !s.run) return 0;
   const userSide = getUserSide(s);
-  if (userSide !== side) return 0;
+  const roster =
+    userSide === side
+      ? s.run.roster
+      : s.run.ghost?.roster ?? null;
+  if (!roster) return 0;
   return side === "Batting"
-    ? teamBatterBonus(s.run.roster)
-    : teamPitcherBonus(s.run.roster);
+    ? teamBatterBonus(roster)
+    : teamPitcherBonus(roster);
+}
+
+/**
+ * SZN passive-badge score bonuses applied per-side off the snap events
+ * that happened inside this hand's best chain. Today this is just the
+ * Yankees Bronx Bombers +10 per Power snap, but the dispatcher reads
+ * every active badge from `run.badges` so future team passives can
+ * tagline against any `SznEdgeId` without further wiring.
+ *
+ * Only the user's own badges fire (the ghost is a procedurally-rolled
+ * opponent; not modeled as carrying badges).
+ */
+function sznBadgeScoreBonus(
+  s: GameState,
+  side: "Batting" | "Pitching",
+  result: ScoringResult,
+): number {
+  if (s.gameMode !== "szn" || !s.run) return 0;
+  const userSide = getUserSide(s);
+  // Only the user's badges fire; ghost rolls don't carry passive badges.
+  if (userSide !== side) return 0;
+  const events = result.sznSnapEvents ?? [];
+  if (events.length === 0) return 0;
+  // Encounter #10 Karma: doubles every passive-badge score deposit on
+  // qualifying snaps. Reads the live run flag so the multiplier reacts
+  // immediately the at-bat after Karma is purchased.
+  const karmaMul = s.run.karmaDoubleTriggers ? 2 : 1;
+  let bonus = 0;
+  for (const badgeId of s.run.badges) {
+    const def = BADGES[badgeId];
+    if (!def || !isSnapTrigger(def.trigger)) continue;
+    for (const ev of events) {
+      if (ev.wildcard) continue; // wildcard snaps don't count as the named edge
+      if (ev.edge !== def.trigger.edge) continue;
+      bonus += def.trigger.scoreBonus * karmaMul;
+    }
+  }
+  return bonus;
+}
+
+/**
+ * The Battery bridge bonus: when a Catcher with a Battery right-edge ends
+ * the batter chain AND the pitcher's anchor card carries a Battery left-edge,
+ * the pitcher side gets a flat +15. Reads the pitcher anchor straight off
+ * `s.pitcherHand[0]` (which is always the `player:` adapter) so this works
+ * even when the pitcher hand has no items dealt yet.
+ */
+const BATTERY_BRIDGE_BONUS = 15;
+function sznBatteryBridgeBonus(
+  s: GameState,
+  side: "Batting" | "Pitching",
+  batterResult: ScoringResult,
+): number {
+  if (side !== "Pitching") return 0;
+  if (s.gameMode !== "szn") return 0;
+  // Last card of the batter's bestGroup must expose a Battery right-edge.
+  const last = batterResult.bestGroup[batterResult.bestGroup.length - 1];
+  if (!last) return 0;
+  if (last.sznRightEdge !== "battery") return 0;
+  // Pitcher's anchor must carry a Battery left-edge.
+  const anchor = s.pitcherHand[0];
+  if (!anchor) return 0;
+  if (anchor.sznLeftEdge !== "battery") return 0;
+  return BATTERY_BRIDGE_BONUS;
+}
+
+/**
+ * Movement debuff carryover: -3 per stack on the next batter's effective
+ * score, capped at -9 (3 stacks). Stacks are stamped into
+ * `s.pendingDebuffs` from `applySznLockInEffects` so the standard
+ * `sumPendingDebuffs("Batting")` pipeline picks them up next at-bat;
+ * this function only mirrors the cap.
+ */
+const MOVEMENT_DEBUFF_PER_STACK = -3;
+const MOVEMENT_DEBUFF_CAP = MOVEMENT_DEBUFF_PER_STACK * 3;
+
+/** Permanent base-score boost granted when a Rookie snaps a Veteran's left edge. */
+const VETERAN_PERMANENT_BOOST = 5;
+/** RNG threshold for Deception to shatter the opposing chain. */
+const DECEPTION_SHATTER_CHANCE = 0.25;
+
+/**
+ * SZN lock-in side effects: walk both sides' snap events and mutate run
+ * state accordingly. Returns the run-state patch (caller is responsible
+ * for splicing it into `set`) plus any extra pendingDebuffs to enqueue.
+ *
+ *  - Bronx Bombers (Power snap on batter side) → +$1 queued into
+ *    `run.nextWeekCashBonus` per snap (the +10 score is already applied
+ *    in `computeMatchup` via `sznBadgeScoreBonus`).
+ *  - Veteran specialty edge (rookie→veteran-tag snap) → stamp a +5
+ *    permanent boost onto the veteran's `RosterPlayer.permanentBoost`,
+ *    one-time per (rookie, veteran) pair (tracked via
+ *    `run.veteranBoostedBy`).
+ *  - Movement defensive edge (any snap that lands on `movement`) →
+ *    queue a -3 stacking debuff on the next opposing batter, capped at
+ *    -9 total.
+ */
+function applySznLockInSideEffects(
+  s: GameState,
+  batterResult: ScoringResult,
+  pitcherResult: ScoringResult,
+): { runPatch: Partial<RunState> | null; extraDebuffs: PendingDebuff[] } {
+  if (s.gameMode !== "szn" || !s.run) {
+    return { runPatch: null, extraDebuffs: [] };
+  }
+  const userSide = getUserSide(s);
+  const userBattersResult = userSide === "Batting" ? batterResult : null;
+  const userPitchersResult = userSide === "Pitching" ? pitcherResult : null;
+
+  let nextWeekCashBonus = s.run.nextWeekCashBonus;
+  let roster = s.run.roster;
+  let veteranBoostedBy = s.run.veteranBoostedBy;
+  let defenseShields = s.run.defenseShields;
+  const extraDebuffs: PendingDebuff[] = [];
+
+  // Encounter #10 Karma: doubles per-snap badge cash deposits AND any
+  // direct cash-bonus deltas (handled below in the badge loop). The
+  // 2x reads from the live run state because we haven't mutated
+  // `karmaDoubleTriggers` in this fn -- the encounter dispatcher owns
+  // the toggle.
+  const karmaMul = s.run.karmaDoubleTriggers ? 2 : 1;
+
+  // Encounter #9 Defense Shield: decrement one charge when the user
+  // is on the batting seat AND the matchup actually consumed one
+  // (mirrors `computeMatchup` so the chip pulse is in sync with the
+  // score nullification). Shields only consume per-at-bat -- if both
+  // halves of the chain produce pitching scores, only one shield
+  // burns.
+  const userIsBatting = userSide === "Batting";
+  if (userIsBatting && defenseShields > 0) {
+    defenseShields = Math.max(0, defenseShields - 1);
+  }
+
+  // -- Bronx Bombers + future onSznSnap badges (cash queue side effect) --
+  // Score bonus already applied in computeMatchup; here we only queue the
+  // per-snap cash bonus the badge declares.
+  if (userBattersResult) {
+    const events = userBattersResult.sznSnapEvents ?? [];
+    for (const badgeId of s.run.badges) {
+      const def = BADGES[badgeId];
+      if (!def || !isSnapTrigger(def.trigger)) continue;
+      if (def.trigger.nextWeekCashBonus === 0) continue;
+      for (const ev of events) {
+        if (ev.wildcard) continue;
+        if (ev.edge !== def.trigger.edge) continue;
+        nextWeekCashBonus += def.trigger.nextWeekCashBonus * karmaMul;
+      }
+    }
+  }
+
+  // -- Veteran specialty: rookie → veteran-tag permanent boost --
+  if (userBattersResult) {
+    const events = userBattersResult.sznSnapEvents ?? [];
+    const updatedRoster = [...roster];
+    let dirty = false;
+    let veteranBoostedDirty = false;
+    const updatedVeteranBoostedBy = [...veteranBoostedBy];
+    for (const ev of events) {
+      if (ev.wildcard) continue;
+      if (ev.edge !== "rookie" && ev.edge !== "veteran-tag") continue;
+      // Identify the actual edges (rookie-right snapping into veteran-tag-left).
+      // bestGroup is ordered left→right; ev.leftCardId is the rookie.
+      const left = userBattersResult.bestGroup.find((c) => c.id === ev.leftCardId);
+      const right = userBattersResult.bestGroup.find((c) => c.id === ev.rightCardId);
+      if (!left || !right) continue;
+      if (left.sznRightEdge !== "rookie") continue;
+      if (right.sznLeftEdge !== "veteran-tag") continue;
+      // Player ids carry the `player:` prefix on the anchor card; bag items
+      // never carry SZN edges so this filter is implicitly satisfied.
+      const rookiePlayerId = left.id.replace(/^player:/, "");
+      const veteranPlayerId = right.id.replace(/^player:/, "");
+      const pairKey = `${rookiePlayerId}->${veteranPlayerId}`;
+      if (updatedVeteranBoostedBy.includes(pairKey)) continue;
+      const idx = updatedRoster.findIndex((r) => r.player.id === veteranPlayerId);
+      if (idx < 0) continue;
+      const target = updatedRoster[idx];
+      updatedRoster[idx] = {
+        ...target,
+        permanentBoost: (target.permanentBoost ?? 0) + VETERAN_PERMANENT_BOOST,
+      };
+      updatedVeteranBoostedBy.push(pairKey);
+      dirty = true;
+      veteranBoostedDirty = true;
+    }
+    if (dirty) roster = updatedRoster;
+    if (veteranBoostedDirty) veteranBoostedBy = updatedVeteranBoostedBy;
+  }
+
+  // -- Movement defensive edge debuff carryover --
+  // Counts Movement snaps from EITHER side: the user's pitcher firing
+  // them at the ghost batter, or the ghost pitcher firing them at the
+  // user's next batter. Stacks cap at 3 (-9 total). We post-clamp by
+  // checking how many movement stacks already sit in pendingDebuffs.
+  const movementEventsUserSide = userPitchersResult?.sznSnapEvents ?? [];
+  const ghostPitcherResult = userSide === "Batting" ? pitcherResult : null;
+  const ghostPitcherEvents = ghostPitcherResult?.sznSnapEvents ?? [];
+  const collect = (events: typeof movementEventsUserSide, debuffSide: "Batting" | "Pitching") => {
+    const newStacks = events.filter((ev) => !ev.wildcard && ev.edge === "movement").length;
+    if (newStacks === 0) return;
+    // Count existing movement stacks already pending so the cap is enforced.
+    const existing = s.pendingDebuffs.filter(
+      (d) => d.appliesToSide === debuffSide && d.source === "szn-movement",
+    ).length;
+    const remainingCapacity = Math.max(0, 3 - existing);
+    const toAdd = Math.min(newStacks, remainingCapacity);
+    for (let i = 0; i < toAdd; i++) {
+      extraDebuffs.push({
+        appliesToSide: debuffSide,
+        totalValueDelta: MOVEMENT_DEBUFF_PER_STACK,
+        remainingAtBats: 2,
+        source: "szn-movement",
+      });
+    }
+  };
+  // User pitcher's Movement snaps debuff the ghost (Batting) on their
+  // next at-bat. Conceptually that's the same `Batting` side carry-over
+  // — `pendingDebuffs` is keyed by which side the debuff hurts.
+  collect(movementEventsUserSide, "Batting");
+  // Ghost pitcher's Movement snaps debuff the user's next batter.
+  collect(ghostPitcherEvents, "Batting");
+
+  void MOVEMENT_DEBUFF_CAP; // referenced for clamp docs
+
+  if (
+    nextWeekCashBonus === s.run.nextWeekCashBonus &&
+    roster === s.run.roster &&
+    veteranBoostedBy === s.run.veteranBoostedBy &&
+    defenseShields === s.run.defenseShields
+  ) {
+    return { runPatch: null, extraDebuffs };
+  }
+  return {
+    runPatch: { nextWeekCashBonus, roster, veteranBoostedBy, defenseShields },
+    extraDebuffs,
+  };
+}
+
+/**
+ * Deception RNG: walk a pitching ScoringResult's snap events for any
+ * `deception` edge and roll a 25% chance to shatter the opposing batter
+ * chain. Returns a new batter ScoringResult with bestGroup collapsed
+ * back to the anchor card only (effectively zeroing the chain bonus
+ * on top of the player's rarity baseline). When no Deception fires,
+ * returns the original batterResult unchanged.
+ */
+function maybeApplyDeception(
+  batterResult: ScoringResult,
+  pitcherResult: ScoringResult,
+): { batterResult: ScoringResult; shattered: boolean } {
+  const events = pitcherResult.sznSnapEvents ?? [];
+  const hasDeception = events.some(
+    (ev) => !ev.wildcard && ev.edge === "deception",
+  );
+  if (!hasDeception) return { batterResult, shattered: false };
+  if (Math.random() >= DECEPTION_SHATTER_CHANCE) {
+    return { batterResult, shattered: false };
+  }
+  // Shatter: collapse bestGroup to just the anchor (first card) and
+  // recompute totals. We don't touch `cardModifiers` so the reveal still
+  // shows what each card WOULD have contributed — only the matchup math
+  // gets the "they swung at deception" haircut.
+  const anchor = batterResult.bestGroup[0];
+  if (!anchor) return { batterResult, shattered: true };
+  const anchorMod = batterResult.cardModifiers[anchor.id];
+  const anchorValue = anchorMod?.value ?? anchor.baseValue;
+  return {
+    batterResult: {
+      ...batterResult,
+      bestGroup: [anchor],
+      maxValue: anchorValue,
+      // Wipe targeted opponent debuffs from non-anchor cards — they didn't
+      // actually fire because the chain shattered.
+      targetedOpponentDebuffs: batterResult.targetedOpponentDebuffs.filter(
+        (d) => d.sourceCardId === anchor.id,
+      ),
+    },
+    shattered: true,
+  };
 }
 
 function computeMatchup(
@@ -3313,12 +4868,34 @@ function computeMatchup(
 
   const guessPitchBonus = revealsGuess ? computeGuessPitchBonus(s) : 0;
 
-  // SZN Mode: team tag-synergy (roster construction) stacks on the chain
-  // total. Tier base for the player-at-the-plate is already in the chain via
-  // the player-as-card's `baseValue` (see `freshAtBat`).
-  // Non-SZN paths leave both bonuses at 0.
-  const sznBatterBonus = sznSideBonus(s, "Batting");
-  const sznPitcherBonus = sznSideBonus(s, "Pitching");
+  // SZN Mode: adjacent roster tag clusters (see `synergies.ts`) stack on the
+  // chain total. Rarity base for the player-at-the-plate is already in the
+  // chain via the player-as-card's `baseValue` (see `freshAtBat`).
+  //
+  // Three additional SZN sources stack on top of the tag-synergy bonus:
+  //   - sznBadgeScoreBonus: passive badge fires per qualifying snap event
+  //     (Bronx Bombers: +10 per Power snap).
+  //   - sznBatteryBridgeBonus: +15 to pitcher side when a Catcher with a
+  //     Battery right-edge ends the batter chain AND the pitcher anchor
+  //     has a Battery left-edge.
+  // Non-SZN paths leave all four bonuses at 0.
+  const sznBatterBonus =
+    sznSideBonus(s, "Batting") + sznBadgeScoreBonus(s, "Batting", batterResult);
+  const sznPitcherBonus =
+    sznSideBonus(s, "Pitching") +
+    sznBadgeScoreBonus(s, "Pitching", pitcherResult) +
+    sznBatteryBridgeBonus(s, "Pitching", batterResult);
+
+  // Encounter #9 Defense Shield: when the user is on the BATTING seat
+  // (so the opposing pitcher is the "pitcherTotal" we're computing
+  // against), spend one shield charge to zero the opponent's chain
+  // contribution. The charge is decremented inside the lock-in side-
+  // effect pass; here we only TREAT pitcherTotal as zero for the
+  // hit-scale and tie-break math so the preview HUD already shows the
+  // user winning with the shield active.
+  const userIsBatting = s.gameMode === "szn" && getUserSide(s) === "Batting";
+  const shieldsAvailable = (s.run?.defenseShields ?? 0) > 0;
+  const consumeShield = userIsBatting && shieldsAvailable;
 
   const batterTotal =
     batterResult.maxValue +
@@ -3326,12 +4903,13 @@ function computeMatchup(
     effBatterDebuffDelta +
     guessPitchBonus +
     sznBatterBonus;
-  const pitcherTotal =
-    pitcherResult.maxValue +
-    batterResult.opponentModifier +
-    batterResult.pitcherCombinedDelta +
-    pitcherDebuffDelta +
-    sznPitcherBonus;
+  const pitcherTotal = consumeShield
+    ? 0
+    : pitcherResult.maxValue +
+      batterResult.opponentModifier +
+      batterResult.pitcherCombinedDelta +
+      pitcherDebuffDelta +
+      sznPitcherBonus;
 
   // Tie-breakers: pitchers (p-48 Lights Out, p-80 Umpire's Call) flip ties
   // to themselves; b-71 Manager's Challenge is the batter mirror and beats
@@ -3400,7 +4978,7 @@ function isCardCombinedInHand(
   for (let i = 1; i < hand.length; i++) {
     const prev = hand[i - 1];
     const curr = hand[i];
-    const mechConnect = canConnect(prev, curr);
+    const mechConnect = canConnectAny(prev, curr);
     const userAffirmed =
       affirmedSeams === null ? true : affirmedSeams.has(seamKey(prev.id, curr.id));
     if (mechConnect && userAffirmed) {
@@ -3429,7 +5007,7 @@ function lowestUncombinedInHand(
   for (let i = 1; i < hand.length; i++) {
     const prev = hand[i - 1];
     const curr = hand[i];
-    const mechConnect = canConnect(prev, curr);
+    const mechConnect = canConnectAny(prev, curr);
     const userAffirmed =
       affirmedSeams === null ? true : affirmedSeams.has(seamKey(prev.id, curr.id));
     if (mechConnect && userAffirmed) {
@@ -3487,6 +5065,12 @@ function applyOutcome(
   },
 ): OutcomeApplyResult {
   let { inning, half, outs, homeScore, awayScore, totalInnings } = s;
+  // SZN games cap extras at exactly one extra inning, then declare a
+  // draw if still tied. Without this cap, a 3-inning weekend game can
+  // grind into unbounded extras and gum up the run schedule.
+  const sznTiedExtrasCap = s.gameMode === "szn" && s.run !== null
+    ? totalInnings + 1
+    : null;
   let bases: Bases = [...s.bases] as Bases;
   // Mirror of `bases` carrying the actual MlbPlayer per occupied slot.
   // Mutated in lockstep so the 3D scene's name labels track the same
@@ -3705,7 +5289,15 @@ function applyOutcome(
       // Past regulation: end ONLY when the score is decided. Tied games
       // continue into extras (each pair of half-innings until somebody
       // leads after the bottom completes / the home team walks off above).
+      // SZN caps extras at one inning, declaring a draw if still tied
+      // after the extra frame completes (see `applyOutcome` header).
       if (inning > totalInnings && homeScore !== awayScore) {
+        phase = "game-over";
+      } else if (
+        sznTiedExtrasCap !== null &&
+        inning > sznTiedExtrasCap &&
+        homeScore === awayScore
+      ) {
         phase = "game-over";
       }
     }

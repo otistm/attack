@@ -27,6 +27,29 @@ export function UIOverlay() {
     return () => clearTimeout(t);
   }, []);
 
+  // The "Let's Play Dugout!" splash is a Quick-Match / Victory-Mode
+  // beat -- the lane buttons paint the user into the Stadium scene
+  // and the splash is the welcome flourish over that scene. SZN Mode
+  // has its own dedicated entry surfaces (team picker overlay -> Front
+  // Office) and the splash painting behind those surfaces just looks
+  // like a leftover artifact (it lives at z-40, pointer-events-none,
+  // so it bleeds visually behind the SZN UI but isn't interactive).
+  //
+  // Yank the splash the instant the user signals ANY intent to play
+  // SZN Mode: either the team picker is open (`showSznTeamSelect`) OR
+  // a run is already active (`sznRunActive`, set the moment they pick
+  // a franchise and `startSznRun` mints a run). Together these cover
+  // both halves of the SZN entry flow so the splash never paints
+  // behind a SZN surface.
+  const sznRunActive = useGameStore((s) => s.gameMode === 'szn' && !!s.run);
+  const sznTeamPickerOpen = useGameStore((s) => s.showSznTeamSelect);
+  const sznIntentActive = sznRunActive || sznTeamPickerOpen;
+  useEffect(() => {
+    if (!sznIntentActive) return;
+    setSplashVisible(false);
+    setCardsReady(true);
+  }, [sznIntentActive]);
+
   const inning = useGameStore((s) => s.inning);
   const half = useGameStore((s) => s.half);
   const homeScore = useGameStore((s) => s.homeScore);
@@ -37,7 +60,6 @@ export function UIOverlay() {
   const userTeam = useGameStore((s) => s.userTeam);
   const startDraft = useGameStore((s) => s.startDraft);
   const startQuickMatch = useGameStore((s) => s.startQuickMatch);
-  const startSznRun = useGameStore((s) => s.startSznRun);
   // Which lane the player committed to. The header's "New Game" button
   // rematches in the SAME lane so locking in cards mid-quick-match doesn't
   // surprise the player by punting them into an auction draft on the next
@@ -87,7 +109,7 @@ export function UIOverlay() {
 
   return (
     <ScreenShake
-      className="absolute inset-0 z-20"
+      className="absolute inset-0 z-20 pointer-events-none"
       requestId={questShakeRequestId}
       magnitude={phase === 'game-over' ? 14 : 11}
       duration={0.42}
@@ -154,24 +176,26 @@ export function UIOverlay() {
               <LogOut className="w-3.5 h-3.5" />
               End Tutorial
             </button>
-          ) : (
+          ) : gameMode !== 'szn' ? (
+            // SZN suppresses the header's "New Game" picker entirely —
+            // a casual click here used to silently wipe the in-flight
+            // run (no confirm, no warning). The dedicated Abandon Run
+            // button in RunHud is now the only entry point that ends
+            // an active SZN run.
             <NewGamePicker
               onPick={(team) => {
                 // Rematch in the lane the player is already in. Quick Match
-                // stays Quick Match; auction Draft stays Draft; SZN Mode
-                // restarts a fresh run; legacy null falls back to the
-                // auction path.
+                // stays Quick Match; auction Draft stays Draft; legacy null
+                // falls back to the auction path.
                 if (gameMode === 'quick-match') {
                   startQuickMatch(team);
-                } else if (gameMode === 'szn') {
-                  startSznRun(team);
                 } else {
                   startDraft(team);
                 }
               }}
               currentTeam={userTeam}
             />
-          )}
+          ) : null}
         </div>
       </header>
       )}
@@ -188,8 +212,16 @@ export function UIOverlay() {
         </motion.div>
       )}
 
+      {/* Splash is suppressed entirely whenever the user has expressed
+          intent to play SZN Mode -- the picker overlay and the Front
+          Office own that surface, and the splash painting behind
+          them (z-40, pointer-events-none) reads as a leftover. The
+          render-time guard is belt-and-suspenders next to the
+          `useEffect` that flips `splashVisible` -- it covers the
+          mount-frame race where the timer hasn't fired yet but the
+          user has already clicked into the SZN lane. */}
       <AnimatePresence>
-        {splashVisible && <IntroSplash key="intro-splash" />}
+        {splashVisible && !sznIntentActive && <IntroSplash key="intro-splash" />}
       </AnimatePresence>
 
       <AnimatePresence>

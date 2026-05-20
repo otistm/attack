@@ -8,12 +8,15 @@ import { UIOverlay } from './components/UIOverlay';
 import { DraftScreen } from './components/DraftScreen';
 import { ShopScreen } from './components/ShopScreen';
 import { StartGameScreen } from './components/StartGameScreen';
+import { SznTeamSelect } from './components/SznTeamSelect';
 import { TutorialOverlay } from './components/TutorialOverlay';
 import { PackRipScreen } from './components/PackRipScreen';
 import { FrontOfficeScreen } from './components/FrontOfficeScreen';
 import { SeriesIntroScreen } from './components/SeriesIntroScreen';
+import { SeriesResultScreen } from './components/SeriesResultScreen';
 import { EndRunScreen } from './components/EndRunScreen';
 import { RunHud } from './components/RunHud';
+import { SznFooterDecks } from './components/SznFooterDecks';
 import { useGameStore } from './lib/gameStore';
 
 export default function App() {
@@ -64,14 +67,30 @@ export default function App() {
       {sznShowFrontOffice && <FrontOfficeScreen />}
       {sznShowSeriesIntro && <SeriesIntroScreen />}
       {sznEndState && <EndRunScreen />}
+      {/* SeriesResultScreen self-gates on `run.lastSeriesSummary`. It
+          paints OVER both the FrontOfficeScreen (continuing run) and
+          the EndRunScreen (10W / 3L terminal) so the user always sees
+          the weekend recap before the next surface takes over. */}
+      {inSzn && <SeriesResultScreen />}
       {/* Pre-game lane chooser (auction vs quick match vs SZN). Self-gates on
           `showStartScreen`; we additionally suppress it during an in-flight
           draft, the SZN run-screens, or any SZN end-state so they don't
           stack on top of each other. */}
       {phase !== 'drafting' && !inSzn && <StartGameScreen />}
+      {/* SZN team-selection overlay. Self-gates on `showSznTeamSelect`;
+          mounted above the start screen so picking SZN doesn't require
+          re-rendering the lane chooser between clicks. */}
+      {!inSzn && <SznTeamSelect />}
       {/* Learn-to-Play tutorial overlay. Self-gates on `tutorialActive`;
           we suppress it during a draft / SZN run so it can't paint over them. */}
       {phase !== 'drafting' && !inSzn && <TutorialOverlay />}
+      {/* SZN footer decks — always-visible roster bench (left) + bag
+          items (right). Self-gates on `gameMode === 'szn' && run`, and
+          phase-gates its own interactivity so the deck is informational
+          on non-combat screens and actionable during card selection.
+          Mounted last so it sits above the field but below any modal
+          / start-screen / tutorial chrome via its internal z-40. */}
+      <SznFooterDecks />
     </div>
   );
 }

@@ -51,8 +51,27 @@ import type { CardDefinition } from "../lib/cards";
 import { ShapeHalf } from "./CardGameOverlay";
 import { shapeModeForSide } from "../lib/connect";
 import { useGameStore } from "../lib/gameStore";
+import { SZN_EDGES, type SznEdgeId } from "../lib/sznEdges";
+import { SznEdgeHalf } from "./SznEdgeHalf";
 
 const HOVER_LAYER_Z_CLASS = "z-[10000]";
+
+/**
+ * Mini-tag rendered in the big-number slot for `baseValue: 0`
+ * EncounterItems so utility cards don't read as "this does nothing."
+ * Indexed by cardId; anything missing falls back to an em-dash.
+ */
+const UTILITY_TAGS: Record<string, string> = {
+  "enc-sticky-stuff": "SNAP",
+  "enc-rally-fire": "AURA",
+  "enc-platinum-glove": "SHIELD",
+  "enc-classic-spikes": "COPY",
+  "enc-the-torch": "COPY",
+  "enc-duct-tape": "SNAP",
+  "enc-faded-scouting-report": "INTEL",
+  "enc-mega-left": "MEGA",
+  "enc-mega-right": "MEGA",
+};
 
 export interface ItemCardPreviewProps {
   card: CardDefinition;
@@ -254,7 +273,33 @@ export function ItemCardPreview({
   const leftMode = shapeModeForSide(card, "left");
   const rightMode = shapeModeForSide(card, "right");
 
+  // SZN mode: every card that carries semantic edges should advertise
+  // them so encounter items read the same in the merchant, reward
+  // reveal, and bag drawer as they do in combat. We only flip when
+  // BOTH sides are registered SznEdgeIds -- otherwise we keep the
+  // shape connectors so the legacy quick-match item set still snaps
+  // correctly. Items don't carry the `team-logo` synthetic so no
+  // resolver pass is needed here (that's the player-card concern).
+  const sznLeftEdge: SznEdgeId | null =
+    card.sznLeftEdge && card.sznLeftEdge in SZN_EDGES
+      ? (card.sznLeftEdge as SznEdgeId)
+      : null;
+  const sznRightEdge: SznEdgeId | null =
+    card.sznRightEdge && card.sznRightEdge in SZN_EDGES
+      ? (card.sznRightEdge as SznEdgeId)
+      : null;
+
   const displayValue = valueOverride ?? card.baseValue;
+  // Encounter "utility" items intentionally have baseValue 0 -- their
+  // effect lives in the snap/aura/instant logic, not the per-card
+  // score. Rendering "0" in the big value slot mis-reads as "this
+  // does nothing". We map known utility cards to a readable mini-tag
+  // (AURA / INTEL / SNAP) so the user sees the card has a job; falls
+  // back to an em-dash for any unmapped 0-value encounter card.
+  const utilityTag: string | null =
+    valueOverride == null && card.baseValue === 0 && card.abilityType === "EncounterItem"
+      ? UTILITY_TAGS[card.id] ?? "—"
+      : null;
 
   // SZN-mode strips the legacy real-world player attribution from item
   // cards (it's flavor that has nothing to do with the user's signed
@@ -302,21 +347,38 @@ export function ItemCardPreview({
         aria-describedby={hasAbility ? tooltipId : undefined}
         {...pointerHandlers}
       >
-        {/* Shape connectors -- same engine the gameplay strip uses. */}
-        <ShapeHalf
-          shape={card.leftShape}
-          side="left"
-          isConnected={false}
-          compact={compact}
-          mode={leftMode}
-        />
-        <ShapeHalf
-          shape={card.rightShape}
-          side="right"
-          isConnected={false}
-          compact={compact}
-          mode={rightMode}
-        />
+        {/* Edge / shape connectors. SZN-mode cards that declare
+            `sznLeftEdge` / `sznRightEdge` render the physical
+            half-shape connector (the same `SznEdgeHalf` the in-combat
+            `PlayerCard` uses) so the bump the user sees in the
+            merchant, reward reveal, and bag matches the bump the card
+            snaps with at the plate. Quick-match items (no szn edges)
+            and SZN cards that never got semantic edges assigned fall
+            back to the geometric shape connector so the legacy snap
+            engine still reads correctly. */}
+        {sznMode && sznLeftEdge && sznRightEdge ? (
+          <>
+            <SznEdgeHalf edge={sznLeftEdge} side="left" isConnected={false} compact={compact} />
+            <SznEdgeHalf edge={sznRightEdge} side="right" isConnected={false} compact={compact} />
+          </>
+        ) : (
+          <>
+            <ShapeHalf
+              shape={card.leftShape}
+              side="left"
+              isConnected={false}
+              compact={compact}
+              mode={leftMode}
+            />
+            <ShapeHalf
+              shape={card.rightShape}
+              side="right"
+              isConnected={false}
+              compact={compact}
+              mode={rightMode}
+            />
+          </>
+        )}
 
         {/* Player + card name plate (stacked) -- mirrors CardItem signature
             layout. Player name is the small uppercase header; card name
@@ -343,12 +405,24 @@ export function ItemCardPreview({
         {/* Big numeric value -- THE single number that travels with the
             card across every UI surface (in-hand, bag, merchant). Matches
             the in-game CardItem position so the user reads the same
-            thing everywhere. */}
-        <div
-          className={`${sz.valueText} font-black z-20 drop-shadow-sm ${valueColor} ${sz.valueMargin}`}
-        >
-          {displayValue}
-        </div>
+            thing everywhere. Utility cards (encounter items with
+            baseValue 0) render their effect tag here instead of "0". */}
+        {utilityTag !== null ? (
+          <div
+            className={`font-black z-20 drop-shadow-sm tracking-widest ${valueColor} ${sz.valueMargin} ${
+              large ? "text-xl" : compact ? "text-[10px]" : "text-base"
+            }`}
+            title="Utility item -- effect is in the snap/aura/instant logic, not a per-card score."
+          >
+            {utilityTag}
+          </div>
+        ) : (
+          <div
+            className={`${sz.valueText} font-black z-20 drop-shadow-sm ${valueColor} ${sz.valueMargin}`}
+          >
+            {displayValue}
+          </div>
+        )}
 
         {/* Optional top-right badge ("OWNED", "+1", etc). */}
         {badge && (

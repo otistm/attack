@@ -1,8 +1,26 @@
 import { CardDefinition, TagLiteral } from "./cards";
 import { ITEMS } from "./items";
 import { ShapeType } from "../components/cardShapes";
-import { canConnect, seamKey } from "./connect";
+import { canConnect, canConnectAny, seamKey } from "./connect";
 import { applyCardEffect, applyOpponentTotalAdjustments, EffectContext, EffectResult, highestValueCard } from "./cardEffects";
+import { canSznSnap, type SznEdgeId } from "./sznEdges";
+
+/**
+ * One semantic-edge snap event captured while scoring a chain. Emitted
+ * whenever two adjacent cards in the best group both carry SZN edges
+ * that connect via {@link canSznSnap}. Consumed by the matchup
+ * pipeline in `gameStore.computeMatchup` to feed badge triggers
+ * (e.g. Bronx Bombers +10 / +$1 on Power), Speed multipliers, the
+ * Battery bridge bonus, Deception RNG, and Movement debuff stacking.
+ */
+export interface SznSnapEvent {
+  leftCardId: string;
+  rightCardId: string;
+  /** Edge id the two cards matched on (either side's edge after canSznSnap). */
+  edge: SznEdgeId;
+  /** True if `wildcard` was involved on either side (no specific edge bonus). */
+  wildcard: boolean;
+}
 
 export interface ScoringContext {
   // Whose hand is being scored ('Batting' or 'Pitching').
@@ -114,6 +132,14 @@ export interface ScoringContext {
    * lane). Each key is a card id; values are item ids from `ITEMS`.
    */
   equippedItems?: Record<string, string[]>;
+
+  /**
+   * SZN Encounter #7 Rally Fire aura. When true, every card immediately
+   * adjacent (in the same scoring group) to a card carrying the
+   * synthetic `team-logo` edge gets a +10% boost. Plumbed in from the
+   * gameStore when `run.rallyFireWeeksLeft > 0`.
+   */
+  sznRallyFireActive?: boolean;
 }
 
 /**
@@ -209,6 +235,13 @@ export interface ScoringResult {
   pitcherCombinedDelta: number;
   // Soft "hint" debug log for development; not displayed.
   log: string[];
+  /**
+   * SZN-only: semantic edge snaps that occurred inside `bestGroup`. The
+   * matchup layer uses these to fire passive badges and the rolling
+   * Yankees edge effects (Speed multiplier is applied inline in
+   * `scoreGroup`; the rest fire at matchup-resolution time).
+   */
+  sznSnapEvents?: SznSnapEvent[];
 }
 
 const EMPTY_RESULT: ScoringResult = {
@@ -222,6 +255,7 @@ const EMPTY_RESULT: ScoringResult = {
   pitcherWinsTies: false,
   pitcherCombinedDelta: 0,
   log: [],
+  sznSnapEvents: [],
 };
 
 /**
@@ -329,6 +363,8 @@ export function scoreHand(cards: CardDefinition[], ctx: ScoringContext): Scoring
     hitScaleBonus += ctx.questHitScaleBonus;
   }
 
+  const sznSnapEvents = collectSnapEvents(bestGroup);
+
   return {
     groups,
     bestGroup,
@@ -341,7 +377,45 @@ export function scoreHand(cards: CardDefinition[], ctx: ScoringContext): Scoring
     pitcherWinsTies,
     pitcherCombinedDelta,
     log,
+    sznSnapEvents,
   };
+}
+
+/**
+ * Walk the winning chain and emit one {@link SznSnapEvent} per adjacent
+ * pair where both sides carry SZN semantic edges that {@link canSznSnap}
+ * accepts. Wildcard snaps still emit (with `wildcard: true`) so badges
+ * can choose whether to fire on them (Bronx Bombers does not).
+ */
+function collectSnapEvents(group: CardDefinition[]): SznSnapEvent[] {
+  if (group.length < 2) return [];
+  const events: SznSnapEvent[] = [];
+  for (let i = 1; i < group.length; i++) {
+    const left = group[i - 1];
+    const right = group[i];
+    const lEdge = left.sznRightEdge as SznEdgeId | undefined;
+    const rEdge = right.sznLeftEdge as SznEdgeId | undefined;
+    if (!lEdge || !rEdge) continue;
+    if (!canSznSnap(lEdge, rEdge)) continue;
+    const wildcard = lEdge === "wildcard" || rEdge === "wildcard";
+    // Pick the non-wildcard side as the canonical matched edge when one
+    // side is wildcard; same-id snaps keep that id verbatim.
+    const edge: SznEdgeId =
+      lEdge === rEdge
+        ? lEdge
+        : lEdge === "wildcard"
+          ? rEdge
+          : rEdge === "wildcard"
+            ? lEdge
+            : lEdge;
+    events.push({
+      leftCardId: left.id,
+      rightCardId: right.id,
+      edge,
+      wildcard,
+    });
+  }
+  return events;
 }
 
 /**
@@ -365,7 +439,7 @@ export function buildGroups(
   for (let i = 1; i < cards.length; i++) {
     const prev = cards[i - 1];
     const curr = cards[i];
-    const mechConnect = canConnect(prev, curr);
+    const mechConnect = canConnectAny(prev, curr);
     const userAffirmed =
       affirmedSeams === null ? true : affirmedSeams.has(seamKey(prev.id, curr.id));
     if (mechConnect && userAffirmed) {
@@ -519,6 +593,80 @@ function scoreGroup(group: CardDefinition[], ctx: ScoringContext, hand: CardDefi
         });
       }
     }
+  }
+
+  // ---- SZN Speed edge multiplier --------------------------------------
+  // The Speed semantic edge "acts as a multiplier for the next card in
+  // the chain". When card[i-1].rightEdge resolves to `speed` AND the
+  // SZN snap engine accepts the pair, bump card[i]'s contribution by
+  // 1.25x. We do this here instead of inline above so the multiplier
+  // applies to the FINAL value (including item bonuses + effect deltas)
+  // rather than just the printed baseValue.
+  if (group.length >= 2) {
+    for (let i = 1; i < group.length; i++) {
+      const left = group[i - 1];
+      const right = group[i];
+      const lEdge = left.sznRightEdge as SznEdgeId | undefined;
+      const rEdge = right.sznLeftEdge as SznEdgeId | undefined;
+      if (!lEdge || !rEdge) continue;
+      if (lEdge !== "speed") continue;
+      if (!canSznSnap(lEdge, rEdge)) continue;
+      const mod = cardModifiers[right.id];
+      if (!mod) continue;
+      const boosted = Math.round(mod.value * 1.25);
+      cardModifiers[right.id] = { ...mod, value: boosted };
+    }
+  }
+
+  // ---- SZN Rally Fire aura --------------------------------------------
+  // Encounter #7 Rally Fire: while the run flag is on, every card
+  // adjacent (in this group) to one carrying a `team-logo` edge on
+  // either side gets a flat +10% boost on its current contribution.
+  // We round-down so a 50-score card becomes 55 rather than 56 (keeps
+  // the aura modest enough to NOT instantly trivialize a chain).
+  if (ctx.sznRallyFireActive && group.length >= 2) {
+    const isRally = (c: CardDefinition) =>
+      (c.sznLeftEdge as SznEdgeId | undefined) === "team-logo" ||
+      (c.sznRightEdge as SznEdgeId | undefined) === "team-logo";
+    for (let i = 0; i < group.length; i++) {
+      const here = group[i];
+      const left = i > 0 ? group[i - 1] : null;
+      const right = i < group.length - 1 ? group[i + 1] : null;
+      const auraNeighbors = (left && isRally(left) ? 1 : 0) + (right && isRally(right) ? 1 : 0);
+      if (auraNeighbors === 0) continue;
+      if (isRally(here)) continue; // don't aura-boost the rally card itself
+      const mod = cardModifiers[here.id];
+      if (!mod) continue;
+      // +10% per adjacent team-logo card; stacks if both sides have one.
+      const factor = 1 + 0.1 * auraNeighbors;
+      cardModifiers[here.id] = { ...mod, value: Math.floor(mod.value * factor) };
+    }
+  }
+
+  // ---- SZN Mega-Card merge --------------------------------------------
+  // Encounter #4 Mega-Card: when both halves (enc-mega-left and
+  // enc-mega-right) live in the same group AND their `mega-seam` edges
+  // sit adjacent (canSznSnap("mega-seam","mega-seam") === true), they
+  // collapse into a single synthetic 500-score hero card.
+  //
+  // We don't synthesize a CardDefinition here -- the renderer will
+  // detect both halves in the rendered hand and overlay the merged
+  // visual itself. From scoring's POV we just zero each half's
+  // contribution and route the +500 onto one of them so the totalValue
+  // stays honest and the per-card modifier readout shows where the
+  // points came from.
+  for (let i = 1; i < group.length; i++) {
+    const left = group[i - 1];
+    const right = group[i];
+    const isLeftHalf = left.id === "enc-mega-left" && right.id === "enc-mega-right";
+    const isRightHalf = left.id === "enc-mega-right" && right.id === "enc-mega-left";
+    if (!isLeftHalf && !isRightHalf) continue;
+    const lEdge = left.sznRightEdge as SznEdgeId | undefined;
+    const rEdge = right.sznLeftEdge as SznEdgeId | undefined;
+    if (!lEdge || !rEdge) continue;
+    if (!canSznSnap(lEdge, rEdge)) continue;
+    cardModifiers[left.id] = { ...(cardModifiers[left.id] ?? { value: 0 }), value: 250 };
+    cardModifiers[right.id] = { ...(cardModifiers[right.id] ?? { value: 0 }), value: 250 };
   }
 
   const totalValue = Object.values(cardModifiers).reduce((acc, m) => acc + m.value, 0);

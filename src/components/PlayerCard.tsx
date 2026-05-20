@@ -6,7 +6,7 @@
  *
  * One source of truth for "what does an MLB player look like as a card?"
  * Rendered everywhere a player appears: the in-game hero rail, the pack-rip
- * reveal screen, the merchant listings, the roster drawer, and the SZN
+ * reveal screen, the merchant listings, the always-on deck footer, and the SZN
  * combat lineup strip.
  *
  * Visual contract:
@@ -22,17 +22,22 @@
 
 import { motion } from "motion/react";
 import type { MlbPlayer } from "../lib/players";
-import { TIER_BASE_VALUE, type Tier } from "../lib/run";
+import { RARITY_BASE_VALUE, type Rarity, type RosterPlayer } from "../lib/run";
+import type { SznPlayer } from "../lib/sznPlayers";
+import { isSznPlayer } from "../lib/sznPlayers";
 import { teamPalette } from "../lib/teamColors";
 import { ShapeHalf } from "./CardGameOverlay";
 import { shapeModeForSide } from "../lib/connect";
 import { playerAsCard } from "../lib/connect";
+import type { SznEdgeId } from "../lib/sznEdges";
+import { teamLogoEdge } from "../lib/sznTeams";
+import { SznEdgeHalf } from "./SznEdgeHalf";
 
 export interface PlayerCardProps {
-  player: MlbPlayer;
-  /** SZN tier; defaults to bronze when the card is shown outside a run. */
-  tier?: Tier;
-  /** Override the displayed combat value. Defaults to tier base value. */
+  player: MlbPlayer | SznPlayer;
+  /** SZN rarity; defaults to common when the card is shown outside a run. */
+  rarity?: Rarity;
+  /** Override the displayed combat value. Defaults to rarity base value. */
   value?: number;
   /** Hide the value readout entirely (e.g., when used as a profile chip). */
   hideValue?: boolean;
@@ -60,25 +65,31 @@ export interface PlayerCardProps {
   dimmed?: boolean;
   /** Tag chip override label (e.g. show "Bench" or "Active" in the lineup). */
   badge?: string;
+  /**
+   * Optional roster slot so the card can render encounter-applied
+   * edge overrides + score overrides. When omitted, falls back to the
+   * static `SznPlayer` edges and `RARITY_BASE_VALUE[rarity]`.
+   */
+  rosterSlot?: RosterPlayer;
 }
 
-const TIER_LABEL: Record<Tier, string> = {
-  bronze: "BRONZE",
-  silver: "SILVER",
-  gold: "GOLD",
-  diamond: "DIAMOND",
+const RARITY_LABEL: Record<Rarity, string> = {
+  common: "COMMON",
+  allstar: "ALL STAR",
+  veteran: "VETERAN",
+  legend: "LEGEND",
 };
 
-const TIER_TEXT: Record<Tier, string> = {
-  bronze: "text-orange-300",
-  silver: "text-slate-200",
-  gold: "text-amber-300",
-  diamond: "text-cyan-200",
+const RARITY_TEXT: Record<Rarity, string> = {
+  common: "text-orange-300",
+  allstar: "text-slate-200",
+  veteran: "text-amber-300",
+  legend: "text-cyan-200",
 };
 
 export function PlayerCard({
   player,
-  tier = "bronze",
+  rarity = "common",
   value,
   hideValue = false,
   showSockets = true,
@@ -91,14 +102,43 @@ export function PlayerCard({
   selected = false,
   dimmed = false,
   badge,
+  rosterSlot,
 }: PlayerCardProps) {
-  const palette = teamPalette(player.team);
-  const baseValue = value ?? TIER_BASE_VALUE[tier];
-  // Use the same shape-mode logic as the card engine so wildcards / blocked
-  // sides render with their distinctive treatment.
-  const playerCard = playerAsCard(player);
-  const leftMode = shapeModeForSide(playerCard, "left");
-  const rightMode = shapeModeForSide(playerCard, "right");
+  const isSzn = isSznPlayer(player);
+  const teamCode = isSzn ? player.teamId : player.team;
+  const palette = teamPalette(teamCode);
+  // Score readout: encounter `scoreOverride` and rookie/veteran
+  // `permanentBoost` both stack on the rarity floor when no explicit
+  // value override is provided.
+  const baseValue =
+    value ??
+    RARITY_BASE_VALUE[rarity] +
+      (rosterSlot?.permanentBoost ?? 0) +
+      (rosterSlot?.scoreOverride ?? 0);
+  // Encounter edge overrides take precedence over the static SznPlayer
+  // edges. team-logo syntheticas resolve to the holder's franchise
+  // logo so a Wildcard Sticker stamped as "team-logo" reads as
+  // "yankees-logo" on a Yankees player card.
+  const sznLeftRaw = isSzn ? (rosterSlot?.leftEdgeOverride ?? player.leftEdge) : null;
+  const sznRightRaw = isSzn ? (rosterSlot?.rightEdgeOverride ?? player.rightEdge) : null;
+  const sznLeft: SznEdgeId | null =
+    isSzn && sznLeftRaw
+      ? sznLeftRaw === "team-logo"
+        ? teamLogoEdge(player.teamId)
+        : sznLeftRaw
+      : null;
+  const sznRight: SznEdgeId | null =
+    isSzn && sznRightRaw
+      ? sznRightRaw === "team-logo"
+        ? teamLogoEdge(player.teamId)
+        : sznRightRaw
+      : null;
+  // Legacy MlbPlayer uses the shape engine; SZN players render their
+  // semantic edge badge instead. We only build the playerCard adapter
+  // for legacy players so the shape-mode lookup stays scoped.
+  const playerCard = !isSzn ? playerAsCard(player) : null;
+  const leftMode = playerCard ? shapeModeForSide(playerCard, "left") : "normal";
+  const rightMode = playerCard ? shapeModeForSide(playerCard, "right") : "normal";
 
   // `large` wins over `compact` if both are set — defensive against a
   // caller passing both (probably accidentally) and getting the wrong
@@ -167,7 +207,7 @@ export function PlayerCard({
         }}
       />
 
-      {showSockets && (
+      {showSockets && !isSzn && (
         <>
           <ShapeHalf
             shape={player.leftShape}
@@ -185,19 +225,25 @@ export function PlayerCard({
           />
         </>
       )}
+      {showSockets && isSzn && sznLeft && sznRight && (
+        <>
+          <SznEdgeHalf edge={sznLeft} side="left" isConnected={isConnectedLeft} compact={compact} />
+          <SznEdgeHalf edge={sznRight} side="right" isConnected={isConnectedRight} compact={compact} />
+        </>
+      )}
 
-      {/* Header: team + tier */}
+      {/* Header: team + rarity */}
       <div className={`absolute ${sz.topPad} left-0 right-0 flex justify-between items-start px-2 z-30`}>
         <span
           className={`${sz.teamText} font-black uppercase tracking-widest text-white/90`}
           style={{ textShadow: "0 1px 2px rgba(0,0,0,0.6)" }}
         >
-          {player.team}
+          {teamCode}
         </span>
         <span
-          className={`${sz.tierText} font-black uppercase tracking-widest ${TIER_TEXT[tier]} bg-black/40 rounded px-1`}
+          className={`${sz.tierText} font-black uppercase tracking-widest ${RARITY_TEXT[rarity]} bg-black/40 rounded px-1`}
         >
-          {badge ?? TIER_LABEL[tier]}
+          {badge ?? RARITY_LABEL[rarity]}
         </span>
       </div>
 

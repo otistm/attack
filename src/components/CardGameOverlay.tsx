@@ -2,20 +2,21 @@ import { useMemo, useState, useCallback, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { Reorder, motion, AnimatePresence } from 'motion/react';
 import { CardDefinition } from '../lib/cards';
-import { canConnect, shapeModeForSide, seamKey } from '../lib/connect';
-import { useGameStore, getUiUserSide, getUserSide, ResolutionBeat, Phase } from '../lib/gameStore';
+import { canConnect, canConnectAny, shapeModeForSide, seamKey } from '../lib/connect';
+import { useGameStore, getUiUserSide, isLowLeverageAtBat, ResolutionBeat, Phase } from '../lib/gameStore';
 import { HitOutcome } from '../lib/scoring';
 import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
+import { SznEdgeHalf } from './SznEdgeHalf';
+import type { SznEdgeId } from '../lib/sznEdges';
 import { PlayerHero } from './PlayerHero';
 import { ManagerHand } from './ManagerHand';
 import { QuestStrip } from './QuestStrip';
 import { teamPalette } from '../lib/teamColors';
-import { TIER_BASE_VALUE } from '../lib/run';
+import { RARITY_BASE_VALUE } from '../lib/run';
 import { activeSynergies, teamBatterBonus, teamPitcherBonus } from '../lib/synergies';
-import { X } from 'lucide-react';
 import { PLAYERS } from '../lib/players';
-import { SESSION_CARDS } from '../lib/cards';
-import { ItemCardPreview } from './ItemCardPreview';
+import { ALL_SZN_PLAYERS, isSznPlayer } from '../lib/sznPlayers';
+import { useSznGamepad } from '../lib/useSznGamepad';
 
 /**
  * Reveal-sequence orchestrator timing. Tuned so a typical 3-5 beat hand
@@ -340,20 +341,32 @@ const CardItem = ({
   // dropped into the hand strip. They're rendered with team colors, the
   // tier-based combat value, and no ability tooltip. The id format is
   // `player:${player.id}` (set by `playerAsCard` in connect.ts).
+  //
+  // The lookup spans BOTH player registries (legacy `PLAYERS` for
+  // Quick-Match / Auction Draft + `ALL_SZN_PLAYERS` for SZN runs). The
+  // previous baseline only checked legacy PLAYERS, so every SZN
+  // player-card landed with `playerForCard = null`, which collapsed
+  // `playerPalette` to null and fell through the team-gradient inline
+  // style -- the card body then rendered fully transparent (no
+  // background class either) and the user saw a colorless, see-through
+  // card during at-bats. Joining both registries restores the team
+  // gradient for every SZN player while still preserving the legacy
+  // path for the non-SZN modes.
   const isPlayerCard = card.abilityType === 'Player';
   const playerForCard = isPlayerCard
-    ? PLAYERS.find((p) => `player:${p.id}` === card.id) ?? null
+    ? (PLAYERS.find((p) => `player:${p.id}` === card.id) ??
+        ALL_SZN_PLAYERS.find((p) => `player:${p.id}` === card.id)) ?? null
     : null;
-  const playerTier = useGameStore((s) => {
-    if (!isPlayerCard || !playerForCard || !s.run) return 'bronze' as const;
+  const playerRarity = useGameStore((s) => {
+    if (!isPlayerCard || !playerForCard || !s.run) return 'common' as const;
     // Look in both the user's roster and the ghost's roster so the AI
-    // hand also renders with the correct tier value during a series.
+    // hand also renders with the correct rarity value during a series.
     const inUser = s.run.roster.find((r) => r.player.id === playerForCard.id);
-    if (inUser) return inUser.tier;
+    if (inUser) return inUser.rarity;
     const inGhost = s.run.ghost?.roster.find(
       (r) => r.player.id === playerForCard.id,
     );
-    return inGhost?.tier ?? 'bronze';
+    return inGhost?.rarity ?? 'common';
   });
   // SZN mode: the legacy `card.player` field on items is real-world
   // attribution (e.g. "Mike Trout (2024)") that has nothing to do with
@@ -363,9 +376,20 @@ const CardItem = ({
   // their own portrait + team chrome.
   const sznMode = useGameStore((s) => s.gameMode === 'szn');
   const hideCardPlayer = sznMode && !isPlayerCard;
-  const playerPalette = playerForCard ? teamPalette(playerForCard.team) : null;
-  const playerBaseValue = isPlayerCard ? TIER_BASE_VALUE[playerTier] : null;
-  // Player cards: `modifier.value` comes from scoring (includes tier via
+  // Normalized team + role lookup that works for BOTH player types:
+  // SZN players carry `teamId` + `role`, legacy MLB players carry
+  // `team` + `role`. Mirroring `PlayerCard.tsx` here keeps the at-bat
+  // hand visual identical to every other surface that renders a
+  // player.
+  const playerTeamCode = playerForCard
+    ? (isSznPlayer(playerForCard) ? playerForCard.teamId : playerForCard.team)
+    : null;
+  const playerRoleCode: 'Batter' | 'Pitcher' | null = playerForCard
+    ? playerForCard.role
+    : null;
+  const playerPalette = playerTeamCode ? teamPalette(playerTeamCode) : null;
+  const playerBaseValue = isPlayerCard ? RARITY_BASE_VALUE[playerRarity] : null;
+  // Player cards: `modifier.value` comes from scoring (includes rarity via
   // `baseValue` on the SZN player-as-card). When a modifier exists,
   // `playerBaseValue + playerDelta` equals `modifier.value`.
   const playerDelta =
@@ -377,20 +401,34 @@ const CardItem = ({
   );
   // General Draw cards take on their label color as their card body so they
   // stand out from signature cards (which stay white) on a busy field view.
+  // In SZN Mode we also color every Signature card body with its `card.color`
+  // so encounter-acquired buff cards (All Rise, etc.) don't show up as a
+  // blank white tile in the at-bat hand strip. Legacy Victory / Quick Match
+  // still use the classic white-body-with-colored-band design.
   const isGeneralDraw = card.abilityType === 'General Draw';
+  const tintAllSignatureCards = sznMode && !isPlayerCard;
+  const shouldUseCardColorBody =
+    (isGeneralDraw || tintAllSignatureCards) && !!card.color;
   const cardBgClass = isPlayerCard
-    ? '' // body color is applied via inline `style.background` for player cards
-    : isGeneralDraw && card.color ? card.color : 'bg-white';
+    // Body color is applied via inline `style.background` for player
+    // cards (team gradient). `bg-slate-700` is a safety floor for the
+    // theoretical case where neither player registry can resolve the
+    // card id -- prevents the legacy "see-through card" bug from ever
+    // returning if a future code path ships a player card with an
+    // unknown id. Live SZN play always paints over this with the team
+    // gradient below.
+    ? (playerPalette ? '' : 'bg-slate-700')
+    : shouldUseCardColorBody ? card.color! : 'bg-white';
   const defaultValueColor = isPlayerCard
     ? 'text-white'
-    : isGeneralDraw ? 'text-white' : 'text-slate-800';
+    : shouldUseCardColorBody ? 'text-white' : 'text-slate-800';
   // Modifier colors recolor the value text to match the source ability -- but
   // only on signature cards. General cards keep white text to stay readable on
   // their colored body (an orange-tagged buff on an orange general would paint
   // the value invisible against the background otherwise). Player cards
   // (SZN Mode) also stay white so the team-color body never washes the
   // tier value into a low-contrast smear.
-  const valueColorClass = isGeneralDraw || isPlayerCard
+  const valueColorClass = shouldUseCardColorBody || isPlayerCard
     ? defaultValueColor
     : modifier?.color
       ? TEXT_COLORS[modifier.color] || defaultValueColor
@@ -610,24 +648,46 @@ const CardItem = ({
             : {}),
         }}
       >
-        <ShapeHalf
-        shape={card.leftShape}
-        side="left"
-        isConnected={isConnectedLeft}
-        compact={compact}
-        mode={leftMode}
-        hint={leftHint}
-        dragActive={dragActive}
-      />
-      <ShapeHalf
-        shape={card.rightShape}
-        side="right"
-        isConnected={isConnectedRight}
-        compact={compact}
-        mode={rightMode}
-        hint={rightHint}
-        dragActive={dragActive}
-      />
+        {card.sznLeftEdge ? (
+          <SznEdgeHalf
+            edge={card.sznLeftEdge as SznEdgeId}
+            side="left"
+            isConnected={isConnectedLeft}
+            compact={compact}
+            hint={leftHint}
+            dragActive={dragActive}
+          />
+        ) : (
+          <ShapeHalf
+            shape={card.leftShape}
+            side="left"
+            isConnected={isConnectedLeft}
+            compact={compact}
+            mode={leftMode}
+            hint={leftHint}
+            dragActive={dragActive}
+          />
+        )}
+        {card.sznRightEdge ? (
+          <SznEdgeHalf
+            edge={card.sznRightEdge as SznEdgeId}
+            side="right"
+            isConnected={isConnectedRight}
+            compact={compact}
+            hint={rightHint}
+            dragActive={dragActive}
+          />
+        ) : (
+          <ShapeHalf
+            shape={card.rightShape}
+            side="right"
+            isConnected={isConnectedRight}
+            compact={compact}
+            mode={rightMode}
+            hint={rightHint}
+            dragActive={dragActive}
+          />
+        )}
 
       {isPlayerCard && playerForCard ? (
         <>
@@ -647,12 +707,12 @@ const CardItem = ({
               className={`${sz.playerText} font-black uppercase tracking-widest text-white/90`}
               style={{ textShadow: '0 1px 2px rgba(0,0,0,0.6)' }}
             >
-              {playerForCard.team}
+              {playerTeamCode ?? ''}
             </span>
             <span
               className={`${sz.playerText} font-black uppercase tracking-widest bg-black/40 rounded px-1 text-amber-200`}
             >
-              {playerTier}
+              {playerRarity}
             </span>
           </div>
           <div className="absolute left-0 right-0 z-30 flex justify-center" style={{ top: '36%' }}>
@@ -672,7 +732,7 @@ const CardItem = ({
               className="text-[8px] font-black uppercase tracking-[0.2em] bg-emerald-400/90 text-emerald-950 rounded-full px-1.5 py-[1px] shadow-md"
               style={{ textShadow: 'none' }}
             >
-              {playerForCard.role === 'Pitcher' ? 'Pitching' : 'Batting'}
+              {playerRoleCode === 'Pitcher' ? 'Pitching' : 'Batting'}
             </span>
           </div>
         </>
@@ -720,16 +780,12 @@ const CardItem = ({
 };
 
 export const CardGameOverlay = () => {
-  // SZN dugout state lives at the overlay level so the user-hand
-  // container can lift in response to the dugout opening (we want the
-  // hand to slide UP and out of the way of the dugout panel).
-  // `dugoutHeight` mirrors the actual rendered mat height (measured by
-  // the panel via ResizeObserver) so the hand slides up by exactly the
-  // mat's footprint -- no more no less. A hardcoded offset clipped on
-  // narrow viewports and left wasted headroom on tall ones.
-  const [dugoutHeight, setDugoutHeight] = useState(0);
-  const dugoutOpen = useGameStore((s) => s.sznDugoutOpen);
-  const handDropZoneRef = useRef<HTMLDivElement | null>(null);
+  // SZN deck-footer height (the always-visible two-row decks rendered by
+  // `SznFooterDecks` at the App level). Read it from the store so the
+  // user-hand container lifts by exactly the deck's footprint -- the
+  // score pill / lock-in button can never disappear behind the deck.
+  // Stays at 0 outside of SZN so the legacy combat lanes are unaffected.
+  const footerDeckHeight = useGameStore((s) => s.sznFooterHeight);
   const batter = useGameStore((s) => s.batter);
   const pitcher = useGameStore((s) => s.pitcher);
   const batterHand = useGameStore((s) => s.batterHand);
@@ -746,10 +802,17 @@ export const CardGameOverlay = () => {
   const sznRunActive = useGameStore((s) => s.gameMode === 'szn' && !!s.run);
   const run = useGameStore((s) => s.run);
   const reportSeriesGameResult = useGameStore((s) => s.reportSeriesGameResult);
-  const userWonThisGame = useGameStore((s) => {
-    const userBatting = s.userTeam === 'AWAY';
-    return userBatting ? s.awayScore > s.homeScore : s.homeScore > s.awayScore;
-  });
+  // Tri-state result for the SZN "Continue Run" handoff: ties cap at one
+  // extra inning then declare draw (see `applyOutcome`), so the user can
+  // legitimately finish in any of the three states.
+  // `userIsAway` reflects which side bats first (top of 1st), which is
+  // the same as which raw score belongs to the user. The actual
+  // `seriesGameResult` derivation is memoised further down (after the
+  // primitive score / userTeam selectors) — derived objects must NEVER
+  // be returned straight out of a zustand selector because
+  // `useSyncExternalStore` compares with `Object.is` and would loop
+  // ("getSnapshot should be cached" → "Maximum update depth").
+  const userTeam = useGameStore((s) => s.userTeam);
   const lastOutcome = useGameStore((s) => s.lastOutcome);
   const lastResolveLog = useGameStore((s) => s.lastResolveLog);
   const lastBatterScore = useGameStore((s) => s.lastBatterScore);
@@ -760,6 +823,18 @@ export const CardGameOverlay = () => {
   const previewMatchupFn = useGameStore((s) => s.previewMatchup);
   const revealScript = useGameStore((s) => s.revealScript);
   const completeReveal = useGameStore((s) => s.completeReveal);
+  // Quick Resolve: a small SZN-only toggle that auto-runs the
+  // lockIn -> completeReveal -> startNextAtBat chain on at-bats the
+  // `isLowLeverageAtBat` guard marks as boring (blowouts, garbage-time
+  // empty-bases two-outs, user pitching with a lead, etc.). The
+  // moment leverage spikes (RISP, tied late, open USE prompt) the
+  // chain stops and the player gets the normal Lock In UX back.
+  const quickResolveEnabled = useGameStore((s) => s.quickResolveEnabled);
+  const setQuickResolveEnabled = useGameStore((s) => s.setQuickResolveEnabled);
+  const tutorialActive = useGameStore((s) => s.tutorialActive);
+  const totalInnings = useGameStore((s) => s.totalInnings);
+  const outs = useGameStore((s) => s.outs);
+  const gameMode = useGameStore((s) => s.gameMode);
   // Which seat is the human in this half? When pitching, the bottom strip
   // becomes the pitcher hand (drag, lock-in, status chips on the user's
   // side) and the top strip becomes the AI batter (face-down -> revealed).
@@ -799,6 +874,20 @@ export const CardGameOverlay = () => {
   const homeScore = useGameStore((s) => s.homeScore);
   const awayScore = useGameStore((s) => s.awayScore);
   const inning = useGameStore((s) => s.inning);
+
+  // Series-game winner / loser derivation. See the comment above
+  // (where `userTeam` is selected) for why this MUST be a useMemo over
+  // primitive selections and not a single combined zustand selector.
+  const seriesGameResult = useMemo(() => {
+    const userIsAway = userTeam === 'AWAY';
+    const userScore = userIsAway ? awayScore : homeScore;
+    const ghostScore = userIsAway ? homeScore : awayScore;
+    let result: 'user' | 'ghost' | 'draw';
+    if (userScore > ghostScore) result = 'user';
+    else if (ghostScore > userScore) result = 'ghost';
+    else result = 'draw';
+    return { result, userScore, ghostScore };
+  }, [userTeam, awayScore, homeScore]);
 
   // User-affirmed connection seams + the action that updates them. The
   // strip reads `affirmedSeams` to decide which adjacent pairs render as
@@ -863,9 +952,42 @@ export const CardGameOverlay = () => {
   void scorePitcherFn;
 
   const isSelecting = phase === 'selecting';
-  const liftHandForDugout = dugoutOpen && isSelecting && sznRunActive;
+  // Hand lift: always lift the user-hand column by the live footer-
+  // deck height when a SZN run is active so the score pill and
+  // lock-in button stay clear of the always-on decks. Non-SZN lanes
+  // never see this lift because `footerDeckHeight` stays at 0 there.
+  const handLiftPx = sznRunActive && footerDeckHeight > 0 ? -footerDeckHeight : 0;
   const isRevealing = phase === 'revealing';
   const isResolved = phase === 'between-at-bats' || phase === 'game-over';
+
+  // Post-at-bat CTA controller binding. CROSS advances:
+  //   - between-at-bats   -> startNextAtBat
+  //   - game-over + SZN   -> reportSeriesGameResult (continues run)
+  //   - game-over non-SZN -> setShowStartScreen(true) (back to lanes)
+  // Priority 10 sits above the always-on footer (0) so a clean Cross
+  // mid-result fires the CTA instead of the footer's Lock In (it's a
+  // no-op outside selecting anyway, but quieting the loop avoids the
+  // user wondering why nothing animated). Disabled in selecting
+  // phase so footer Lock In keeps its CROSS during selection.
+  useSznGamepad({
+    id: 'card-game-overlay-cta',
+    priority: 10,
+    enabled: isResolved,
+    handler: (btn) => {
+      if (btn !== 'CROSS') return;
+      if (phase === 'between-at-bats') {
+        startNextAtBat();
+      } else if (phase === 'game-over' && sznRunActive) {
+        reportSeriesGameResult(
+          seriesGameResult.result,
+          seriesGameResult.userScore,
+          seriesGameResult.ghostScore,
+        );
+      } else if (phase === 'game-over') {
+        setShowStartScreen(true);
+      }
+    },
+  });
   /** Opponent total stays hidden only while hands are still locked (selection). During
    *  `revealing`, both pills follow the beat-by-beat orchestrator; after that, finals. */
   const hideOpponentTotals = isSelecting;
@@ -969,6 +1091,243 @@ export const CardGameOverlay = () => {
 
   const batterCardIds = useMemo(() => new Set(batterHand.map((c) => c.id)), [batterHand]);
 
+  // ---- In-game (selecting-phase) controller surface ---------------------
+  // Two new gamepad capabilities specific to SZN's selecting phase:
+  //   1. Lock In on CROSS from the default 'screen' surface, so the user
+  //      can commit the swing without ever touching the mouse.
+  //   2. A new 'hand' focus surface that walks the cards in the user's
+  //      hand, lets the user "grab" one with SQUARE, then shift it left/
+  //      right with the DPAD. Drop fires affirmDraggedCard, which is the
+  //      same store action mouse drag uses on drop -- so chains snap
+  //      with identical seam-affirm semantics, scoring math, and
+  //      animations as Quick Play's drag-to-snap.
+  //
+  // We model the focus/grab as IDs (not indices) so the highlight
+  // follows the card across reorders / SZN deal/recall hand mutations.
+  // The derived index is recomputed every render against the live hand.
+  const sznGamepadFocus = useGameStore((s) => s.sznGamepadFocus);
+  const setSznGamepadFocus = useGameStore((s) => s.setSznGamepadFocus);
+  const [gamepadFocusedHandCardId, setGamepadFocusedHandCardId] = useState<
+    string | null
+  >(null);
+  const [gamepadGrabbedHandCardId, setGamepadGrabbedHandCardId] = useState<
+    string | null
+  >(null);
+
+  // Drop the hand focus when the user leaves the at-bat selecting phase
+  // (reveal, between-at-bats, game-over). Without this, the amber ring
+  // would persist into the reveal animation and look like the engine
+  // was pointing at a card.
+  useEffect(() => {
+    if (!isSelecting) {
+      setGamepadFocusedHandCardId(null);
+      setGamepadGrabbedHandCardId(null);
+      // Also release the 'hand' surface so the next at-bat starts on
+      // the default 'screen' surface (Lock In). Leaving it on 'hand'
+      // would hijack the next at-bat's DPAD before the new hand even
+      // drew.
+      if (sznGamepadFocus === 'hand') setSznGamepadFocus('screen');
+    }
+  }, [isSelecting, sznGamepadFocus, setSznGamepadFocus]);
+
+  // Reconcile the focused / grabbed IDs against the live hand. If the
+  // focused card disappeared (recalled to the bag, transformed away by
+  // an ability, or the player anchor got swapped), snap focus to a
+  // sensible neighbor instead of stranding the ring on a ghost id.
+  useEffect(() => {
+    if (!isSelecting) return;
+    const ids = userHand.map((c) => c.id);
+    if (ids.length === 0) {
+      if (gamepadFocusedHandCardId !== null) setGamepadFocusedHandCardId(null);
+      if (gamepadGrabbedHandCardId !== null) setGamepadGrabbedHandCardId(null);
+      return;
+    }
+    if (gamepadFocusedHandCardId && !ids.includes(gamepadFocusedHandCardId)) {
+      setGamepadFocusedHandCardId(ids[0]);
+    }
+    if (gamepadGrabbedHandCardId && !ids.includes(gamepadGrabbedHandCardId)) {
+      setGamepadGrabbedHandCardId(null);
+    }
+  }, [
+    isSelecting,
+    userHand,
+    gamepadFocusedHandCardId,
+    gamepadGrabbedHandCardId,
+  ]);
+
+  // Helper: move the grabbed card by `dir` (-1 left, +1 right) within
+  // the current user hand, push the new order through the store's
+  // reorder action, and fire `affirmDraggedCard` so the seam set
+  // updates exactly like a mouse drag-end. Returns true on success so
+  // the caller can swallow the controller input.
+  const shiftGrabbedHandCard = useCallback(
+    (dir: -1 | 1): boolean => {
+      const id = gamepadGrabbedHandCardId;
+      if (!id) return false;
+      const idx = userHand.findIndex((c) => c.id === id);
+      if (idx < 0) return false;
+      const target = idx + dir;
+      if (target < 0 || target >= userHand.length) return false;
+      const next = userHand.slice();
+      const [moved] = next.splice(idx, 1);
+      next.splice(target, 0, moved);
+      reorderUser(next);
+      // Mirror HandStrip.handleDragEnd: affirming on the moved card id
+      // is what re-derives the seam set (prunes broken seams, adds new
+      // ones for mechanically valid adjacencies). Without this the snap
+      // visual + chain credit never appears.
+      affirmDraggedCard(id);
+      return true;
+    },
+    [gamepadGrabbedHandCardId, userHand, reorderUser, affirmDraggedCard],
+  );
+
+  // Unified in-selection handler. Sits ABOVE the SznFooterDecks router
+  // (priority 50) so it wins DPAD_DOWN from the 'hand' surface
+  // (re-routes back to 'screen' instead of dropping into the rail), and
+  // wins CROSS from the 'screen' surface so the user gets Lock In
+  // without the footer's default Cross deal stealing focus. When the
+  // player is on 'footer' surface, we explicitly return false so the
+  // footer router keeps driving its rail navigation.
+  useSznGamepad({
+    id: 'card-game-overlay-selecting',
+    priority: 60,
+    enabled: sznRunActive && isSelecting,
+    handler: (btn) => {
+      if (sznGamepadFocus === 'footer') return false;
+
+      // 'screen' surface: lock in / drop into the hand.
+      if (sznGamepadFocus === 'screen') {
+        if (btn === 'CROSS') {
+          lockIn();
+          return true;
+        }
+        if (btn === 'DPAD_UP') {
+          if (userHand.length === 0) return false;
+          // Restore the previous focus if the card is still there, else
+          // seed the rightmost card so the player lands on the most
+          // recently dealt ability rather than the player anchor.
+          const ids = userHand.map((c) => c.id);
+          const restore =
+            gamepadFocusedHandCardId && ids.includes(gamepadFocusedHandCardId)
+              ? gamepadFocusedHandCardId
+              : ids[ids.length - 1];
+          setGamepadFocusedHandCardId(restore);
+          setSznGamepadFocus('hand');
+          return true;
+        }
+        // DPAD_DOWN / TRIANGLE / etc. fall through so the footer router
+        // can intercept them (its priority-50 listener handles the
+        // rail drop-in + collapse toggle).
+        return false;
+      }
+
+      // 'hand' surface from here down.
+      const grabbing = gamepadGrabbedHandCardId !== null;
+
+      // Move mode: lock the user into LEFT/RIGHT shift + drop/cancel.
+      // Mirrors the footer's move-mode lockdown so a held card can't be
+      // stranded by an accidental DPAD_UP into another surface.
+      if (grabbing) {
+        switch (btn) {
+          case 'DPAD_LEFT':
+            shiftGrabbedHandCard(-1);
+            return true;
+          case 'DPAD_RIGHT':
+            shiftGrabbedHandCard(1);
+            return true;
+          case 'SQUARE':
+          case 'CROSS':
+            // Drop in place. The grabbed card already affirmed its
+            // seams on every shift, so dropping just clears grab state.
+            setGamepadGrabbedHandCardId(null);
+            return true;
+          case 'CIRCLE':
+            // Cancel: same drop semantics. We don't unwind the moves
+            // because each shift was already a real reorder under the
+            // hood; reverting would surprise the user more than it'd
+            // help. The grabbed-state clears so DPAD goes back to nav.
+            setGamepadGrabbedHandCardId(null);
+            return true;
+          case 'DPAD_UP':
+          case 'DPAD_DOWN':
+            // Drop + exit the hand surface back to 'screen'. Escape
+            // hatch when a user grabs and then realizes they want to
+            // lock in or deal another card.
+            setGamepadGrabbedHandCardId(null);
+            setSznGamepadFocus('screen');
+            return true;
+          default:
+            return true;
+        }
+      }
+
+      // Normal hand-surface navigation.
+      const ids = userHand.map((c) => c.id);
+      const focusIdx = gamepadFocusedHandCardId
+        ? ids.indexOf(gamepadFocusedHandCardId)
+        : -1;
+      const safeIdx = focusIdx < 0 ? 0 : focusIdx;
+
+      switch (btn) {
+        case 'DPAD_LEFT': {
+          if (ids.length === 0) return true;
+          const next = Math.max(0, safeIdx - 1);
+          setGamepadFocusedHandCardId(ids[next]);
+          return true;
+        }
+        case 'DPAD_RIGHT': {
+          if (ids.length === 0) return true;
+          const next = Math.min(ids.length - 1, safeIdx + 1);
+          setGamepadFocusedHandCardId(ids[next]);
+          return true;
+        }
+        case 'SQUARE': {
+          // Grab the focused card. Cards in the hand are reorderable
+          // by mouse-drag too, so there's no "this card can't be
+          // grabbed" special-case here -- including the player anchor,
+          // which the engine treats as just another hand position.
+          if (ids.length === 0) return true;
+          const id = ids[safeIdx];
+          if (!id) return true;
+          setGamepadGrabbedHandCardId(id);
+          return true;
+        }
+        case 'CROSS': {
+          // CROSS priority: trigger an open USE prompt on the focused
+          // card if there is one (matches clicking the in-hand USE
+          // pill), otherwise fall through to Lock In so the user can
+          // commit the swing without leaving the hand surface.
+          const id = ids[safeIdx];
+          if (id && userPendingChoiceIds.has(id)) {
+            triggerChoice(id);
+            return true;
+          }
+          lockIn();
+          return true;
+        }
+        case 'CIRCLE': {
+          // Back out to the 'screen' surface (Lock In default focus).
+          setSznGamepadFocus('screen');
+          return true;
+        }
+        case 'DPAD_UP':
+        case 'DPAD_DOWN': {
+          // Either direction backs out of the hand surface. DPAD_DOWN
+          // additionally feeds the footer router on the NEXT press (the
+          // user can chain DPAD_DOWN twice to skip from hand into the
+          // rail). We don't auto-drop into the footer here because the
+          // intermediate 'screen' surface holds the Lock In CTA, which
+          // is the more common target after rearranging.
+          setSznGamepadFocus('screen');
+          return true;
+        }
+        default:
+          return false;
+      }
+    },
+  });
+
   /** SZN: flat team tag bonus folded into the matchup pill via `sznSideBonus`. */
   const userSznRosterSynergyAmount = useMemo(() => {
     if (!sznRunActive || !run) return null;
@@ -983,9 +1342,118 @@ export const CardGameOverlay = () => {
         userIsBatting ? s.threshold.batterBonus > 0 : s.threshold.pitcherBonus > 0,
       )
       .map((s) => s.threshold.label);
-    if (lines.length === 0) return 'Roster tag synergy — added to your matchup total.';
+    if (lines.length === 0) return 'Adjacent roster tag synergy — added to your matchup total.';
     return `${lines.join(' · ')} — counted in your matchup total.`;
   }, [run, userIsBatting, userSznRosterSynergyAmount]);
+
+  // ---- Quick Resolve auto-chain --------------------------------------------
+  // Cheap recompute on every render -- the helper is a few branches over
+  // primitive store fields, so a memo would cost more than it saves.
+  const isLowLeverage = isLowLeverageAtBat({
+    gameMode,
+    run,
+    phase,
+    inning,
+    totalInnings,
+    half,
+    outs,
+    bases,
+    homeScore,
+    awayScore,
+    userTeam,
+    pendingChoices,
+    activeChoiceCardId,
+    tutorialActive,
+  });
+  // Surface the auto-pilot state to the toggle UI so the player can see
+  // at a glance whether the toggle is "armed and waiting" (on but the
+  // current spot is high-leverage) vs "actively driving" (on AND
+  // currently auto-running the chain).
+  const quickResolveActive = quickResolveEnabled && isLowLeverage;
+  // Latch the toggle-on moment so we ONLY auto-resolve at-bats that the
+  // player explicitly opted into via the toggle. Without this, flipping
+  // the toggle ON during a between-at-bats pause would immediately fire
+  // startNextAtBat() under the player's finger before they could read
+  // the result of the at-bat that just finished. The latch arms once
+  // both conditions hold (toggle on AND we're in `selecting` phase) and
+  // disarms whenever the toggle goes off.
+  const autoChainArmedRef = useRef(false);
+  useEffect(() => {
+    if (!quickResolveEnabled) {
+      autoChainArmedRef.current = false;
+      return;
+    }
+    if (phase === 'selecting' && isLowLeverage) {
+      autoChainArmedRef.current = true;
+    }
+  }, [quickResolveEnabled, phase, isLowLeverage]);
+  // The actual auto-advance driver. Fires whenever phase / leverage
+  // changes; each transition along the chain re-triggers the effect
+  // with fresh state, so the chain "walks itself" through the
+  // selecting -> revealing -> between-at-bats loop with no manual
+  // sequencing. completeReveal/startNextAtBat are both idempotent
+  // outside their valid phase, so a stale fire is a safe no-op.
+  useEffect(() => {
+    if (!quickResolveEnabled) return;
+    if (tutorialActive) return;
+    if (!autoChainArmedRef.current) return;
+    if (phase === 'selecting') {
+      if (!isLowLeverage) return; // leverage spiked; hand control back
+      // Defer one tick so any in-flight render (USE prompt, dealing
+      // animation) commits first, and so React's strict-mode double
+      // invoke can't drive two simultaneous lockIns.
+      const t = setTimeout(() => {
+        const s = useGameStore.getState();
+        if (s.phase !== 'selecting') return;
+        if (!s.quickResolveEnabled) return;
+        if (s.activeChoiceCardId !== null) return;
+        if (s.pendingChoices.length > 0) return;
+        s.lockIn();
+      }, 60);
+      return () => clearTimeout(t);
+    }
+    if (phase === 'revealing') {
+      // Skip the ~2s+ reveal orchestrator entirely. The outcome math
+      // has already been applied to inning/outs/bases/scores inside
+      // lockIn, so completeReveal just flips the phase forward.
+      const t = setTimeout(() => {
+        const s = useGameStore.getState();
+        if (s.phase !== 'revealing') return;
+        if (!s.quickResolveEnabled) return;
+        s.completeReveal();
+      }, 80);
+      return () => clearTimeout(t);
+    }
+    if (phase === 'between-at-bats') {
+      // Quick "tap the result and roll" pause -- long enough for the
+      // user to glance at the new score, short enough that auto-pilot
+      // still feels like auto-pilot.
+      const t = setTimeout(() => {
+        const s = useGameStore.getState();
+        if (s.phase !== 'between-at-bats') return;
+        if (!s.quickResolveEnabled) return;
+        s.startNextAtBat();
+      }, 320);
+      return () => clearTimeout(t);
+    }
+    if (phase === 'game-over') {
+      // Game ended mid auto-chain; disarm so the player gets manual
+      // control over the Continue Run CTA.
+      autoChainArmedRef.current = false;
+    }
+  }, [
+    quickResolveEnabled,
+    isLowLeverage,
+    phase,
+    tutorialActive,
+    // Re-running the effect when these change is safe (idempotent
+    // calls inside) and keeps the chain reactive to mid-resolve
+    // mutations like a new pendingChoice popping during reveal.
+    activeChoiceCardId,
+    pendingChoices,
+    atBatId,
+  ]);
+  // --------------------------------------------------------------------------
 
   return (
     <>
@@ -1000,6 +1468,11 @@ export const CardGameOverlay = () => {
         phase={phase}
         atBatId={atBatId}
         resolveLog={lastResolveLog}
+        batterTotal={lastRevealMathSnapshot?.batter.total ?? null}
+        pitcherTotal={lastRevealMathSnapshot?.pitcher.total ?? null}
+        batterName={batter?.name ?? null}
+        pitcherName={pitcher?.name ?? null}
+        userIsBatting={userIsBatting}
       />
 
       <QuestStrip />
@@ -1080,18 +1553,20 @@ export const CardGameOverlay = () => {
       {/* User hand - bottom of screen. Always interactive: drag, connect,
           lock-in. Whether the user is the batter or the pitcher this half
           is decided by `userTeam` + `half` via getUserSide.
-          In SZN combat, when the user opens the dugout the entire hand
-          column lifts upward so the dugout mat has room to render. The
-          ref on the inner pointer-events container is a drop target for
-          dugout drag-to-deal -- when a bag card is released over this
-          rectangle the dugout panel calls `sznDealItem`. */}
+          In SZN combat the entire hand column is lifted upward by the
+          live `sznFooterHeight` so the always-on `SznFooterDecks` (the
+          persistent two-column roster/bag rail at the bottom of the
+          screen) doesn't overlap the hand. Card dealing from the bag
+          is a one-tap action on the rail itself (click an ability,
+          or press CROSS on the focused gamepad slot) -- there's no
+          drag-to-hand handshake to wire up on this end. */}
       <motion.div
-        animate={{ y: liftHandForDugout ? -dugoutHeight : 0 }}
+        animate={{ y: handLiftPx }}
         transition={{ type: 'spring', stiffness: 220, damping: 28 }}
         className="absolute inset-x-0 bottom-0 pointer-events-none flex flex-col items-center justify-end pb-8 bg-gradient-to-t from-slate-900/80 via-slate-900/40 to-transparent pt-32 h-80"
       >
 
-        <div ref={handDropZoneRef} className="pointer-events-auto flex flex-col items-center gap-4">
+        <div className="pointer-events-auto flex flex-col items-center gap-4">
           <ScorePill
             label={userLabel}
             tone={userTone}
@@ -1215,22 +1690,64 @@ export const CardGameOverlay = () => {
               // Mark the FIRST card so the tutorial overlay can spotlight
               // distinct regions (value, shapes, ability hover panel).
               tutorialFirstCard={true}
+              // Controller surface: amber ring on focused card, violet
+              // ring + pulse on grabbed card. Both are no-ops outside
+              // selecting (the gamepad handler clears these IDs the
+              // moment the phase advances), so the reveal sequence
+              // never inherits a stale highlight.
+              gamepadFocusedCardId={
+                sznGamepadFocus === 'hand' ? gamepadFocusedHandCardId : null
+              }
+              gamepadGrabbedCardId={gamepadGrabbedHandCardId}
             />
           </div>
 
           <AnimatePresence mode="wait">
             {isSelecting && (
-              <motion.button
+              <motion.div
                 key="lockin"
-                data-tutorial="lock-in"
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: 10 }}
-                onClick={lockIn}
-                className="px-12 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-full shadow-lg shadow-blue-900/50 transition-all hover:scale-105 active:scale-95 text-lg uppercase tracking-wider"
+                className="flex flex-col items-center gap-2"
               >
-                Lock In
-              </motion.button>
+                <button
+                  data-tutorial="lock-in"
+                  onClick={lockIn}
+                  className="px-12 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-full shadow-lg shadow-blue-900/50 transition-all hover:scale-105 active:scale-95 text-lg uppercase tracking-wider"
+                >
+                  Lock In
+                </button>
+                {sznRunActive && !tutorialActive && (
+                  <QuickResolveToggle
+                    enabled={quickResolveEnabled}
+                    active={quickResolveActive}
+                    onChange={setQuickResolveEnabled}
+                  />
+                )}
+                {/* Discoverability nudge: the QuickResolveToggle pill is
+                    small enough that first-time SZN players were missing
+                    it entirely during playtest. When we hit a verifiable
+                    low-leverage spot but the toggle is OFF, surface a
+                    one-line hint right under the toggle pill so the player
+                    learns the feature exists exactly at the moment it
+                    would help them. Auto-hides the moment the toggle is
+                    flipped on (active OR armed) so it doesn't compete with
+                    the pill's own state visuals. */}
+                {sznRunActive &&
+                  !tutorialActive &&
+                  !quickResolveEnabled &&
+                  isLowLeverage && (
+                    <button
+                      type="button"
+                      onClick={() => setQuickResolveEnabled(true)}
+                      className="text-[10px] uppercase tracking-[0.18em] text-emerald-200/80 hover:text-emerald-100 underline decoration-dotted underline-offset-4 transition-colors"
+                      title="Auto-resolves this and other low-leverage at-bats. Toggle off any time."
+                    >
+                      Boring spot — tap Quick Resolve to skip
+                    </button>
+                  )}
+              </motion.div>
             )}
             {isResolved && (
               <motion.div
@@ -1249,7 +1766,13 @@ export const CardGameOverlay = () => {
                   </button>
                 ) : sznRunActive ? (
                   <button
-                    onClick={() => reportSeriesGameResult(userWonThisGame)}
+                    onClick={() =>
+                      reportSeriesGameResult(
+                        seriesGameResult.result,
+                        seriesGameResult.userScore,
+                        seriesGameResult.ghostScore,
+                      )
+                    }
                     className="px-10 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-full shadow-lg uppercase tracking-wider text-sm transition-all hover:scale-105 active:scale-95"
                   >
                     Continue Run
@@ -1270,16 +1793,76 @@ export const CardGameOverlay = () => {
 
       <ManagerHand side={userSide} />
 
-      {/* SZN Mode: dugout panel + toggle. Mounted as a sibling of the
-          hand container so it can render below the lifted hand and own
-          its own click area. The drop-zone ref is the user-hand inner
-          container: when a bag card is released over that rect, the
-          dugout panel calls `sznDealItem`. */}
-      <SznDugoutPanel
-        onHeightChange={setDugoutHeight}
-        handDropZoneRef={handDropZoneRef}
-      />
+      {/* SZN deck footer is mounted at App level so it persists across
+          the entire SZN experience (front office, draft, series intro,
+          combat). It self-locates this overlay's user-hand container
+          via the `data-szn-hand-drop-zone` attribute set above. */}
     </>
+  );
+};
+
+/**
+ * Compact pill toggle that lives right under the Lock In button during
+ * SZN combat. Drives the auto-resolve chain in `CardGameOverlay` via
+ * the `quickResolveEnabled` store flag. The pill has three visual
+ * states so the player always knows what auto-pilot is doing:
+ *   - OFF: dim slate -- toggle is off, every at-bat is manual.
+ *   - ARMED: amber outline -- toggle is on but the current spot is
+ *     high-leverage (RISP, tied late, etc.), so the chain is paused
+ *     and the player has to lock in by hand.
+ *   - ACTIVE: emerald solid -- toggle is on AND auto-pilot is
+ *     currently driving the chain through low-leverage at-bats.
+ */
+const QuickResolveToggle = ({
+  enabled,
+  active,
+  onChange,
+}: {
+  enabled: boolean;
+  active: boolean;
+  onChange: (next: boolean) => void;
+}) => {
+  // Three-state visual: OFF / ARMED (on but waiting) / ACTIVE (running).
+  const state: 'off' | 'armed' | 'active' = !enabled
+    ? 'off'
+    : active
+      ? 'active'
+      : 'armed';
+  const palette =
+    state === 'active'
+      ? 'bg-emerald-500/90 text-emerald-950 ring-emerald-300 shadow-emerald-900/40'
+      : state === 'armed'
+        ? 'bg-amber-400/20 text-amber-100 ring-amber-300/70 shadow-amber-900/30'
+        : 'bg-slate-700/60 text-slate-300 ring-slate-500/40 hover:bg-slate-700/80 hover:text-slate-100';
+  const label =
+    state === 'active'
+      ? 'Quick Resolve · ON'
+      : state === 'armed'
+        ? 'Quick Resolve · Armed'
+        : 'Quick Resolve';
+  const dotClass =
+    state === 'active'
+      ? 'bg-emerald-900 animate-pulse'
+      : state === 'armed'
+        ? 'bg-amber-300'
+        : 'bg-slate-400';
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(!enabled)}
+      aria-pressed={enabled}
+      title={
+        state === 'active'
+          ? 'Auto-resolving low-leverage at-bats. Click to turn off.'
+          : state === 'armed'
+            ? 'Quick Resolve is on, but this spot is high-leverage. The chain will resume on the next boring at-bat.'
+            : 'Auto-resolve obvious blowouts and garbage-time at-bats.'
+      }
+      className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-[0.18em] ring-1 transition-all shadow ${palette}`}
+    >
+      <span className={`w-1.5 h-1.5 rounded-full ${dotClass}`} />
+      {label}
+    </button>
   );
 };
 
@@ -1299,6 +1882,11 @@ const HitResultBanner = ({
   phase,
   atBatId,
   resolveLog,
+  batterTotal,
+  pitcherTotal,
+  batterName,
+  pitcherName,
+  userIsBatting,
 }: {
   outcome: HitOutcome | null;
   phase: Phase;
@@ -1310,6 +1898,19 @@ const HitResultBanner = ({
    * the field.
    */
   resolveLog: string[];
+  /**
+   * Locked-in totals from the reveal math snapshot. Drives the
+   * "why this happened" scoreline chip ("Batter 58 vs Pitcher 40 ·
+   * Wins by 18") so the user can see at-a-glance why the outcome
+   * landed the way it did. Both null on the very first render (no
+   * at-bat has resolved yet) -- the chip just hides itself.
+   */
+  batterTotal: number | null;
+  pitcherTotal: number | null;
+  batterName: string | null;
+  pitcherName: string | null;
+  /** Drives the "You won by X" / "Beat you by X" wording polarity. */
+  userIsBatting: boolean;
 }) => {
   const [visible, setVisible] = useState(false);
   // Re-enter every time a fresh resolved-state lands. We key on atBatId so a
@@ -1340,6 +1941,25 @@ const HitResultBanner = ({
   const cfg = HIT_BANNER_CONFIG[outcome ?? 'out'];
   if (!cfg) return null;
 
+  // Build the "why this happened" scoreline. Only renders when both
+  // totals exist (every at-bat after the first lock-in) and we can
+  // compute the winning margin. Reads polarity from the actual
+  // matchup (batter wins iff batter > pitcher under the chain math)
+  // and then frames the margin from the USER's perspective so a
+  // pitching seat doesn't read "you won by 18" when their pitcher
+  // shut down the batter -- we say "Shutdown by 18" instead.
+  const hasMath = batterTotal !== null && pitcherTotal !== null;
+  const batterWon = hasMath && batterTotal! > pitcherTotal!;
+  const margin = hasMath ? Math.abs(batterTotal! - pitcherTotal!) : 0;
+  const userWonMatchup = userIsBatting ? batterWon : !batterWon;
+  const verb = batterWon
+    ? userIsBatting
+      ? `You out-hit by ${margin}`
+      : `Hit through you by ${margin}`
+    : userIsBatting
+      ? `Pitcher held you off by ${margin}`
+      : `You shut it down by ${margin}`;
+
   return (
     <AnimatePresence>
       {visible && (
@@ -1366,6 +1986,36 @@ const HitResultBanner = ({
               <span className="text-xs font-bold uppercase tracking-[0.32em] opacity-80">
                 {cfg.sub}
               </span>
+            )}
+            {/* Scoreline chip -- the "why" line for the result. Shows
+                the locked-in batter / pitcher totals and the matchup
+                margin so the user can connect a base hit / strikeout
+                back to the chain math they just resolved. The user
+                used to be told ONLY the outcome name ("SINGLE") with
+                no on-screen reason; this row says "Batter 58 vs
+                Pitcher 40 · You out-hit by 18" so the math reads
+                like baseball commentary. */}
+            {hasMath && (
+              <div className="mt-2 flex flex-col items-center gap-0.5">
+                <div className="flex items-center gap-2 text-[11px] font-black uppercase tracking-[0.2em] opacity-95">
+                  <span className="rounded-md bg-slate-900/40 px-2 py-0.5 border border-white/25">
+                    {batterName ?? 'Batter'} {batterTotal}
+                  </span>
+                  <span className="opacity-70">vs</span>
+                  <span className="rounded-md bg-slate-900/40 px-2 py-0.5 border border-white/25">
+                    {pitcherName ?? 'Pitcher'} {pitcherTotal}
+                  </span>
+                </div>
+                <span
+                  className={`mt-0.5 rounded-full px-2.5 py-0.5 text-[10px] font-black uppercase tracking-[0.2em] border ${
+                    userWonMatchup
+                      ? 'bg-emerald-500/30 border-emerald-200/60'
+                      : 'bg-rose-500/30 border-rose-200/60'
+                  }`}
+                >
+                  {verb}
+                </span>
+              </div>
             )}
             {/* Resolve-step log: tells the player WHY follow-on effects fired
                 (e.g. an extra phantom runner from b-135 Stolen Bag). Renders
@@ -1484,236 +2134,11 @@ const STATUS_CHIP_EXPLANATIONS: Record<string, string> = {
     'Stolen Base Threat — the pitcher cannot use any General cards this round (their generals are zeroed at scoring).',
 };
 
-/**
- * SznDugoutPanel — full-bottom dugout drawer in SZN combat. Renders
- * the user's bag items as the SAME `ItemCardPreview` they'd see in
- * combat hand, so the visual identity carries straight from "I bought
- * this at the merchant" through "I dealt it into my swing".
- *
- * Toggle lives in `RunHud` (above the week strip). This component only
- * renders the expanded mat and bag grid.
- *   - Closed: no UI here (RunHud owns the affordance).
- *   - Open: a wide mat that lifts the user's hand strip above it and
- *     exposes drag-and-drop between hand and bag.
- *
- * Drop targets:
- *   - Drag a bag card UP into the hand zone -> `sznDealItem`
- *   - Click a hand-mounted bag card -> `sznRecallItem`
- *   (We also keep click-to-deal as a tap fallback for users who don't
- *   discover the drag affordance.)
- *
- * `handDropZoneRef` points at the user-hand container in CardGameOverlay
- * so onDragEnd can geometry-check whether the user released the bag
- * card over the hand or just shuffled it around the dugout mat.
+/*
+ * The toggleable `SznDugoutPanel` drawer was removed; bag items now
+ * live in the always-visible `SznFooterDecks` row alongside the bench
+ * players. See `src/components/SznFooterDecks.tsx`.
  */
-function SznDugoutPanel({
-  onHeightChange,
-  handDropZoneRef,
-}: {
-  /**
-   * Reports the rendered mat height back up so `CardGameOverlay` can
-   * lift the user hand by exactly the right amount. Receives 0 when
-   * the mat is closed.
-   */
-  onHeightChange: (h: number) => void;
-  handDropZoneRef: React.RefObject<HTMLDivElement | null>;
-}) {
-  const sznActive = useGameStore(
-    (s) => s.gameMode === 'szn' && s.run !== null && s.phase === 'selecting',
-  );
-  const open = useGameStore((s) => s.sznDugoutOpen);
-  const setDugoutOpen = useGameStore((s) => s.setSznDugoutOpen);
-  const run = useGameStore((s) => s.run);
-  const userHand = useGameStore((s) =>
-    getUserSide(s) === 'Batting' ? s.batterHand : s.pitcherHand,
-  );
-  const dealItem = useGameStore((s) => s.sznDealItem);
-  const recall = useGameStore((s) => s.sznRecallItem);
-  // ResizeObserver-backed measurement of the mat. Mirrors the live
-  // height back to the parent so the user-hand strip can translate by
-  // the actual footprint instead of a hardcoded offset (which clipped
-  // on narrow viewports and left dead space on tall ones).
-  const matRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    if (!sznActive || !open) {
-      onHeightChange(0);
-      return;
-    }
-    const el = matRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      onHeightChange(entry.contentRect.height);
-    });
-    ro.observe(el);
-    // Seed with the initial measurement before any resize fires.
-    onHeightChange(el.getBoundingClientRect().height);
-    return () => {
-      ro.disconnect();
-      onHeightChange(0);
-    };
-  }, [sznActive, open, onHeightChange]);
-
-  if (!sznActive || !run) return null;
-
-  // Card-id set of items already dealt into the hand. We use this to
-  // gate INTERACTION on bag entries -- not visibility -- so a duplicate
-  // card the user owns stays on screen (dimmed) instead of silently
-  // disappearing the moment its sibling is dealt.
-  const handCardIds = new Set(userHand.map((c) => c.id));
-  const dealtFromBag = userHand.filter((c) => !c.id.startsWith('player:'));
-
-  // Geometry-check helper: is the released pointer over the hand strip?
-  const droppedOverHand = (clientX: number, clientY: number) => {
-    const el = handDropZoneRef.current;
-    if (!el) return false;
-    const r = el.getBoundingClientRect();
-    return (
-      clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom
-    );
-  };
-
-  return (
-    <>
-      {/* Expanded mat. Sits at fixed bottom with translateY animation so
-          it slides up cleanly. Width is full so the cards have room to
-          breathe; height is content-driven (max 38vh). */}
-      <AnimatePresence>
-        {open && (
-          <motion.div
-            key="szn-dugout-mat"
-            ref={matRef}
-            initial={{ y: 280, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            exit={{ y: 280, opacity: 0 }}
-            transition={{ type: 'spring', stiffness: 220, damping: 28 }}
-            className="absolute inset-x-0 bottom-0 z-30 pointer-events-auto pb-16 pt-3 px-4 bg-gradient-to-t from-slate-950/98 via-slate-950/95 to-slate-950/85 border-t-2 border-emerald-500/40 shadow-[0_-20px_50px_-20px_rgba(0,0,0,0.8)]"
-          >
-            <div className="max-w-6xl mx-auto flex flex-col gap-3">
-              <div className="flex items-center justify-between px-1">
-                <div className="flex items-baseline gap-3">
-                  <span className="dugout-font-sport text-xl uppercase tracking-widest text-emerald-200">
-                    Dugout
-                  </span>
-                  <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
-                    Drag a card up onto your hand to deal it
-                  </span>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setDugoutOpen(false)}
-                  className="text-slate-400 hover:text-white p-1 rounded hover:bg-white/10"
-                  aria-label="Close dugout"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-
-              {/* In-hand cards -- click to recall back to the bag. We
-                  show them so the user can see at a glance which bag
-                  items are currently dealt. */}
-              {dealtFromBag.length > 0 && (
-                <div className="flex flex-col gap-1.5">
-                  <span className="text-[9px] font-black uppercase tracking-widest text-amber-300/80 px-1">
-                    In hand · click to recall
-                  </span>
-                  <div className="flex flex-wrap gap-3">
-                    {dealtFromBag.map((c) => {
-                      const def = SESSION_CARDS.find((d) => d.id === c.id);
-                      if (!def) return null;
-                      return (
-                        <button
-                          key={`hand-${c.id}`}
-                          type="button"
-                          onClick={() => recall(c.id)}
-                          className="relative group"
-                          title="Recall to bag"
-                        >
-                          <ItemCardPreview
-                            card={def}
-                            compact
-                            badge="DEALT"
-                            badgeClass="bg-amber-500"
-                          />
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {/* Available bag items -- draggable cards. Tap also deals
-                  for users who don't discover the drag gesture. We render
-                  every instance the user owns; duplicates whose `cardId`
-                  already lives in the hand are visible-but-dimmed so the
-                  user can see they exist without being able to deal them
-                  twice (the chain engine keys hand cards by id). */}
-              <div className="flex flex-col gap-1.5">
-                <span className="text-[9px] font-black uppercase tracking-widest text-emerald-300/80 px-1">
-                  In bag · drag up onto your hand or tap to deal
-                </span>
-                {run.itemBag.length > 0 ? (
-                  <div className="flex flex-wrap gap-3">
-                    {run.itemBag.map((it) => {
-                      const def = SESSION_CARDS.find((d) => d.id === it.cardId);
-                      if (!def) return null;
-                      const alreadyDealt = handCardIds.has(it.cardId);
-                      if (alreadyDealt) {
-                        return (
-                          <div
-                            key={`bag-${it.instanceId}`}
-                            title="Duplicate of a card already in your hand"
-                            className="cursor-not-allowed"
-                          >
-                            <ItemCardPreview
-                              card={def}
-                              dimmed
-                              badge="DUPLICATE"
-                              badgeClass="bg-slate-600"
-                            />
-                          </div>
-                        );
-                      }
-                      return (
-                        <motion.div
-                          key={`bag-${it.instanceId}`}
-                          drag
-                          dragSnapToOrigin
-                          dragElastic={0.4}
-                          dragMomentum={false}
-                          whileDrag={{ scale: 1.1, zIndex: 60 }}
-                          onClick={() => dealItem(it.instanceId)}
-                          onDragEnd={(_e, info) => {
-                            // info.point is the pointer in viewport coords
-                            // at release. Cross-check against the hand
-                            // container's bounding box so an actual hand
-                            // drop fires the deal action; otherwise the
-                            // card snaps back via dragSnapToOrigin.
-                            if (droppedOverHand(info.point.x, info.point.y)) {
-                              dealItem(it.instanceId);
-                            }
-                          }}
-                          className="cursor-grab active:cursor-grabbing"
-                        >
-                          <ItemCardPreview card={def} />
-                        </motion.div>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  <p className="text-xs text-slate-500 italic px-1 py-3">
-                    Bag is empty. Visit a merchant to stock up.
-                  </p>
-                )}
-              </div>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </>
-  );
-}
 
 const BatterStatusStrip = ({
   batterHand,
@@ -2677,8 +3102,8 @@ const FlipPitcherStrip = ({
     >
       <AnimatePresence>
         {hand.map((card, index) => {
-          const isConnectedLeft = index > 0 && canConnect(hand[index - 1], card);
-          const isConnectedRight = index < hand.length - 1 && canConnect(card, hand[index + 1]);
+          const isConnectedLeft = index > 0 && canConnectAny(hand[index - 1], card);
+          const isConnectedRight = index < hand.length - 1 && canConnectAny(card, hand[index + 1]);
           const modifier = modifiers[card.id];
           const isGeneral = card.abilityType === 'General Draw';
           return (
@@ -2881,6 +3306,21 @@ interface HandStripProps {
    * (opponent, reveal-only) leave this off.
    */
   tutorialFirstCard?: boolean;
+  /**
+   * Card id under the gamepad focus ring (amber). When set, that card
+   * renders a controller-focus highlight on top of its normal styling.
+   * Distinct from `gamepadGrabbedCardId` so we can show "focused but not
+   * grabbed" vs "actively held" with different tints. Mouse-only users
+   * never see this because the controller never assigns a focus.
+   */
+  gamepadFocusedCardId?: string | null;
+  /**
+   * Card id currently "grabbed" via the gamepad SQUARE button (violet).
+   * Mirrors the move-mode lockdown the footer uses: while one card is
+   * grabbed, DPAD LEFT/RIGHT shifts that card and re-fires
+   * `onAffirmConnections` so chains snap exactly like a mouse drag.
+   */
+  gamepadGrabbedCardId?: string | null;
 }
 
 const HandStrip = ({
@@ -2899,6 +3339,8 @@ const HandStrip = ({
   activeChoiceCardId,
   onTriggerChoice,
   tutorialFirstCard = false,
+  gamepadFocusedCardId = null,
+  gamepadGrabbedCardId = null,
 }: HandStripProps) => {
   // Signature cards fly in from the screen edge they belong to (pitcher drops
   // from above, batter rises up from below); general-draw cards then sweep in
@@ -2944,14 +3386,14 @@ const HandStrip = ({
 
     // Left seam of the dragged card (between dragIdx-1 and dragIdx).
     if (dragIdx > 0) {
-      const ok = canConnect(hand[dragIdx - 1], hand[dragIdx]);
+      const ok = canConnectAny(hand[dragIdx - 1], hand[dragIdx]);
       const tag: ConnectHint = ok ? 'allow' : 'block';
       out[dragIdx - 1].right = tag;
       out[dragIdx].left = tag;
     }
     // Right seam of the dragged card (between dragIdx and dragIdx+1).
     if (dragIdx < hand.length - 1) {
-      const ok = canConnect(hand[dragIdx], hand[dragIdx + 1]);
+      const ok = canConnectAny(hand[dragIdx], hand[dragIdx + 1]);
       const tag: ConnectHint = ok ? 'allow' : 'block';
       out[dragIdx].right = tag;
       out[dragIdx + 1].left = tag;
@@ -2986,10 +3428,16 @@ const HandStrip = ({
       className="flex flex-row items-center justify-center list-none p-0 m-0"
     >
       {/*
-        Intentionally NO <AnimatePresence> here: cards in the batter hand are
-        never added/removed mid-at-bat (deal-time discards happen before this
-        renders), and wrapping in AnimatePresence with `layout` Reorder.Item
-        children plays badly with Framer's reorder swaps.
+        Intentionally NO <AnimatePresence> here. In legacy / quick-match
+        lanes the hand is set once by `dealHand` and never mutated until
+        the at-bat resolves, so there's nothing for AnimatePresence to
+        track. In SZN the player CAN deal/recall items mid-at-bat via
+        the persistent footer — those operations route through the
+        store's `reconcileSznHandState()` which rebuilds the hand atomically;
+        the reorder list re-renders fresh on the new `hand` reference,
+        which is enough animation continuity for the deck-style swap UX
+        (wrapping with AnimatePresence + Reorder.Item `layout` together
+        plays badly with Framer's reorder swap math).
       */}
       {hand.map((card, index) => {
           // A seam is "connected" only if (a) the mechanic allows it
@@ -3006,10 +3454,10 @@ const HandStrip = ({
             (affirmedSeams === undefined ||
               affirmedSeams.has(seamKey(card.id, hand[index + 1].id)));
           const isConnectedLeft =
-            index > 0 && canConnect(hand[index - 1], card) && seamLeftAffirmed;
+            index > 0 && canConnectAny(hand[index - 1], card) && seamLeftAffirmed;
           const isConnectedRight =
             index < hand.length - 1 &&
-            canConnect(card, hand[index + 1]) &&
+            canConnectAny(card, hand[index + 1]) &&
             seamRightAffirmed;
           const modifier = modifiers[card.id];
           const hintForCard = hints[index];
@@ -3051,6 +3499,8 @@ const HandStrip = ({
                   : undefined
               }
               tutorialRegions={tutorialFirstCard && index === 0}
+              gamepadFocused={gamepadFocusedCardId === card.id}
+              gamepadGrabbed={gamepadGrabbedCardId === card.id}
             />
           );
         })}
@@ -3125,6 +3575,16 @@ interface HandCardProps {
    * drag but keep hover so ability tooltips still work.
    */
   lockReorder?: boolean;
+  /**
+   * Controller focus highlight (amber ring). Rendered on top of the
+   * card so it's visible regardless of the underlying card art. Decoupled
+   * from `gamepadGrabbed` so we can show "focused but not grabbed" (the
+   * D-Pad cursor sits on this card) vs "grabbed" (SQUARE has picked it up
+   * for shifting) as separate tints.
+   */
+  gamepadFocused?: boolean;
+  /** Controller grab highlight (violet ring + pulse), see above. */
+  gamepadGrabbed?: boolean;
 }
 
 /**
@@ -3158,6 +3618,8 @@ const HandCard = ({
   onTriggerChoice,
   tutorialRegions = false,
   lockReorder = false,
+  gamepadFocused = false,
+  gamepadGrabbed = false,
 }: HandCardProps) => {
   useEffect(() => {
     onEntryPlayed(card.id);
@@ -3223,9 +3685,54 @@ const HandCard = ({
           onClick={onTriggerChoice}
         />
       )}
+      {(gamepadFocused || gamepadGrabbed) && (
+        <GamepadFocusRing grabbed={gamepadGrabbed} />
+      )}
     </Reorder.Item>
   );
 };
+
+/**
+ * Controller focus / grab indicator. Renders as a pointer-events-none
+ * overlay so it never steals clicks from the underlying CardItem (the
+ * card must stay mouse-draggable and hover-tooltip-able). Two visual
+ * states:
+ *  - focused (grabbed=false): amber 2-pixel ring + soft glow, the
+ *    "D-Pad cursor sits on this card" hint.
+ *  - grabbed (grabbed=true): violet ring + pulsing glow, the "SQUARE
+ *    picked this up, DPAD LEFT/RIGHT shifts it" affordance. Mirrors the
+ *    footer's grab visual so the controller language stays uniform
+ *    across surfaces.
+ */
+function GamepadFocusRing({ grabbed }: { grabbed: boolean }) {
+  return (
+    <motion.div
+      key={grabbed ? 'grabbed' : 'focused'}
+      initial={{ opacity: 0, scale: 0.95 }}
+      animate={
+        grabbed
+          ? {
+              opacity: [0.9, 1, 0.9],
+              scale: [1.02, 1.05, 1.02],
+              transition: {
+                duration: 0.9,
+                repeat: Infinity,
+                ease: 'easeInOut',
+              },
+            }
+          : { opacity: 1, scale: 1.02 }
+      }
+      exit={{ opacity: 0, scale: 0.95 }}
+      transition={{ duration: 0.15 }}
+      className={`pointer-events-none absolute inset-0 z-30 rounded-xl border-2 ${
+        grabbed
+          ? 'border-violet-300 shadow-[0_0_20px_4px_rgba(167,139,250,0.55)]'
+          : 'border-amber-300 shadow-[0_0_14px_2px_rgba(252,211,77,0.45)]'
+      }`}
+      aria-hidden
+    />
+  );
+}
 
 /**
  * Floating "USE" pill anchored just above a card. Renders only when the

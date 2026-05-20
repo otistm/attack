@@ -1,7 +1,7 @@
 import { motion, AnimatePresence } from 'motion/react';
 import { useMemo, useState } from 'react';
 import { useGameStore, getUserSide, type PendingReveal } from '../lib/gameStore';
-import { canConnect } from '../lib/connect';
+import { canConnectAny } from '../lib/connect';
 import { Eye, X } from 'lucide-react';
 import type { CardDefinition } from '../lib/cards';
 import { SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, type ShapeType } from './cardShapes';
@@ -232,7 +232,7 @@ function uncombinedCards(hand: CardDefinition[]): CardDefinition[] {
   const groups: CardDefinition[][] = [];
   let cur: CardDefinition[] = [hand[0]];
   for (let i = 1; i < hand.length; i++) {
-    if (canConnect(hand[i - 1], hand[i])) cur.push(hand[i]);
+    if (canConnectAny(hand[i - 1], hand[i])) cur.push(hand[i]);
     else {
       groups.push(cur);
       cur = [hand[i]];

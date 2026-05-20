@@ -4,6 +4,7 @@ import { useGameStore, getUserSide } from '../lib/gameStore';
 import { CardDefinition, sessionCardById } from '../lib/cards';
 import type { PendingChoice, ResolvedChoice } from '../lib/gameStore';
 import { SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeType } from './cardShapes';
+import { useSznGamepad } from '../lib/useSznGamepad';
 
 /**
  * Whitelist of shapes the player can actually pick in the shape-resolved
@@ -50,6 +51,11 @@ export function PlayerChoiceModal() {
   const batterHand = useGameStore((s) => s.batterHand);
   const pitcherHand = useGameStore((s) => s.pitcherHand);
   const userSide = useGameStore(getUserSide);
+  // SZN's always-on `SznFooterDecks` overlays the bottom of the screen;
+  // we lift the modal's bottom anchor up by exactly the live footer
+  // height so the choice panel still sits visually above the user hand
+  // strip (which itself is lifted by the same amount in CardGameOverlay).
+  const sznFooterHeight = useGameStore((s) => s.sznFooterHeight);
 
   // Match the open modal to its queued choice. Filtering by side is a
   // double-belt-and-braces: triggerChoice already validates the cardId is
@@ -75,6 +81,7 @@ export function PlayerChoiceModal() {
           choice={choice}
           batterHand={batterHand}
           pitcherHand={pitcherHand}
+          footerLiftPx={sznFooterHeight}
           onResolve={(value) => resolveChoice(choice.cardId, value)}
           onDismiss={dismissChoice}
         />
@@ -87,6 +94,13 @@ interface ChoicePanelProps {
   choice: PendingChoice;
   batterHand: CardDefinition[];
   pitcherHand: CardDefinition[];
+  /**
+   * Live SZN deck footer height in px. The panel's bottom edge lifts
+   * by exactly this amount so the modal stays above the deck instead
+   * of getting clipped by it. Non-SZN lanes pass 0 and the legacy
+   * `pb-80` (h-80 = 320px) hand offset is preserved.
+   */
+  footerLiftPx: number;
   onResolve: (value: ResolvedChoice) => void;
   /**
    * Close the modal without resolving. The choice stays in `pendingChoices`
@@ -96,7 +110,7 @@ interface ChoicePanelProps {
   onDismiss: () => void;
 }
 
-function ChoicePanel({ choice, batterHand, pitcherHand, onResolve, onDismiss }: ChoicePanelProps) {
+function ChoicePanel({ choice, batterHand, pitcherHand, footerLiftPx, onResolve, onDismiss }: ChoicePanelProps) {
   const card = sessionCardById(choice.cardId);
   const promptCopy = PROMPTS[choice.type] ?? 'Make a choice';
 
@@ -123,6 +137,49 @@ function ChoicePanel({ choice, batterHand, pitcherHand, onResolve, onDismiss }: 
 
   const isModifyShape = choice.type === 'pickShape' && targetCards.length > 0;
 
+  // Controller cursor for the non-wizard single-row option list
+  // (guessShape, future pickGeneral/pickConnection). The wizard
+  // variant manages its own focus internally because the option set
+  // changes per step. Priority 200 sits over the abandon-confirm and
+  // any modal-level binding.
+  const flatOptions =
+    !isModifyShape && (choice.type === 'guessShape' || choice.type === 'pickShape')
+      ? (choice.options as ShapeType[]).filter(isPickableShape)
+      : !isModifyShape
+        ? choice.options
+        : [];
+  const [flatFocus, setFlatFocus] = useState(0);
+  useSznGamepad({
+    id: 'player-choice-modal-flat',
+    priority: 200,
+    enabled: !isModifyShape && flatOptions.length > 0,
+    handler: (btn) => {
+      if (btn === 'CIRCLE') {
+        onDismiss();
+        return;
+      }
+      if (btn === 'DPAD_LEFT' || btn === 'DPAD_UP') {
+        setFlatFocus((i) => Math.max(0, i - 1));
+        return;
+      }
+      if (btn === 'DPAD_RIGHT' || btn === 'DPAD_DOWN') {
+        setFlatFocus((i) => Math.min(flatOptions.length - 1, i + 1));
+        return;
+      }
+      if (btn === 'CROSS') {
+        const v = flatOptions[flatFocus];
+        if (
+          (choice.type === 'guessShape' || choice.type === 'pickShape') &&
+          isPickableShape(v)
+        ) {
+          onResolve({ kind: 'shape', shape: v });
+        }
+        // pickGeneral / pickConnection are read-only today (the mouse
+        // path no-ops too); keep the controller consistent.
+      }
+    },
+  });
+
   return (
     // Anchored just above the batter hand strip (bottom-0, h-80 = 320px) so
     // the player's eyes don't have to travel from the modal at the top of
@@ -132,7 +189,11 @@ function ChoicePanel({ choice, batterHand, pitcherHand, onResolve, onDismiss }: 
     // visible directly below the modal. The backdrop still clips at
     // `bottom-72` so the cards themselves stay un-dimmed and interactive.
     <motion.div
-      className="absolute inset-0 z-50 flex items-end justify-center pointer-events-none px-4 pb-80"
+      className="absolute inset-0 z-50 flex items-end justify-center pointer-events-none px-4"
+      // 20rem (= h-80, the hand strip height) is the legacy non-SZN
+      // offset; SZN layers the live deck-footer height on top so the
+      // modal clears both surfaces.
+      style={{ paddingBottom: `calc(20rem + ${footerLiftPx}px)` }}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1, transition: { duration: 0.2 } }}
       exit={{ opacity: 0, transition: { duration: 0.18 } }}
@@ -140,9 +201,13 @@ function ChoicePanel({ choice, batterHand, pitcherHand, onResolve, onDismiss }: 
       {/* Click anywhere on the backdrop = dismiss without resolving. The
           backdrop is the same scrim that already dims the field; making it
           interactive saves the player from hunting for the X when they
-          decide they don't want to commit yet. */}
+          decide they don't want to commit yet. The scrim stops at the
+          hand strip top edge (bottom-72 ≈ 288px). When the SZN footer
+          is also present we additionally lift the scrim by the footer
+          height so the cards under the lifted hand stay un-dimmed. */}
       <motion.div
-        className="absolute inset-x-0 top-0 bottom-72 bg-slate-950/55 pointer-events-auto"
+        className="absolute inset-x-0 top-0 bg-slate-950/55 pointer-events-auto"
+        style={{ bottom: `calc(18rem + ${footerLiftPx}px)` }}
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         exit={{ opacity: 0 }}
@@ -182,6 +247,7 @@ function ChoicePanel({ choice, batterHand, pitcherHand, onResolve, onDismiss }: 
             promptCopy={promptCopy}
             targetCards={targetCards}
             onCommit={(payload) => onResolve(payload)}
+            onDismiss={onDismiss}
           />
         ) : (
           <>
@@ -195,6 +261,8 @@ function ChoicePanel({ choice, batterHand, pitcherHand, onResolve, onDismiss }: 
                 // Runtime guard below still validates in case the engine
                 // ever drifts.
                 options={choice.options.filter(isPickableShape)}
+                focusIndex={flatFocus}
+                onHover={(i) => setFlatFocus(i)}
                 onPick={(shape) => {
                   if (!isPickableShape(shape)) return;
                   onResolve({ kind: 'shape', shape });
@@ -238,14 +306,79 @@ interface ModifyShapePanelProps {
   promptCopy: string;
   targetCards: CardDefinition[];
   onCommit: (payload: ResolvedChoice) => void;
+  /** Controller CIRCLE / dismiss path. Mouse path uses the modal's X. */
+  onDismiss: () => void;
 }
 
-function ModifyShapePanel({ promptCopy, targetCards, onCommit }: ModifyShapePanelProps) {
+function ModifyShapePanel({ promptCopy, targetCards, onCommit, onDismiss }: ModifyShapePanelProps) {
   const [step, setStep] = useState<WizardStep>('card');
   const [pickedCardId, setPickedCardId] = useState<string | null>(null);
   const [pickedSide, setPickedSide] = useState<'left' | 'right' | null>(null);
+  const [focus, setFocus] = useState(0);
 
   const pickedCard = pickedCardId ? targetCards.find((c) => c.id === pickedCardId) : null;
+
+  // Per-step option count for the controller cursor. Reset to 0 on
+  // every step transition so the focus ring always lands on the first
+  // affordance (consistent muscle memory).
+  const optionCount =
+    step === 'card'
+      ? targetCards.length
+      : step === 'side'
+        ? 2
+        : SHAPE_PICK_OPTIONS.length;
+
+  // Clamp focus on step change.
+  if (focus >= optionCount && optionCount > 0) setFocus(0);
+
+  useSznGamepad({
+    id: 'player-choice-modal-wizard',
+    priority: 200,
+    enabled: targetCards.length > 0,
+    handler: (btn) => {
+      if (btn === 'CIRCLE') {
+        // CIRCLE in step 1 dismisses; later steps back up to the
+        // previous step (matches the on-screen "Back to ..." link).
+        if (step === 'card') onDismiss();
+        else if (step === 'side') setStep('card');
+        else if (step === 'shape') setStep('side');
+        return;
+      }
+      if (btn === 'DPAD_LEFT' || btn === 'DPAD_UP') {
+        setFocus((i) => Math.max(0, i - 1));
+        return;
+      }
+      if (btn === 'DPAD_RIGHT' || btn === 'DPAD_DOWN') {
+        setFocus((i) => Math.min(optionCount - 1, i + 1));
+        return;
+      }
+      if (btn === 'CROSS') {
+        if (step === 'card') {
+          const c = targetCards[focus];
+          if (c) {
+            setPickedCardId(c.id);
+            setStep('side');
+            setFocus(0);
+          }
+        } else if (step === 'side' && pickedCard) {
+          const side = focus === 0 ? 'left' : 'right';
+          setPickedSide(side);
+          setStep('shape');
+          setFocus(0);
+        } else if (step === 'shape' && pickedCard && pickedSide) {
+          const shape = SHAPE_PICK_OPTIONS[focus];
+          if (shape) {
+            onCommit({
+              kind: 'modifyShape',
+              targetCardId: pickedCard.id,
+              side: pickedSide,
+              shape,
+            });
+          }
+        }
+      }
+    },
+  });
 
   const stepLabel =
     step === 'card'
@@ -273,13 +406,16 @@ function ModifyShapePanel({ promptCopy, targetCards, onCommit }: ModifyShapePane
             transition={{ duration: 0.15 }}
             className="grid grid-cols-3 gap-2"
           >
-            {targetCards.map((c) => (
+            {targetCards.map((c, i) => (
               <CardThumb
                 key={c.id}
                 card={c}
+                focused={focus === i}
+                onMouseEnter={() => setFocus(i)}
                 onClick={() => {
                   setPickedCardId(c.id);
                   setStep('side');
+                  setFocus(0);
                 }}
               />
             ))}
@@ -300,17 +436,23 @@ function ModifyShapePanel({ promptCopy, targetCards, onCommit }: ModifyShapePane
               <SideButton
                 label="Left"
                 shape={pickedCard.leftShape}
+                focused={focus === 0}
+                onMouseEnter={() => setFocus(0)}
                 onClick={() => {
                   setPickedSide('left');
                   setStep('shape');
+                  setFocus(0);
                 }}
               />
               <SideButton
                 label="Right"
                 shape={pickedCard.rightShape}
+                focused={focus === 1}
+                onMouseEnter={() => setFocus(1)}
                 onClick={() => {
                   setPickedSide('right');
                   setStep('shape');
+                  setFocus(0);
                 }}
               />
             </div>
@@ -329,10 +471,12 @@ function ModifyShapePanel({ promptCopy, targetCards, onCommit }: ModifyShapePane
           >
             <SelectedCardBanner card={pickedCard} highlight={pickedSide} />
             <div className="grid grid-cols-4 gap-2">
-              {SHAPE_PICK_OPTIONS.map((shape) => (
+              {SHAPE_PICK_OPTIONS.map((shape, i) => (
                 <ShapeButton
                   key={shape}
                   shape={shape}
+                  focused={focus === i}
+                  onMouseEnter={() => setFocus(i)}
                   onClick={() =>
                     onCommit({
                       kind: 'modifyShape',
@@ -369,11 +513,27 @@ function StepDots({ step }: { step: WizardStep }) {
   );
 }
 
-function CardThumb({ card, onClick }: { card: CardDefinition; onClick: () => void }) {
+function CardThumb({
+  card,
+  focused = false,
+  onMouseEnter,
+  onClick,
+}: {
+  card: CardDefinition;
+  focused?: boolean;
+  onMouseEnter?: () => void;
+  onClick: () => void;
+}) {
   return (
     <button
       onClick={onClick}
-      className="bg-slate-800 hover:bg-slate-700 active:scale-95 rounded-lg border border-slate-700 hover:border-amber-400 p-2 flex flex-col gap-1.5 text-left transition-all"
+      onMouseEnter={onMouseEnter}
+      onFocus={onMouseEnter}
+      className={`bg-slate-800 hover:bg-slate-700 active:scale-95 rounded-lg border p-2 flex flex-col gap-1.5 text-left transition-all ${
+        focused
+          ? 'border-amber-400 ring-2 ring-amber-400/80'
+          : 'border-slate-700 hover:border-amber-400'
+      }`}
     >
       <div className="flex items-center justify-between">
         <span className={`text-[8px] uppercase font-black tracking-widest text-white px-1 py-0.5 rounded ${card.color}`}>
@@ -409,13 +569,31 @@ function SelectedCardBanner({ card, highlight }: { card: CardDefinition; highlig
   );
 }
 
-function SideButton({ label, shape, onClick }: { label: string; shape: ShapeType; onClick: () => void }) {
+function SideButton({
+  label,
+  shape,
+  focused = false,
+  onMouseEnter,
+  onClick,
+}: {
+  label: string;
+  shape: ShapeType;
+  focused?: boolean;
+  onMouseEnter?: () => void;
+  onClick: () => void;
+}) {
   const shapeName = SHAPE_LABEL[shape];
   return (
     <button
       onClick={onClick}
+      onMouseEnter={onMouseEnter}
+      onFocus={onMouseEnter}
       title={shapeName}
-      className="bg-slate-800 hover:bg-slate-700 active:scale-95 rounded-lg border border-slate-700 hover:border-amber-400 px-4 py-3 flex items-center justify-between transition-all"
+      className={`bg-slate-800 hover:bg-slate-700 active:scale-95 rounded-lg border px-4 py-3 flex items-center justify-between transition-all ${
+        focused
+          ? 'border-amber-400 ring-2 ring-amber-400/80'
+          : 'border-slate-700 hover:border-amber-400'
+      }`}
     >
       <div className="flex flex-col items-start">
         <span className="text-[10px] uppercase font-black text-amber-400 tracking-widest">{label}</span>
@@ -469,24 +647,56 @@ function ShapeMini({ shape, highlighted = false, large = false }: { shape: Shape
 // Single-row pickers (b-65 guess + future generic options).
 // ---------------------------------------------------------------------------
 
-function ShapeOptionRow({ options, onPick }: { options: ShapeType[]; onPick: (value: ShapeType) => void }) {
+function ShapeOptionRow({
+  options,
+  focusIndex,
+  onHover,
+  onPick,
+}: {
+  options: ShapeType[];
+  focusIndex?: number;
+  onHover?: (index: number) => void;
+  onPick: (value: ShapeType) => void;
+}) {
   return (
     <div className="grid grid-cols-4 gap-2">
-      {options.map((shape) => (
-        <ShapeButton key={shape} shape={shape} onClick={() => onPick(shape)} />
+      {options.map((shape, i) => (
+        <ShapeButton
+          key={shape}
+          shape={shape}
+          focused={focusIndex === i}
+          onMouseEnter={() => onHover?.(i)}
+          onClick={() => onPick(shape)}
+        />
       ))}
     </div>
   );
 }
 
-function ShapeButton({ shape, onClick }: { shape: ShapeType; onClick: () => void }) {
+function ShapeButton({
+  shape,
+  focused = false,
+  onMouseEnter,
+  onClick,
+}: {
+  shape: ShapeType;
+  focused?: boolean;
+  onMouseEnter?: () => void;
+  onClick: () => void;
+}) {
   const shapeName = SHAPE_LABEL[shape];
   if (shape === 'none' || shape === 'wildcard') {
     return (
       <button
         onClick={onClick}
+        onMouseEnter={onMouseEnter}
+        onFocus={onMouseEnter}
         title={shapeName}
-        className="aspect-square bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 hover:border-slate-500 flex items-center justify-center transition-colors"
+        className={`aspect-square bg-slate-800 hover:bg-slate-700 rounded-lg border flex items-center justify-center transition-colors ${
+          focused
+            ? 'border-amber-400 ring-2 ring-amber-400/80'
+            : 'border-slate-700 hover:border-slate-500'
+        }`}
       >
         <span className="text-[10px] uppercase font-black text-slate-300 tracking-wider">{shape}</span>
       </button>
@@ -497,8 +707,14 @@ function ShapeButton({ shape, onClick }: { shape: ShapeType; onClick: () => void
   return (
     <button
       onClick={onClick}
+      onMouseEnter={onMouseEnter}
+      onFocus={onMouseEnter}
       title={shapeName}
-      className="aspect-square bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 hover:border-amber-400 flex flex-col items-center justify-center gap-1 transition-colors group"
+      className={`aspect-square bg-slate-800 hover:bg-slate-700 rounded-lg border flex flex-col items-center justify-center gap-1 transition-colors group ${
+        focused
+          ? 'border-amber-400 ring-2 ring-amber-400/80'
+          : 'border-slate-700 hover:border-amber-400'
+      }`}
     >
       <div
         className="w-9 h-9 transition-transform group-hover:scale-110"

@@ -1,4 +1,10 @@
 import { ShapeType } from "../components/cardShapes";
+// Type-only import: cards.ts stores SZN edges as `string` to avoid a
+// cyclic runtime dependency, but the per-run randomizer below needs
+// to pull from the typed `SznEdgeId` union so the chosen edges stay
+// in the registry. `sznEdges.ts` doesn't import from `cards.ts`, so
+// the type-only import doesn't create a real cycle.
+import type { SznEdgeId } from "./sznEdges";
 
 export type CardType = "Batting" | "Pitching";
 export type CardAbilityType = string;
@@ -62,6 +68,25 @@ export interface CardDefinition {
    * -- it's only ever spliced on by `applyHandTransforms`.
    */
   disabled?: boolean;
+  /**
+   * SZN-only: when this card was dealt from the run's item bag, the
+   * source `Item.instanceId` is stamped onto the dealt clone so the
+   * `SznFooterDecks` Abilities column can hide only the specific
+   * instance that's in the hand (not every bag entry that happens to
+   * share the same `cardId`). Never set on static `SESSION_CARDS` entries.
+   */
+  sznInstanceId?: string;
+  /**
+   * SZN-only: semantic left/right edge ids carried by player-as-card
+   * adapters for SZN players (see `playerAsCard` in `connect.ts`).
+   * When present, the SZN combat path consults these via `canSznConnect`
+   * INSTEAD of the geometric shape engine. Item cards never set these.
+   *
+   * Imported as `string` to avoid a cyclic type dependency with
+   * `sznEdges.ts`; runtime callers cast to `SznEdgeId` after retrieval.
+   */
+  sznLeftEdge?: string;
+  sznRightEdge?: string;
 }
 
 /**
@@ -2230,6 +2255,267 @@ if (typeof console !== "undefined") {
   console.info(`[dugout] session seed = ${SESSION_SEED}`);
 }
 
+// ============================================================================
+// SZN-mode per-run EDGE randomization
+// ============================================================================
+//
+// Player cards (SznPlayer) carry FIXED `leftEdge` / `rightEdge` per their
+// printed identity -- Aaron Judge is always Yankees-Logo / Power, that's
+// who he IS. Item / ability cards are the opposite: their printed shape
+// pool was always randomized session-to-session via `randomizeCardShapes`
+// above, and the SZN edge layer needs the same treatment so each run
+// remixes the snap puzzle. Without this, every ability card would render
+// with bare geometric `ShapeHalf` in the SZN encounter UI (the rendering
+// in `ItemCardPreview` already gates on `sznLeftEdge && sznRightEdge`),
+// so the user never sees the semantic SZN edge connector on a merchant
+// listing or random reward.
+//
+// `randomizeCardEdges(cards, seed)` mutates each entry IN PLACE so the
+// existing `SESSION_CARDS` array and the `SESSION_CARDS_BY_ID` lookup
+// keep pointing at the same objects, and downstream merchant rolls /
+// encounter rewards pick up the new edges automatically. Encounter-only
+// items (`enc-*`) are skipped because their `sznLeftEdge` /
+// `sznRightEdge` are deliberately authored to drive specific snap
+// puzzles (mega-seam, defense-shield, team-logo, etc.).
+//
+// Pools are split by card `type` so a Batting card never gets a
+// pitcher-side edge (and vice versa) -- a "Sweeping Slider" pitcher
+// rolling `power` would feel like a tooling bug, not a fresh remix.
+// `wildcard` appears in both pools with low frequency so the
+// "snap-anywhere" escape hatch shows up sometimes without flooding the
+// run. Edges that are exclusive to specific encounter mechanics
+// (`team-logo`, `mega-seam`, `defense-shield`, `fastball-102`,
+// `city-connect`) are intentionally EXCLUDED here -- those should only
+// appear when an encounter explicitly grants them.
+// ============================================================================
+
+/** Batting-card edge pool. Offensive + positional + low-rate wildcard. */
+const BATTING_EDGE_POOL: SznEdgeId[] = [
+  "power", "power",
+  "speed", "speed",
+  "contact", "contact",
+  "patience",
+  "infield",
+  "outfield",
+  "battery",
+  "lefty",
+  "righty",
+  "wildcard", // single entry → ~5–8% of rolls
+];
+
+/** Pitching-card edge pool. Defensive + positional + low-rate wildcard. */
+const PITCHING_EDGE_POOL: SznEdgeId[] = [
+  "velocity", "velocity",
+  "movement", "movement",
+  "control", "control",
+  "deception",
+  "battery",
+  "infield",
+  "lefty",
+  "righty",
+  "wildcard",
+];
+
+/**
+ * Mutate each card's `sznLeftEdge` / `sznRightEdge` in place, drawing
+ * from the appropriate type-aware pool. Encounter-only items
+ * (`enc-*` ids) are skipped so their curated edges don't get blown
+ * away. Re-runnable: calling with a fresh seed mid-session reshuffles
+ * the edges for the next run.
+ */
+export function randomizeCardEdges(
+  cards: CardDefinition[],
+  seed: number,
+): void {
+  const rng = makeShapeRng(seed);
+  const pickFrom = (pool: SznEdgeId[]): SznEdgeId =>
+    pool[Math.floor(rng() * pool.length)];
+  for (const c of cards) {
+    // Skip encounter-only items (curated edges drive their mechanics).
+    if (c.id.startsWith("enc-")) continue;
+    const pool = c.type === "Pitching" ? PITCHING_EDGE_POOL : BATTING_EDGE_POOL;
+    c.sznLeftEdge = pickFrom(pool);
+    c.sznRightEdge = pickFrom(pool);
+  }
+}
+
+// ---------------------------------------------------------------------
+// SZN-mode encounter items
+// ---------------------------------------------------------------------
+//
+// These items only enter play via SZN encounters (not the Quick Match
+// shape-engine pool, and not the random draft). They carry semantic
+// `sznLeftEdge` / `sznRightEdge` so the SZN combat path can chain them
+// into player hands. Legacy shape sockets fall back to `wildcard` so
+// nothing crashes if a non-SZN code path ever inspects them.
+//
+// IDs use the `enc-*` prefix so callers (encounter dispatcher, footer
+// dealer, registry lookups) can cheaply distinguish encounter items
+// from the legacy Quick Match card catalog. The 30-card limit on the
+// shape randomizer doesn't apply to these because `randomizeCardShapes`
+// only touches the legacy entries; the encounter cards keep their
+// declared (always wildcard) shapes.
+
+export const SZN_ENCOUNTER_ITEM_CARDS: CardDefinition[] = [
+  {
+    id: "enc-sticky-stuff",
+    name: "Sticky Stuff",
+    type: "Pitching",
+    abilityType: "EncounterItem",
+    baseValue: 0,
+    leftShape: "wildcard",
+    rightShape: "wildcard",
+    description:
+      "Snap two cards together that don't normally match. 15% chance to destroy the targeted player at lock-in.",
+    sznLeftEdge: "wildcard",
+    sznRightEdge: "wildcard",
+  },
+  {
+    id: "enc-legal-rosin",
+    name: "Legal Rosin",
+    type: "Pitching",
+    abilityType: "EncounterItem",
+    baseValue: 15,
+    leftShape: "wildcard",
+    rightShape: "wildcard",
+    description: "Snap onto any pitcher's right edge for +15 Pitching Score.",
+    sznLeftEdge: "wildcard",
+    sznRightEdge: "velocity",
+  },
+  // Mega-Card halves (Encounter #4). Same name on both so the merged
+  // visual reads as a single hero card; the seam side is `mega-seam`
+  // (which only snaps to itself), the outside side is `blank` so the
+  // halves can't chain anywhere else.
+  {
+    id: "enc-mega-left",
+    name: "Mega-Card (Left)",
+    type: "Batting",
+    abilityType: "MegaHalf",
+    baseValue: 0,
+    leftShape: "none",
+    rightShape: "wildcard",
+    description: "Combines with the right half into a single 500-score hero card.",
+    sznLeftEdge: "blank",
+    sznRightEdge: "mega-seam",
+  },
+  {
+    id: "enc-mega-right",
+    name: "Mega-Card (Right)",
+    type: "Batting",
+    abilityType: "MegaHalf",
+    baseValue: 0,
+    leftShape: "wildcard",
+    rightShape: "none",
+    description: "Combines with the left half into a single 500-score hero card.",
+    sznLeftEdge: "mega-seam",
+    sznRightEdge: "blank",
+  },
+  {
+    id: "enc-corked-bat",
+    name: "Corked Bat",
+    type: "Batting",
+    abilityType: "EncounterItem",
+    baseValue: 100,
+    leftShape: "wildcard",
+    rightShape: "wildcard",
+    description: "Snap to any Outfielder or Infielder edge for +100 Batting Score.",
+    sznLeftEdge: "infield",
+    sznRightEdge: "outfield",
+  },
+  {
+    id: "enc-rally-fire",
+    name: "Rally Fire",
+    type: "Batting",
+    abilityType: "EncounterItem",
+    baseValue: 0,
+    leftShape: "wildcard",
+    rightShape: "wildcard",
+    description: "Snap to your team logo. Adjacent cards get +10% score for the rest of the week.",
+    sznLeftEdge: "team-logo",
+    sznRightEdge: "team-logo",
+  },
+  {
+    id: "enc-platinum-glove",
+    name: "Platinum Glove",
+    type: "Pitching",
+    abilityType: "EncounterItem",
+    baseValue: 0,
+    leftShape: "wildcard",
+    rightShape: "wildcard",
+    description: "Snap into your pitching chain. Nullifies the opponent's next pitching score.",
+    sznLeftEdge: "wildcard",
+    sznRightEdge: "defense-shield",
+  },
+  {
+    id: "enc-drip-cleats",
+    name: "Drip Cleats",
+    type: "Batting",
+    abilityType: "EncounterItem",
+    baseValue: 40,
+    leftShape: "wildcard",
+    rightShape: "wildcard",
+    description: "Snap to any Batter for +40 Batting Score. Forces the next card to be a Pitcher.",
+    sznLeftEdge: "speed",
+    sznRightEdge: "blank",
+  },
+  {
+    id: "enc-classic-spikes",
+    name: "Classic Spikes",
+    type: "Batting",
+    abilityType: "EncounterItem",
+    baseValue: 0,
+    leftShape: "wildcard",
+    rightShape: "wildcard",
+    description: "Snap to any card. Copies the other card's edge onto its own.",
+    sznLeftEdge: "wildcard",
+    sznRightEdge: "wildcard",
+  },
+  {
+    id: "enc-the-torch",
+    name: "The Torch",
+    type: "Batting",
+    abilityType: "EncounterItem",
+    baseValue: 0,
+    leftShape: "wildcard",
+    rightShape: "wildcard",
+    description: "Snap onto any player. Duplicates their left edge onto its right side.",
+    sznLeftEdge: "wildcard",
+    sznRightEdge: "wildcard",
+  },
+  {
+    id: "enc-duct-tape",
+    name: "Duct Tape",
+    type: "Batting",
+    abilityType: "EncounterItem",
+    baseValue: 0,
+    leftShape: "wildcard",
+    rightShape: "wildcard",
+    description: "Snap two non-matching cards together. Both sides take -50% base score.",
+    sznLeftEdge: "wildcard",
+    sznRightEdge: "wildcard",
+  },
+  {
+    id: "enc-faded-scouting-report",
+    name: "Faded Scouting Report",
+    type: "Pitching",
+    abilityType: "EncounterItem",
+    baseValue: 0,
+    leftShape: "none",
+    rightShape: "none",
+    description: "Intel only. Reveals the opponent's first card next series.",
+    sznLeftEdge: "blank",
+    sznRightEdge: "blank",
+    combineConstraint: { noCombine: true },
+  },
+];
+
+/**
+ * Registry lookup for encounter items. Used by the encounter dispatcher
+ * to grant items by id without searching SESSION_CARDS.
+ */
+export const SZN_ENCOUNTER_ITEMS_BY_ID: Record<string, CardDefinition> = {};
+for (const c of SZN_ENCOUNTER_ITEM_CARDS) SZN_ENCOUNTER_ITEMS_BY_ID[c.id] = c;
+
 /**
  * The card array the GAME uses. Identical to `ALL_CARDS` in every field
  * except `leftShape` / `rightShape`, which are re-rolled per session via
@@ -2238,11 +2524,16 @@ if (typeof console !== "undefined") {
  * drafting, draft visualization, collection screen, pending-choice modal)
  * reads from this one so the player sees one consistent shape layout for
  * the whole session.
+ *
+ * SZN encounter items are appended verbatim (NOT shuffled by
+ * `randomizeCardShapes`) so their declared sznLeftEdge / sznRightEdge
+ * remain stable and the wildcard fallback shapes don't get rerolled
+ * into something restrictive.
  */
-export const SESSION_CARDS: CardDefinition[] = randomizeCardShapes(
-  ALL_CARDS,
-  SESSION_SEED,
-);
+export const SESSION_CARDS: CardDefinition[] = [
+  ...randomizeCardShapes(ALL_CARDS, SESSION_SEED),
+  ...SZN_ENCOUNTER_ITEM_CARDS,
+];
 
 const SESSION_CARDS_BY_ID: Record<string, CardDefinition> = {};
 for (const c of SESSION_CARDS) SESSION_CARDS_BY_ID[c.id] = c;

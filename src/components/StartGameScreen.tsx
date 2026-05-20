@@ -16,6 +16,7 @@ import { useGameStore, type Team } from '../lib/gameStore';
 import { BATTERS, PITCHERS, type MlbPlayer } from '../lib/players';
 import { teamPalette } from '../lib/teamColors';
 import { QUEST_REGISTRY, rollQuestSlate, rerollQuestSlotAt, type QuestRarity } from '../lib/quests';
+import { useSznGamepad } from '../lib/useSznGamepad';
 
 /**
  * Pre-game lane chooser. Shown on first boot (after the splash) and again on
@@ -42,7 +43,7 @@ export function StartGameScreen() {
   const phase = useGameStore((s) => s.phase);
   const startDraft = useGameStore((s) => s.startDraft);
   const startQuickMatch = useGameStore((s) => s.startQuickMatch);
-  const startSznRun = useGameStore((s) => s.startSznRun);
+  const setShowSznTeamSelect = useGameStore((s) => s.setShowSznTeamSelect);
   const startTutorial = useGameStore((s) => s.startTutorial);
 
   // The screen never paints over an in-flight auction. App.tsx also gates
@@ -74,7 +75,7 @@ export function StartGameScreen() {
               <MainMenu
                 onAuction={(team) => startDraft(team)}
                 onQuickConfirm={(team, questSlate) => startQuickMatch(team, questSlate)}
-                onSzn={(team) => startSznRun(team)}
+                onSzn={() => setShowSznTeamSelect(true)}
                 onLearn={() => {
                   // Tutorial always plays as AWAY so the user bats in the
                   // top of the 1st -- the modal copy assumes that seat.
@@ -237,7 +238,12 @@ function MainMenu({
 }: {
   onAuction: (team: Team) => void;
   onQuickConfirm: (team: Team, questSlate: string[]) => void;
-  onSzn: (team: Team) => void;
+  /**
+   * SZN entry no longer takes an AWAY/HOME seat — picking SZN opens the
+   * MLB team-selection overlay (see `SznTeamSelect`), where the user
+   * chooses a franchise. The seat is always AWAY for SZN runs.
+   */
+  onSzn: () => void;
   onLearn: () => void;
 }) {
   const [openLane, setOpenLane] = useState<Lane | null>(null);
@@ -247,11 +253,93 @@ function MainMenu({
     rerollSpent: boolean;
   }>(null);
 
+  // Controller focus over the 4 active lane buttons (szn / auction /
+  // quick / learn). SZN is the headline lane (the only finished
+  // roguelike loop), so it sits at the top of the list AND is the
+  // default focus when the screen mounts -- a controller-first user
+  // mashes CROSS and lands directly in the SZN team picker. DPad
+  // cycles; CROSS activates. The SZN lane skips the AWAY/HOME team
+  // picker so CROSS launches the run directly. The auction / quick
+  // lanes expand into a team picker — CROSS expands and CROSS again
+  // picks AWAY (the first option in the picker grid). The quick lane
+  // additionally opens the quest picker modal (which owns higher-
+  // priority input).
+  const [focus, setFocus] = useState(0);
+  const lanes = ['szn', 'auction', 'quick', 'learn'] as const;
+  useSznGamepad({
+    id: 'start-game-screen',
+    priority: 10,
+    enabled: quickQuest === null,
+    handler: (btn) => {
+      if (btn === 'DPAD_UP') setFocus((i) => Math.max(0, i - 1));
+      else if (btn === 'DPAD_DOWN') setFocus((i) => Math.min(lanes.length - 1, i + 1));
+      else if (btn === 'CROSS') {
+        const lane = lanes[focus];
+        if (lane === 'szn') onSzn();
+        else if (lane === 'learn') onLearn();
+        else if (lane === 'auction') onAuction('AWAY');
+        else if (lane === 'quick') {
+          const s = rollQuestSlate();
+          setQuickQuest({
+            team: 'AWAY',
+            slate: [s[0]!, s[1]!, s[2]!],
+            rerollSpent: false,
+          });
+        }
+      }
+    },
+  });
+
+  // Quick-match quest picker handler. CROSS confirms (starts run with
+  // current slate), CIRCLE cancels, SQUARE re-rolls the focused slot
+  // once. Priority 100 because it's a modal stacked over the lane
+  // grid.
+  const [questFocus, setQuestFocus] = useState(0);
+  useSznGamepad({
+    id: 'start-game-quest-picker',
+    priority: 100,
+    enabled: quickQuest !== null,
+    handler: (btn) => {
+      if (!quickQuest) return;
+      if (btn === 'DPAD_LEFT') setQuestFocus((i) => Math.max(0, i - 1));
+      else if (btn === 'DPAD_RIGHT') setQuestFocus((i) => Math.min(2, i + 1));
+      else if (btn === 'CIRCLE') setQuickQuest(null);
+      else if (btn === 'SQUARE' && !quickQuest.rerollSpent) {
+        setQuickQuest({
+          ...quickQuest,
+          rerollSpent: true,
+          slate: rerollQuestSlotAt(quickQuest.slate, questFocus as 0 | 1 | 2),
+        });
+      } else if (btn === 'CROSS') {
+        onQuickConfirm(quickQuest.team, [...quickQuest.slate]);
+        setQuickQuest(null);
+      }
+    },
+  });
+
   const toggle = (lane: Lane) =>
     setOpenLane((prev) => (prev === lane ? null : lane));
 
   return (
     <div className="flex flex-col gap-4 w-full max-w-md">
+      {/* SZN Mode anchors the top of the list — it's the flagship
+          roguelike loop and the only lane that skips straight into a
+          full run instead of a single-game flow. Anchoring it at
+          index 0 also makes it the default gamepad focus when the
+          screen mounts so a controller-first user can boot the lane
+          with a single CROSS press. */}
+      <LaneButton
+        lane="szn"
+        title="SZN Mode"
+        subtitle="Pick your franchise"
+        icon={<Calendar className="w-6 h-6" />}
+        variant="emerald"
+        expanded={openLane === 'szn'}
+        focused={focus === 0}
+        onHover={() => setFocus(0)}
+        onToggle={() => toggle('szn')}
+        onPickTeam={() => onSzn()}
+      />
       <LaneButton
         lane="auction"
         title="Victory Mode"
@@ -259,6 +347,8 @@ function MainMenu({
         icon={<Trophy className="w-6 h-6" />}
         variant="red"
         expanded={openLane === 'auction'}
+        focused={focus === 1}
+        onHover={() => setFocus(1)}
         onToggle={() => toggle('auction')}
         onPickTeam={(team) => onAuction(team)}
       />
@@ -269,6 +359,8 @@ function MainMenu({
         icon={<Zap className="w-6 h-6" />}
         variant="gold"
         expanded={openLane === 'quick'}
+        focused={focus === 2}
+        onHover={() => setFocus(2)}
         onToggle={() => toggle('quick')}
         onPickTeam={(team) => {
           const s = rollQuestSlate();
@@ -279,16 +371,6 @@ function MainMenu({
           });
         }}
       />
-      <LaneButton
-        lane="szn"
-        title="SZN Mode"
-        subtitle="Make it to the World Series"
-        icon={<Calendar className="w-6 h-6" />}
-        variant="emerald"
-        expanded={openLane === 'szn'}
-        onToggle={() => toggle('szn')}
-        onPickTeam={(team) => onSzn(team)}
-      />
 
       {/* Tertiary "Learn to Play" entry. Smaller and ghost-styled so it
           doesn't compete with the two primary lane buttons. Skips the
@@ -296,7 +378,13 @@ function MainMenu({
       <button
         type="button"
         onClick={onLearn}
-        className="group w-full flex items-center justify-center gap-2 mt-1 px-4 py-3 rounded-lg border border-amber-400/40 bg-slate-900/40 hover:bg-slate-800/70 hover:border-amber-300/70 transition-colors dugout-font-base text-sm font-bold uppercase tracking-widest text-amber-200 hover:text-amber-100"
+        onMouseEnter={() => setFocus(3)}
+        onFocus={() => setFocus(3)}
+        className={`group w-full flex items-center justify-center gap-2 mt-1 px-4 py-3 rounded-lg border bg-slate-900/40 hover:bg-slate-800/70 transition-colors dugout-font-base text-sm font-bold uppercase tracking-widest text-amber-200 hover:text-amber-100 ${
+          focus === 3
+            ? 'border-amber-300 ring-2 ring-amber-400/70'
+            : 'border-amber-400/40 hover:border-amber-300/70'
+        }`}
       >
         <GraduationCap className="w-5 h-5" />
         Learn to Play
@@ -342,6 +430,8 @@ function LaneButton({
   icon,
   variant,
   expanded,
+  focused = false,
+  onHover,
   onToggle,
   onPickTeam,
 }: {
@@ -351,6 +441,8 @@ function LaneButton({
   icon: React.ReactNode;
   variant: 'red' | 'gold' | 'emerald';
   expanded: boolean;
+  focused?: boolean;
+  onHover?: () => void;
   onToggle: () => void;
   onPickTeam: (team: Team) => void;
 }) {
@@ -377,8 +469,12 @@ function LaneButton({
       <button
         type="button"
         onClick={handleClick}
+        onMouseEnter={onHover}
+        onFocus={onHover}
         aria-expanded={skipTeamPicker ? undefined : expanded}
-        className={`${buttonClass} w-full py-4 px-6 rounded-xl dugout-font-sport text-2xl sm:text-3xl uppercase tracking-wider flex items-center justify-between gap-3 transition-shadow`}
+        className={`${buttonClass} w-full py-4 px-6 rounded-xl dugout-font-sport text-2xl sm:text-3xl uppercase tracking-wider flex items-center justify-between gap-3 transition-shadow ${
+          focused ? 'ring-2 ring-amber-300/90 ring-offset-2 ring-offset-slate-950' : ''
+        }`}
       >
         <span className="flex items-center gap-3">
           {icon}

@@ -3,7 +3,7 @@
  *
  * Renders the player using the shared `PlayerCard` so the at-bat hero
  * carries the same team-colored card identity used everywhere else in
- * SZN Mode (pack-rip, merchants, roster drawer, lineup strip). The
+ * SZN Mode (pack-rip, merchants, deck footer, lineup strip). The
  * playtest-derived rules from the previous Topps-image cut still apply:
  * pulse on value change, color-tint by delta sign, treat player identity
  * change as a fresh entry tween.
@@ -11,12 +11,13 @@
 import { useEffect, useRef } from "react";
 import { motion, useAnimationControls } from "motion/react";
 import type { MlbPlayer } from "../lib/players";
+import type { SznPlayer } from "../lib/sznPlayers";
 import { PlayerCard } from "./PlayerCard";
 import { useGameStore } from "../lib/gameStore";
-import type { Tier } from "../lib/run";
+import type { Rarity } from "../lib/run";
 
 interface PlayerHeroProps {
-  player: MlbPlayer;
+  player: MlbPlayer | SznPlayer;
   /**
    * Live displayed total. `null` means "fog of war" (e.g., AI selecting in
    * secret) and renders the readout as `?` without triggering a pulse.
@@ -49,13 +50,13 @@ export function PlayerHero({
   const cardControls = useAnimationControls();
   const numberControls = useAnimationControls();
 
-  // Pull the SZN tier for this player when in a run, so the team-colored
-  // card shows the correct tier badge (Bronze / Silver / Gold / Diamond).
-  // Outside a run, defaults to bronze.
-  const tier = useGameStore((s) => {
-    if (s.gameMode !== "szn" || !s.run) return "bronze" as Tier;
+  // Pull the SZN rarity for this player when in a run, so the team-colored
+  // card shows the correct rarity badge (Common / All Star / Veteran / Legend).
+  // Outside a run, defaults to common.
+  const rarity = useGameStore((s) => {
+    if (s.gameMode !== "szn" || !s.run) return "common" as Rarity;
     const slot = s.run.roster.find((r) => r.player.id === player.id);
-    return (slot?.tier ?? "bronze") as Tier;
+    return (slot?.rarity ?? "common") as Rarity;
   });
 
   const prevValueRef = useRef<number | null>(null);
@@ -138,7 +139,7 @@ export function PlayerHero({
         {/* Sockets are off here -- the hero rail is the player's identity
             chip, not a chain target. The actual connection sockets show
             up on the lineup strip during a SZN at-bat. */}
-        <PlayerCard player={player} tier={tier} hideValue showSockets={false} />
+        <PlayerCard player={player} rarity={rarity} hideValue showSockets={false} />
       </motion.div>
 
       {showTotalBesideCard ? (

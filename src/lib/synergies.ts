@@ -1,14 +1,17 @@
 /**
- * SZN Mode tag synergies. When the user's roster carries N copies of a
- * given `ClassTag`, a global team buff applies during combat. The buff is
- * folded into the BATTER side's preview / lock-in score (and symmetrically
- * for the pitcher) so the player feels the lineup-construction reward.
+ * SZN Mode tag synergies. A tag threshold only counts players who are
+ * **adjacent in roster order** — the active streak is the longest contiguous
+ * block sharing that tag. Non-adjacent duplicates do not stack toward the
+ * same synergy tier.
+ *
+ * Bonuses fold into the batter preview / lock-in score (and symmetrically
+ * for the pitcher) via {@link teamBatterBonus} / {@link teamPitcherBonus}.
  */
 
 import type { ClassTag, RosterPlayer } from "./run";
 
 export interface SynergyThreshold {
-  /** Minimum count of players with this tag on the roster. */
+  /** Minimum length of a contiguous same-tag block in roster order. */
   count: number;
   /** Flat bonus added to the batter's Final Score when active. */
   batterBonus: number;
@@ -20,8 +23,8 @@ export interface SynergyThreshold {
 
 /**
  * Each tag declares a series of thresholds (smallest first). The active
- * threshold is the largest one whose `count` is <= the number of carriers
- * on the roster. Below the smallest threshold, the synergy is dormant.
+ * threshold is the largest one whose `count` is <= the longest **adjacent**
+ * run of that tag in roster order. Below the smallest threshold, dormant.
  */
 export const SYNERGY_TIERS: Record<ClassTag, SynergyThreshold[]> = {
   Slugger: [
@@ -63,21 +66,41 @@ export const SYNERGY_TIERS: Record<ClassTag, SynergyThreshold[]> = {
 export interface ActiveSynergy {
   tag: ClassTag;
   threshold: SynergyThreshold;
+  /** Longest contiguous roster block with this tag that satisfies `threshold`. */
   count: number;
 }
 
+/**
+ * For each class tag, the length of the longest consecutive run of that tag
+ * in `roster` array order (bench order). Tags that never appear are omitted.
+ */
+export function longestAdjacentBlocksByTag(roster: RosterPlayer[]): Map<ClassTag, number> {
+  const best = new Map<ClassTag, number>();
+  const n = roster.length;
+  if (n === 0) return best;
+  let i = 0;
+  while (i < n) {
+    const tag = roster[i].tag;
+    let j = i + 1;
+    while (j < n && roster[j].tag === tag) j++;
+    const run = j - i;
+    best.set(tag, Math.max(best.get(tag) ?? 0, run));
+    i = j;
+  }
+  return best;
+}
+
 export function activeSynergies(roster: RosterPlayer[]): ActiveSynergy[] {
-  const counts = new Map<ClassTag, number>();
-  for (const r of roster) counts.set(r.tag, (counts.get(r.tag) ?? 0) + 1);
+  const longestRun = longestAdjacentBlocksByTag(roster);
   const out: ActiveSynergy[] = [];
-  for (const [tag, count] of counts) {
+  for (const [tag, adjCount] of longestRun) {
     const tiers = SYNERGY_TIERS[tag];
     if (!tiers) continue;
     let active: SynergyThreshold | null = null;
     for (const t of tiers) {
-      if (count >= t.count) active = t;
+      if (adjCount >= t.count) active = t;
     }
-    if (active) out.push({ tag, threshold: active, count });
+    if (active) out.push({ tag, threshold: active, count: adjCount });
   }
   return out;
 }

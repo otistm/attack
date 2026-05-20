@@ -5,6 +5,13 @@ import { motion } from "motion/react";
 export function ManagerHand({ side }: { side: "Batting" | "Pitching" }) {
   const inventory = useGameStore((s) => s.inventory);
   const phase = useGameStore((s) => s.phase);
+  const gameMode = useGameStore((s) => s.gameMode);
+
+  // SZN replaces the legacy Manager's Hand panel with the always-on
+  // `SznFooterDecks` Abilities column. Mounting both stacks two
+  // duplicate item rails on the same screen, so this component bows
+  // out entirely whenever a SZN run owns the surface.
+  if (gameMode === "szn") return null;
 
   // Only show the manager's hand during the selecting phase
   if (phase !== "selecting") return null;

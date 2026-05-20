@@ -1,31 +1,121 @@
 /**
- * SeriesIntroScreen — the splash before each weekend Bo3 game. Reads
- * like a national-broadcast tale-of-the-tape: just the two starting
- * pitchers face-to-face, the series ledger between them, and a big
- * "Play Ball" CTA. We deliberately do NOT spoil the ghost lineup --
- * the user gets to know their opponent through the live at-bats.
+ * SeriesIntroScreen — the splash before the weekend Game of the Week.
+ * Reads like a national-broadcast tale-of-the-tape: the two starters
+ * face-to-face and a big "Play Ball" CTA. The weekend is a SINGLE
+ * game (no more Bo3 series tally), so no per-side series score chip
+ * — the only thing at stake is the one game we're about to play.
+ *
+ * We deliberately do NOT spoil the ghost lineup -- the user gets to
+ * know their opponent through the live at-bats.
+ *
+ * The starter cards render in the same compact, role-tinted footprint
+ * the persistent `SznFooterDecks` rail uses (via
+ * `FooterStylePlayerCard`) so the user sees the SAME card visual on
+ * the marquee that they've been managing in the bottom rail all
+ * week. Edge resolution mirrors the footer (overrides win, then the
+ * printed edge, with `team-logo` synthetics resolving to the player's
+ * franchise logo) so a Wildcard Sticker applied during the week
+ * shows up here too.
  */
 
 import { motion } from "motion/react";
 import { Trophy, Ghost as GhostIcon } from "lucide-react";
 import { useGameStore } from "../lib/gameStore";
-import { PlayerCard } from "./PlayerCard";
+import { FooterStylePlayerCard } from "./FooterStylePlayerCard";
+import { useSznGamepad } from "../lib/useSznGamepad";
+import { RARITY_BASE_VALUE, type RosterPlayer } from "../lib/run";
+import { isSznPlayer } from "../lib/sznPlayers";
+import { teamLogoEdge } from "../lib/sznTeams";
+import type { SznEdgeId } from "../lib/sznEdges";
+
+/**
+ * Resolve a roster slot into the {value, leftEdge, rightEdge} the
+ * FooterStylePlayerCard expects. Mirrors `rosterToFooterCard` inside
+ * `SznFooterDecks` so the marquee card matches the bottom-rail chip
+ * pixel-for-pixel: rarity base + permanent boost + score override for
+ * the big number, plus override-aware edges with `team-logo` resolved
+ * to the player's franchise logo.
+ */
+function footerCardPropsFor(rp: RosterPlayer): {
+  value: number;
+  leftEdge: SznEdgeId | null;
+  rightEdge: SznEdgeId | null;
+  teamCode: string | null;
+} {
+  const value =
+    RARITY_BASE_VALUE[rp.rarity] +
+    (rp.permanentBoost ?? 0) +
+    (rp.scoreOverride ?? 0);
+  let leftEdge: SznEdgeId | null = null;
+  let rightEdge: SznEdgeId | null = null;
+  if (isSznPlayer(rp.player)) {
+    const leftRaw = (rp.leftEdgeOverride ?? rp.player.leftEdge) as SznEdgeId;
+    const rightRaw = (rp.rightEdgeOverride ?? rp.player.rightEdge) as SznEdgeId;
+    leftEdge =
+      leftRaw === "team-logo" ? teamLogoEdge(rp.player.teamId) : leftRaw;
+    rightEdge =
+      rightRaw === "team-logo" ? teamLogoEdge(rp.player.teamId) : rightRaw;
+  }
+  // Team code lets the FooterStylePlayerCard paint with the team
+  // palette so the marquee starter cards match the in-combat
+  // `PlayerCard` and the persistent footer rail exactly. SZN players
+  // use `teamId`; legacy MLB players use `team`. Mirrors the lookup
+  // in `SznFooterDecks.rosterToFooterCard`.
+  const teamCode = isSznPlayer(rp.player) ? rp.player.teamId : rp.player.team;
+  return { value, leftEdge, rightEdge, teamCode: teamCode ?? null };
+}
 
 export function SeriesIntroScreen() {
   const run = useGameStore((s) => s.run);
+  const userTeam = useGameStore((s) => s.userTeam);
   const startSeries = useGameStore((s) => s.startSeries);
+  const visible =
+    !!run && run.day === "series" && !!run.series && !!run.ghost &&
+    !run.series.gameInProgress;
+  // CROSS = Play Ball. Priority 20 so the footer (0) can't accidentally
+  // steal the press, but anything modal (≥100) still wins.
+  useSznGamepad({
+    id: "series-intro-screen",
+    priority: 20,
+    enabled: visible,
+    handler: (btn) => {
+      if (btn === "CROSS") startSeries();
+    },
+  });
   if (!run || run.day !== "series" || !run.series || !run.ghost) return null;
   const ghost = run.ghost;
 
-  // Surface the active pitcher on each side. v1 picks the first
-  // pitcher entry from the roster -- that's the "ace" until we add
-  // rotation logic. If the ghost (or the user, after a sell) somehow
-  // has zero pitchers we fall back to the first roster slot so the
-  // tale-of-the-tape still renders something.
-  const userStarter = run.roster.find((r) => r.player.role === "Pitcher")
-    ?? run.roster[0];
-  const ghostStarter = ghost.roster.find((r) => r.player.role === "Pitcher")
-    ?? ghost.roster[0];
+  // Tonight's tale-of-the-tape: who is at the plate and who is on the
+  // mound. Derived from `userTeam` — the user bats first when AWAY
+  // (top of the 1st), which means the user's lead-off batter is in
+  // the box and the GHOST starting pitcher is on the mound for the
+  // opening at-bat. Mirror that when the user is HOME.
+  //
+  // Previously this screen labeled the USER's starting pitcher as
+  // "Starting Pitcher" regardless of which team was batting first, so
+  // a HOME user (who is pitching first) saw their batter card in the
+  // pitcher slot, and an AWAY user (batting first) saw their pitcher
+  // card with no batter callout for the opening at-bat.
+  const userIsAway = userTeam === "AWAY";
+  // The seat-that-owns-the-mound for the first at-bat is the HOME side.
+  const userOnMoundFirst = !userIsAway;
+  const userPitcher =
+    run.roster.find((r) => r.player.role === "Pitcher") ?? run.roster[0];
+  const userBatter =
+    run.roster.find((r) => r.player.role === "Batter") ?? run.roster[0];
+  const ghostPitcher =
+    ghost.roster.find((r) => r.player.role === "Pitcher") ?? ghost.roster[0];
+  const ghostBatter =
+    ghost.roster.find((r) => r.player.role === "Batter") ?? ghost.roster[0];
+
+  const userStarter = userOnMoundFirst ? userPitcher : userBatter;
+  const userSublabel = userOnMoundFirst
+    ? "Starting Pitcher"
+    : "Tonight's Leadoff";
+  const ghostStarter = userOnMoundFirst ? ghostBatter : ghostPitcher;
+  const ghostSublabel = userOnMoundFirst
+    ? "Tonight's Leadoff"
+    : "Ghost Ace";
 
   if (!userStarter || !ghostStarter) return null;
 
@@ -37,6 +127,19 @@ export function SeriesIntroScreen() {
       exit={{ opacity: 0 }}
       className="absolute inset-0 z-30 flex flex-col items-center justify-center px-4 dugout-font-base text-white pointer-events-auto overflow-hidden"
     >
+      {/* Solid dark backdrop -- the screen used to be transparent over
+          whatever was rendered underneath (Front Office grid, footer
+          rail) which made the tale-of-the-tape look like a floating
+          modal instead of the marquee "we are now in a series" beat
+          it was designed to be. Painting a near-opaque slate layer
+          isolates the matchup visually so the eye lands on the two
+          starter cards. The radial-gradient atmospheric layer sits
+          ON TOP of the dark backdrop so the green/purple shafts of
+          light still tint the scene. */}
+      <div
+        aria-hidden
+        className="absolute inset-0 bg-slate-950/95 pointer-events-none"
+      />
       {/* Atmospheric backdrop -- twin diagonal shafts of light, one
           per side, themed to the series tension. */}
       <div
@@ -67,7 +170,7 @@ export function SeriesIntroScreen() {
             className="dugout-font-sport text-4xl sm:text-6xl uppercase tracking-widest text-white mt-2"
             style={{ textShadow: "0 4px 18px rgba(0,0,0,0.8)" }}
           >
-            Game {run.series.gameIndex + 1} of 3
+            Game of the Week
           </motion.h2>
           <motion.p
             initial={{ opacity: 0 }}
@@ -76,29 +179,42 @@ export function SeriesIntroScreen() {
             className="text-sm text-slate-300 mt-1"
             style={{ textShadow: "0 1px 4px rgba(0,0,0,0.7)" }}
           >
-            Tonight's pitching matchup
+            {userOnMoundFirst
+              ? "You take the mound first"
+              : "You step to the plate first"}
           </motion.p>
         </div>
 
-        {/* Tale of the tape: user starter vs ghost starter. */}
+        {/* Tale of the tape: user starter vs ghost starter. Cards are
+            the same `FooterStylePlayerCard` chips the persistent
+            `SznFooterDecks` rail paints, so the marquee references
+            the same visual the user has been managing all week. */}
         <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-4 sm:gap-8 w-full">
           <StarterPanel
             label="You"
-            sublabel="Starting Pitcher"
+            sublabel={userSublabel}
             icon={<Trophy className="w-5 h-5 text-amber-300" />}
             tone="amber"
-            seriesScore={run.series.userGameWins}
           >
             <motion.div
               initial={{ x: -40, opacity: 0, rotateY: -25 }}
               animate={{ x: 0, opacity: 1, rotateY: 0 }}
               transition={{ delay: 0.25, type: "spring", stiffness: 240, damping: 22 }}
             >
-              <PlayerCard
-                player={userStarter.player}
-                tier={userStarter.tier}
-                showSockets={false}
-              />
+              {(() => {
+                const props = footerCardPropsFor(userStarter);
+                return (
+                  <FooterStylePlayerCard
+                    name={userStarter.player.name}
+                    role={userStarter.player.role}
+                    value={props.value}
+                    leftEdge={props.leftEdge}
+                    rightEdge={props.rightEdge}
+                    teamCode={props.teamCode}
+                    ariaLabel={`Your starter ${userStarter.player.name}`}
+                  />
+                );
+              })()}
             </motion.div>
           </StarterPanel>
 
@@ -125,26 +241,49 @@ export function SeriesIntroScreen() {
 
           <StarterPanel
             label={ghost.label}
-            sublabel="Ghost Ace"
+            sublabel={ghostSublabel}
             icon={<GhostIcon className="w-5 h-5 text-purple-300" />}
             tone="purple"
-            seriesScore={run.series.ghostGameWins}
           >
             <motion.div
               initial={{ x: 40, opacity: 0, rotateY: 25 }}
               animate={{ x: 0, opacity: 1, rotateY: 0 }}
               transition={{ delay: 0.25, type: "spring", stiffness: 240, damping: 22 }}
             >
-              <PlayerCard
-                player={ghostStarter.player}
-                tier={ghostStarter.tier}
-                showSockets={false}
-              />
+              {(() => {
+                const props = footerCardPropsFor(ghostStarter);
+                return (
+                  <FooterStylePlayerCard
+                    name={ghostStarter.player.name}
+                    role={ghostStarter.player.role}
+                    value={props.value}
+                    leftEdge={props.leftEdge}
+                    rightEdge={props.rightEdge}
+                    teamCode={props.teamCode}
+                    ariaLabel={`Opponent starter ${ghostStarter.player.name}`}
+                  />
+                );
+              })()}
             </motion.div>
           </StarterPanel>
         </div>
 
         {/* CTA */}
+        {run.mlbScoutingIntel && (
+          <motion.div
+            initial={{ y: 12, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            transition={{ delay: 0.5 }}
+            className="flex items-center gap-2 px-4 py-2 rounded-full border border-cyan-400/50 bg-cyan-900/40 text-cyan-100 shadow-[0_0_24px_rgba(34,211,238,0.35)] max-w-2xl text-center"
+            title="Faded Scouting Report"
+          >
+            <span aria-hidden className="text-base">🔎</span>
+            <span className="text-xs sm:text-sm font-bold uppercase tracking-wide">
+              {run.mlbScoutingIntel}
+            </span>
+          </motion.div>
+        )}
+
         <motion.button
           initial={{ scale: 0.9, opacity: 0 }}
           animate={{ scale: 1, opacity: 1 }}
@@ -164,7 +303,7 @@ export function SeriesIntroScreen() {
           transition={{ delay: 0.7 }}
           className="text-[10px] uppercase tracking-[0.4em] text-slate-500"
         >
-          First to 2 wins takes the series
+          Win the game, move the run record one game closer to the pennant
         </motion.p>
       </div>
     </motion.div>
@@ -176,20 +315,24 @@ function StarterPanel({
   sublabel,
   icon,
   tone,
-  seriesScore,
   children,
 }: {
   label: string;
   sublabel: string;
   icon: React.ReactNode;
   tone: "amber" | "purple";
-  seriesScore: number;
   children: React.ReactNode;
 }) {
   // Pre-baked literal class strings: Tailwind v4's JIT scanner only
   // emits classes it can see verbatim in the source, so building
   // `${accent.text}/80` at runtime previously generated zero CSS for
   // the sublabel. Both color-stop variants are spelled out below.
+  //
+  // The per-side "series" tally readout (e.g. "2") was removed when
+  // the weekend collapsed from a Bo3 series into a single Game of
+  // the Week — there's nothing to count between two halves of one
+  // game, and the run-level W/L lives in the persistent `RunHud`
+  // strip above.
   const accent =
     tone === "amber"
       ? {
@@ -223,18 +366,6 @@ function StarterPanel({
         {sublabel}
       </span>
       {children}
-      <div className="flex items-center gap-1 mt-2">
-        <span className="text-[10px] uppercase tracking-widest text-slate-400">
-          series
-        </span>
-        <span
-          className={`text-2xl font-black ${
-            tone === "amber" ? "text-amber-300" : "text-purple-300"
-          }`}
-        >
-          {seriesScore}
-        </span>
-      </div>
     </div>
   );
 }

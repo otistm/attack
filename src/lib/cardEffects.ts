@@ -1,6 +1,6 @@
 import { CardDefinition, TagLiteral } from "./cards";
 import { ShapeType } from "../components/cardShapes";
-import { canConnect, seamKey } from "./connect";
+import { canConnect, canConnectAny, seamKey } from "./connect";
 import type { ScoringContext } from "./scoring";
 import {
   batterTeamLead,
@@ -1199,7 +1199,7 @@ function buildGroupsFor(
   for (let i = 1; i < cards.length; i++) {
     const prev = cards[i - 1];
     const curr = cards[i];
-    const mechConnect = canConnect(prev, curr);
+    const mechConnect = canConnectAny(prev, curr);
     const userAffirmed =
       affirmedSeams === null ? true : affirmedSeams.has(seamKey(prev.id, curr.id));
     if (mechConnect && userAffirmed) {

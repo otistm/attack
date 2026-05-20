@@ -9,18 +9,16 @@
 import { SESSION_CARDS } from "./cards";
 import { BATTERS, PITCHERS } from "./players";
 import type {
-  ClassTag,
   GhostSnapshot,
   Item,
   RosterPlayer,
   RunState,
-  Tier,
-  WeekendScouting,
+  Rarity,
 } from "./run";
 import {
   STARTER_PACK_BATTERS,
   STARTER_PACK_PITCHERS,
-  TIER_ORDER,
+  RARITY_ORDER,
   makeRunId,
 } from "./run";
 
@@ -34,28 +32,28 @@ function sample<T>(arr: T[], n: number): T[] {
   return out;
 }
 
-function tierForRecord(wins: number, losses: number): Tier {
-  // Ghost tier loosely scales with opponent wins; a 5-win user faces silvers,
-  // 8-win user faces golds, etc. Losses pull the tier back to keep early
+function rarityForRecord(wins: number, losses: number): Rarity {
+  // Ghost rarity loosely scales with opponent wins; a 5-win user faces all-stars,
+  // 8-win user faces veterans, etc. Losses pull the rarity back to keep early
   // skids forgiving.
   const score = Math.max(0, wins - losses);
-  if (score >= 8) return "diamond";
-  if (score >= 5) return "gold";
-  if (score >= 2) return "silver";
-  return "bronze";
+  if (score >= 8) return "legend";
+  if (score >= 5) return "veteran";
+  if (score >= 2) return "allstar";
+  return "common";
 }
 
 function buildGhostRoster(wins: number, losses: number): RosterPlayer[] {
-  const baseTier = tierForRecord(wins, losses);
-  const baseIdx = TIER_ORDER.indexOf(baseTier);
+  const baseRarity = rarityForRecord(wins, losses);
+  const baseIdx = RARITY_ORDER.indexOf(baseRarity);
   const batters = sample(BATTERS, STARTER_PACK_BATTERS).map((p) => ({
     player: p,
-    tier: TIER_ORDER[Math.min(TIER_ORDER.length - 1, Math.max(0, baseIdx + (Math.random() < 0.3 ? 1 : 0)))],
+    rarity: RARITY_ORDER[Math.min(RARITY_ORDER.length - 1, Math.max(0, baseIdx + (Math.random() < 0.3 ? 1 : 0)))],
     tag: p.tag,
   }));
   const pitchers = sample(PITCHERS, STARTER_PACK_PITCHERS).map((p) => ({
     player: p,
-    tier: baseTier,
+    rarity: baseRarity,
     tag: p.tag,
   }));
   return [...batters, ...pitchers];
@@ -107,56 +105,12 @@ export function buildGhostSnapshot(run: RunState): GhostSnapshot {
   };
 }
 
-/** Class-tag copy for the opposing starter (pitcher) on the Monday report. */
-const PITCHER_SCOUT_COPY: Partial<Record<ClassTag, string>> = {
-  Strikeout:
-    "They run an elite swing-and-miss starter — expect chase pitches; contact and foul-management cards pay off.",
-  Control:
-    "Their ace is a weak-contact / groundball-leaning arm — stack launch angle and barrel paths if you have them.",
-  Starter:
-    "Workhorse starter who floods the zone — stamina answers and value depth in the chain matter.",
-  Veteran:
-    "Crafty veteran on the bump — reads sequencing; bring versatility, not one-trick shapes.",
-  Closer:
-    "Short-burst closer profile ported into a start — expect high-leverage stuff early; don't sleep on the first trip.",
-  Groundball:
-    "True groundball tendencies — keep the ball off the deck; lift and line-drive tools are at a premium.",
-};
-
-/**
- * Build the three-line Monday scouting brief from a ghost that is already
- * locked in for the upcoming series (same object used at-bat Fri–Sun).
- */
-export function weekendScoutingFromGhost(ghost: GhostSnapshot): WeekendScouting {
-  const pitcher = ghost.roster.find((r) => r.player.role === "Pitcher");
-  const batters = ghost.roster.filter((r) => r.player.role === "Batter");
-  const tag = pitcher?.tag ?? "Veteran";
-  const pitcherLine =
-    PITCHER_SCOUT_COPY[tag] ??
-    `Their listed starter profiles as ${tag} — shape your connectors for that tendency.`;
-
-  const counts = new Map<ClassTag, number>();
-  for (const b of batters) {
-    counts.set(b.tag, (counts.get(b.tag) ?? 0) + 1);
-  }
-  let bestTag: ClassTag = "Contact";
-  let bestN = 0;
-  for (const [t, n] of counts) {
-    if (n > bestN) {
-      bestTag = t;
-      bestN = n;
-    }
-  }
-  const synergyLine =
-    bestN >= 3
-      ? `Opponent synergy: ${bestTag}s — ${bestN} of 9 bats in that mold.`
-      : `Lineup leans ${bestTag} (${bestN} bats); the rest is mixed — shop for holes.`;
-
-  const cleanLabel = ghost.label.replace(/^Ghost:\s*/i, "").trim();
-  const opponentLine = `This weekend, you face the ${cleanLabel}.`;
-
-  return { opponentLine, pitcherLine, synergyLine };
-}
+// NOTE: The Monday scouting brief is no longer derived from the
+// weekend ghost. The report has been reframed as worldbuilding
+// flavor (league atmosphere + ability rumors + player buzz) and is
+// authored by `rollWeeklyScout` in `scouting.ts`. The ghost itself
+// is still built here and still drives the Fri-Sun series; only
+// the scouting text generation moved out.
 
 /**
  * Trigger script for the ghost during an at-bat. v1: dead simple — when
