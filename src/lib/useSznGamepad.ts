@@ -138,6 +138,53 @@ let prevButtons: boolean[] = [];
 let raf = 0;
 let seqCounter = 0;
 
+// ---- Gamepad presence broadcast --------------------------------------
+// Surfaces (toolbars, focus rings, controller hints) need to render
+// differently when a gamepad is actually connected vs not. We track
+// presence here so consumers can subscribe via `useGamepadPresent()`
+// without each one wiring its own connect / disconnect listener.
+//
+// We keep two sources of truth:
+//   1. The window-level 'gamepadconnected' / 'gamepaddisconnected'
+//      events. Reliable on Chrome / Edge for plug + unplug.
+//   2. A re-scan inside the per-frame tick that polls `getGamepads()`.
+//      Some browsers (Safari, Firefox under privacy modes) only
+//      surface a pad AFTER the user presses a button on it, so the
+//      connect event might fire late or not at all -- the in-tick
+//      rescan covers that fallback.
+let gamepadPresent = false;
+const presenceListeners = new Set<(present: boolean) => void>();
+
+function setGamepadPresent(next: boolean) {
+  if (gamepadPresent === next) return;
+  gamepadPresent = next;
+  for (const l of presenceListeners) {
+    try {
+      l(next);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[useSznGamepad] presence listener threw', err);
+    }
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('gamepadconnected', () => setGamepadPresent(true));
+  window.addEventListener('gamepaddisconnected', () => {
+    // Recompute from the live pad list rather than blindly flipping
+    // to false -- the user may have unplugged ONE of multiple pads.
+    const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    let any = false;
+    for (let i = 0; i < pads.length; i += 1) {
+      if (pads[i] && pads[i]!.connected) {
+        any = true;
+        break;
+      }
+    }
+    setGamepadPresent(any);
+  });
+}
+
 function tick() {
   raf = 0;
   if (handlers.size === 0) return;
@@ -157,6 +204,11 @@ function tick() {
     }
   }
   if (gp) {
+    // The tick loop is the most reliable place to detect "yes, a pad
+    // is actually live right now" -- Safari/Firefox sometimes never
+    // fire gamepadconnected, but they DO start populating getGamepads
+    // the moment the user touches the stick.
+    if (!gamepadPresent) setGamepadPresent(true);
     const cur = gp.buttons.map((b) => b.pressed);
     // Build a priority-DESC list of enabled handlers (ties broken by
     // latest registration via `seq`, so a freshly-mounted modal beats
@@ -206,6 +258,7 @@ function tick() {
   } else {
     // No pad → clear so a reconnect doesn't replay queued rising edges.
     prevButtons = [];
+    if (gamepadPresent) setGamepadPresent(false);
   }
   raf = requestAnimationFrame(tick);
 }
@@ -317,4 +370,33 @@ export function useFocusIndex(length: number, initial = 0) {
   };
 
   return [index, safeSet, helpers] as const;
+}
+
+/**
+ * Subscribe to gamepad-presence changes. Returns `true` while at
+ * least one connected pad is visible to the browser, `false` when
+ * none is present. Used by SZN at-bat surfaces to gate the amber
+ * controller-focus rings so mouse-only players never see them.
+ *
+ * The presence flag is updated from two sources (window-level
+ * gamepadconnected / gamepaddisconnected events AND the in-tick
+ * `getGamepads()` rescan), so a Safari user who only "appears" after
+ * pressing a button still flips the visuals on the first input
+ * frame.
+ */
+export function useGamepadPresent(): boolean {
+  const [present, setPresent] = useState(gamepadPresent);
+  useEffect(() => {
+    const listener = (p: boolean) => setPresent(p);
+    presenceListeners.add(listener);
+    // Sync once on subscribe in case the value changed between the
+    // useState initialiser and the effect attaching.
+    if (gamepadPresent !== present) setPresent(gamepadPresent);
+    return () => {
+      presenceListeners.delete(listener);
+    };
+    // We intentionally only subscribe once per mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return present;
 }

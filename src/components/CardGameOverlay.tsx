@@ -16,7 +16,7 @@ import { RARITY_BASE_VALUE } from '../lib/run';
 import { activeSynergies, teamBatterBonus, teamPitcherBonus } from '../lib/synergies';
 import { PLAYERS } from '../lib/players';
 import { ALL_SZN_PLAYERS, isSznPlayer } from '../lib/sznPlayers';
-import { useSznGamepad } from '../lib/useSznGamepad';
+import { useSznGamepad, useGamepadPresent } from '../lib/useSznGamepad';
 
 /**
  * Reveal-sequence orchestrator timing. Tuned so a typical 3-5 beat hand
@@ -960,29 +960,21 @@ export const CardGameOverlay = () => {
   const isRevealing = phase === 'revealing';
   const isResolved = phase === 'between-at-bats' || phase === 'game-over';
 
-  // Post-at-bat CTA controller binding. CROSS advances:
+  // Non-SZN post-at-bat CTA controller binding. CROSS advances:
   //   - between-at-bats   -> startNextAtBat
-  //   - game-over + SZN   -> reportSeriesGameResult (continues run)
   //   - game-over non-SZN -> setShowStartScreen(true) (back to lanes)
-  // Priority 10 sits above the always-on footer (0) so a clean Cross
-  // mid-result fires the CTA instead of the footer's Lock In (it's a
-  // no-op outside selecting anyway, but quieting the loop avoids the
-  // user wondering why nothing animated). Disabled in selecting
-  // phase so footer Lock In keeps its CROSS during selection.
+  // SZN runs go through the unified priority-60 handler below (which
+  // also drives hand-surface focus during the resolved phase). Keeping
+  // this one alive for non-SZN lanes preserves the Quick Match / Draft
+  // controller flow that was already shipped.
   useSznGamepad({
     id: 'card-game-overlay-cta',
     priority: 10,
-    enabled: isResolved,
+    enabled: isResolved && !sznRunActive,
     handler: (btn) => {
       if (btn !== 'CROSS') return;
       if (phase === 'between-at-bats') {
         startNextAtBat();
-      } else if (phase === 'game-over' && sznRunActive) {
-        reportSeriesGameResult(
-          seriesGameResult.result,
-          seriesGameResult.userScore,
-          seriesGameResult.ghostScore,
-        );
       } else if (phase === 'game-over') {
         setShowStartScreen(true);
       }
@@ -1091,20 +1083,27 @@ export const CardGameOverlay = () => {
 
   const batterCardIds = useMemo(() => new Set(batterHand.map((c) => c.id)), [batterHand]);
 
-  // ---- In-game (selecting-phase) controller surface ---------------------
-  // Two new gamepad capabilities specific to SZN's selecting phase:
-  //   1. Lock In on CROSS from the default 'screen' surface, so the user
-  //      can commit the swing without ever touching the mouse.
-  //   2. A new 'hand' focus surface that walks the cards in the user's
-  //      hand, lets the user "grab" one with SQUARE, then shift it left/
-  //      right with the DPAD. Drop fires affirmDraggedCard, which is the
-  //      same store action mouse drag uses on drop -- so chains snap
-  //      with identical seam-affirm semantics, scoring math, and
-  //      animations as Quick Play's drag-to-snap.
+  // ---- In-game controller surface (selecting + resolved) ---------------
+  // Two new gamepad capabilities for SZN's selecting AND resolved
+  // phases:
+  //   1. 'screen' surface CROSS fires whichever CTA is on-screen: Lock
+  //      In while selecting; Next At-Bat / Continue Run / New Game once
+  //      resolved. The visible button itself also paints an amber focus
+  //      ring whenever this surface is active, so the user can SEE what
+  //      Cross is going to do (the playtest complaint was "I can't tell
+  //      where the cursor is").
+  //   2. A 'hand' focus surface that walks the cards in the user's
+  //      hand. During selecting, SQUARE grabs and DPAD shifts the
+  //      grabbed card via the same reorderUser + affirmDraggedCard path
+  //      mouse drag uses, so chains snap with identical seam-affirm
+  //      semantics. During the resolved phase the hand is read-only
+  //      (the strip is `disabled`), so SQUARE is a no-op and we expose
+  //      navigation-only so the user can still review the cards that
+  //      just played.
   //
-  // We model the focus/grab as IDs (not indices) so the highlight
-  // follows the card across reorders / SZN deal/recall hand mutations.
-  // The derived index is recomputed every render against the live hand.
+  // Focus/grab are tracked by id (not index) so the highlight follows
+  // the card across reorders / SZN deal/recall hand mutations. The
+  // derived index is recomputed every render against the live hand.
   const sznGamepadFocus = useGameStore((s) => s.sznGamepadFocus);
   const setSznGamepadFocus = useGameStore((s) => s.setSznGamepadFocus);
   const [gamepadFocusedHandCardId, setGamepadFocusedHandCardId] = useState<
@@ -1114,28 +1113,36 @@ export const CardGameOverlay = () => {
     string | null
   >(null);
 
-  // Drop the hand focus when the user leaves the at-bat selecting phase
-  // (reveal, between-at-bats, game-over). Without this, the amber ring
-  // would persist into the reveal animation and look like the engine
-  // was pointing at a card.
+  // Reset focus + grab + surface on at-bat boundaries. atBatId
+  // increments every time `startNextAtBat` fires, so this fires once
+  // per new at-bat and lands the controller back on the 'screen'
+  // surface (Lock In). Without this, a player who left focus on the
+  // hand at the end of one at-bat would still be on 'hand' surface on
+  // the next, and CROSS would lock in immediately on the first press.
   useEffect(() => {
-    if (!isSelecting) {
-      setGamepadFocusedHandCardId(null);
+    setGamepadFocusedHandCardId(null);
+    setGamepadGrabbedHandCardId(null);
+    if (sznGamepadFocus === 'hand') setSznGamepadFocus('screen');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [atBatId]);
+
+  // Drop grab state when the hand becomes read-only (revealing,
+  // between-at-bats, game-over). Focus itself is preserved across
+  // resolve so the user can navigate cards while results are on
+  // screen -- only the in-progress grab needs to be cancelled because
+  // the strip stops accepting reorders.
+  const handReorderable = isSelecting;
+  useEffect(() => {
+    if (!handReorderable && gamepadGrabbedHandCardId !== null) {
       setGamepadGrabbedHandCardId(null);
-      // Also release the 'hand' surface so the next at-bat starts on
-      // the default 'screen' surface (Lock In). Leaving it on 'hand'
-      // would hijack the next at-bat's DPAD before the new hand even
-      // drew.
-      if (sznGamepadFocus === 'hand') setSznGamepadFocus('screen');
     }
-  }, [isSelecting, sznGamepadFocus, setSznGamepadFocus]);
+  }, [handReorderable, gamepadGrabbedHandCardId]);
 
   // Reconcile the focused / grabbed IDs against the live hand. If the
   // focused card disappeared (recalled to the bag, transformed away by
   // an ability, or the player anchor got swapped), snap focus to a
   // sensible neighbor instead of stranding the ring on a ghost id.
   useEffect(() => {
-    if (!isSelecting) return;
     const ids = userHand.map((c) => c.id);
     if (ids.length === 0) {
       if (gamepadFocusedHandCardId !== null) setGamepadFocusedHandCardId(null);
@@ -1148,12 +1155,7 @@ export const CardGameOverlay = () => {
     if (gamepadGrabbedHandCardId && !ids.includes(gamepadGrabbedHandCardId)) {
       setGamepadGrabbedHandCardId(null);
     }
-  }, [
-    isSelecting,
-    userHand,
-    gamepadFocusedHandCardId,
-    gamepadGrabbedHandCardId,
-  ]);
+  }, [userHand, gamepadFocusedHandCardId, gamepadGrabbedHandCardId]);
 
   // Helper: move the grabbed card by `dir` (-1 left, +1 right) within
   // the current user hand, push the new order through the store's
@@ -1182,31 +1184,65 @@ export const CardGameOverlay = () => {
     [gamepadGrabbedHandCardId, userHand, reorderUser, affirmDraggedCard],
   );
 
-  // Unified in-selection handler. Sits ABOVE the SznFooterDecks router
+  // Resolved-phase CTA dispatcher. Mirrors the on-screen Next At-Bat /
+  // Continue Run / New Game branches so CROSS from any in-game surface
+  // fires the same action the user would click. Kept inside the
+  // component (not pulled into a top-level helper) because it closes
+  // over a handful of store-bound callbacks + the memoised
+  // seriesGameResult tuple.
+  const fireResolvedCta = useCallback(() => {
+    if (phase === 'between-at-bats') {
+      startNextAtBat();
+      return;
+    }
+    if (phase === 'game-over' && sznRunActive) {
+      reportSeriesGameResult(
+        seriesGameResult.result,
+        seriesGameResult.userScore,
+        seriesGameResult.ghostScore,
+      );
+      return;
+    }
+    if (phase === 'game-over') {
+      setShowStartScreen(true);
+    }
+  }, [
+    phase,
+    sznRunActive,
+    startNextAtBat,
+    reportSeriesGameResult,
+    seriesGameResult,
+    setShowStartScreen,
+  ]);
+
+  // Unified in-game handler. Sits ABOVE the SznFooterDecks router
   // (priority 50) so it wins DPAD_DOWN from the 'hand' surface
   // (re-routes back to 'screen' instead of dropping into the rail), and
-  // wins CROSS from the 'screen' surface so the user gets Lock In
-  // without the footer's default Cross deal stealing focus. When the
-  // player is on 'footer' surface, we explicitly return false so the
-  // footer router keeps driving its rail navigation.
+  // wins CROSS from the 'screen' surface so the user gets Lock In /
+  // Next At-Bat without the footer's default Cross deal stealing
+  // focus. When the player is on 'footer' surface, we explicitly
+  // return false so the footer router keeps driving its rail
+  // navigation.
   useSznGamepad({
     id: 'card-game-overlay-selecting',
     priority: 60,
-    enabled: sznRunActive && isSelecting,
+    enabled: sznRunActive && (isSelecting || isResolved),
     handler: (btn) => {
       if (sznGamepadFocus === 'footer') return false;
 
-      // 'screen' surface: lock in / drop into the hand.
+      // 'screen' surface: fire the visible primary CTA, or pop into
+      // the hand for review/rearrange.
       if (sznGamepadFocus === 'screen') {
         if (btn === 'CROSS') {
-          lockIn();
+          if (isSelecting) lockIn();
+          else fireResolvedCta();
           return true;
         }
         if (btn === 'DPAD_UP') {
           if (userHand.length === 0) return false;
-          // Restore the previous focus if the card is still there, else
-          // seed the rightmost card so the player lands on the most
-          // recently dealt ability rather than the player anchor.
+          // Restore the previous focus if the card is still there,
+          // else seed the rightmost card so the player lands on the
+          // most recently dealt ability rather than the player anchor.
           const ids = userHand.map((c) => c.id);
           const restore =
             gamepadFocusedHandCardId && ids.includes(gamepadFocusedHandCardId)
@@ -1216,9 +1252,9 @@ export const CardGameOverlay = () => {
           setSznGamepadFocus('hand');
           return true;
         }
-        // DPAD_DOWN / TRIANGLE / etc. fall through so the footer router
-        // can intercept them (its priority-50 listener handles the
-        // rail drop-in + collapse toggle).
+        // DPAD_DOWN / TRIANGLE / etc. fall through so the footer
+        // router can intercept them (its priority-50 listener handles
+        // the rail drop-in + collapse toggle).
         return false;
       }
 
@@ -1226,8 +1262,8 @@ export const CardGameOverlay = () => {
       const grabbing = gamepadGrabbedHandCardId !== null;
 
       // Move mode: lock the user into LEFT/RIGHT shift + drop/cancel.
-      // Mirrors the footer's move-mode lockdown so a held card can't be
-      // stranded by an accidental DPAD_UP into another surface.
+      // Mirrors the footer's move-mode lockdown so a held card can't
+      // be stranded by an accidental DPAD_UP into another surface.
       if (grabbing) {
         switch (btn) {
           case 'DPAD_LEFT':
@@ -1239,14 +1275,16 @@ export const CardGameOverlay = () => {
           case 'SQUARE':
           case 'CROSS':
             // Drop in place. The grabbed card already affirmed its
-            // seams on every shift, so dropping just clears grab state.
+            // seams on every shift, so dropping just clears grab
+            // state.
             setGamepadGrabbedHandCardId(null);
             return true;
           case 'CIRCLE':
             // Cancel: same drop semantics. We don't unwind the moves
             // because each shift was already a real reorder under the
             // hood; reverting would surprise the user more than it'd
-            // help. The grabbed-state clears so DPAD goes back to nav.
+            // help. The grabbed-state clears so DPAD goes back to
+            // nav.
             setGamepadGrabbedHandCardId(null);
             return true;
           case 'DPAD_UP':
@@ -1283,10 +1321,11 @@ export const CardGameOverlay = () => {
           return true;
         }
         case 'SQUARE': {
-          // Grab the focused card. Cards in the hand are reorderable
-          // by mouse-drag too, so there's no "this card can't be
-          // grabbed" special-case here -- including the player anchor,
-          // which the engine treats as just another hand position.
+          // Grab the focused card. Only meaningful while the hand is
+          // reorderable (selecting phase); during reveal/result the
+          // strip ignores reorders, so we silently consume the press
+          // instead of leaving a phantom violet ring.
+          if (!handReorderable) return true;
           if (ids.length === 0) return true;
           const id = ids[safeIdx];
           if (!id) return true;
@@ -1294,10 +1333,17 @@ export const CardGameOverlay = () => {
           return true;
         }
         case 'CROSS': {
-          // CROSS priority: trigger an open USE prompt on the focused
-          // card if there is one (matches clicking the in-hand USE
-          // pill), otherwise fall through to Lock In so the user can
-          // commit the swing without leaving the hand surface.
+          // CROSS priority:
+          //  - During selecting: USE prompt on the focused card if
+          //    one is pending, else Lock In (commit without leaving
+          //    the hand surface).
+          //  - During resolved: fire the visible CTA (Next At-Bat /
+          //    Continue Run / New Game) so the user can advance from
+          //    the hand surface too.
+          if (!isSelecting) {
+            fireResolvedCta();
+            return true;
+          }
           const id = ids[safeIdx];
           if (id && userPendingChoiceIds.has(id)) {
             triggerChoice(id);
@@ -1307,18 +1353,19 @@ export const CardGameOverlay = () => {
           return true;
         }
         case 'CIRCLE': {
-          // Back out to the 'screen' surface (Lock In default focus).
+          // Back out to the 'screen' surface (Lock In / CTA default
+          // focus).
           setSznGamepadFocus('screen');
           return true;
         }
         case 'DPAD_UP':
         case 'DPAD_DOWN': {
           // Either direction backs out of the hand surface. DPAD_DOWN
-          // additionally feeds the footer router on the NEXT press (the
-          // user can chain DPAD_DOWN twice to skip from hand into the
-          // rail). We don't auto-drop into the footer here because the
-          // intermediate 'screen' surface holds the Lock In CTA, which
-          // is the more common target after rearranging.
+          // additionally feeds the footer router on the NEXT press
+          // (the user can chain DPAD_DOWN twice to skip from hand
+          // into the rail). We don't auto-drop into the footer here
+          // because the intermediate 'screen' surface holds the CTA,
+          // which is the more common target after rearranging.
           setSznGamepadFocus('screen');
           return true;
         }
@@ -1327,6 +1374,18 @@ export const CardGameOverlay = () => {
       }
     },
   });
+
+  // Derived: the 'screen' surface has focus on the visible CTA button.
+  // Used by the Lock In / Next At-Bat / Continue Run / New Game JSX
+  // below to paint an amber ring + glow that matches the hand card
+  // focus visual, so CROSS's target is never ambiguous.
+  //
+  // Gated on `useGamepadPresent()` so mouse-only players never see
+  // the amber halo on their primary button -- the ring is purely a
+  // controller affordance.
+  const gamepadPresent = useGamepadPresent();
+  const screenCtaFocused =
+    sznRunActive && gamepadPresent && sznGamepadFocus === 'screen';
 
   /** SZN: flat team tag bonus folded into the matchup pill via `sznSideBonus`. */
   const userSznRosterSynergyAmount = useMemo(() => {
@@ -1691,14 +1750,19 @@ export const CardGameOverlay = () => {
               // distinct regions (value, shapes, ability hover panel).
               tutorialFirstCard={true}
               // Controller surface: amber ring on focused card, violet
-              // ring + pulse on grabbed card. Both are no-ops outside
-              // selecting (the gamepad handler clears these IDs the
-              // moment the phase advances), so the reveal sequence
-              // never inherits a stale highlight.
+              // ring + pulse on grabbed card. Gated on
+              // `gamepadPresent` so a disconnect (or mouse-only player)
+              // never leaves a stale highlight on the strip; entering
+              // the 'hand' surface also requires gamepad DPAD_UP, so
+              // this is the canonical "controller is driving" check.
               gamepadFocusedCardId={
-                sznGamepadFocus === 'hand' ? gamepadFocusedHandCardId : null
+                gamepadPresent && sznGamepadFocus === 'hand'
+                  ? gamepadFocusedHandCardId
+                  : null
               }
-              gamepadGrabbedCardId={gamepadGrabbedHandCardId}
+              gamepadGrabbedCardId={
+                gamepadPresent ? gamepadGrabbedHandCardId : null
+              }
             />
           </div>
 
@@ -1711,13 +1775,15 @@ export const CardGameOverlay = () => {
                 exit={{ opacity: 0, y: 10 }}
                 className="flex flex-col items-center gap-2"
               >
-                <button
+                <CtaButton
                   data-tutorial="lock-in"
                   onClick={lockIn}
-                  className="px-12 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-full shadow-lg shadow-blue-900/50 transition-all hover:scale-105 active:scale-95 text-lg uppercase tracking-wider"
+                  focused={screenCtaFocused}
+                  tone="blue"
+                  size="lg"
                 >
                   Lock In
-                </button>
+                </CtaButton>
                 {sznRunActive && !tutorialActive && (
                   <QuickResolveToggle
                     enabled={quickResolveEnabled}
@@ -1758,14 +1824,16 @@ export const CardGameOverlay = () => {
                 className="flex items-center gap-3"
               >
                 {phase === 'between-at-bats' ? (
-                  <button
+                  <CtaButton
                     onClick={startNextAtBat}
-                    className="px-10 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-full shadow-lg uppercase tracking-wider text-sm transition-all hover:scale-105 active:scale-95"
+                    focused={screenCtaFocused}
+                    tone="emerald"
+                    size="md"
                   >
                     Next At-Bat
-                  </button>
+                  </CtaButton>
                 ) : sznRunActive ? (
-                  <button
+                  <CtaButton
                     onClick={() =>
                       reportSeriesGameResult(
                         seriesGameResult.result,
@@ -1773,17 +1841,21 @@ export const CardGameOverlay = () => {
                         seriesGameResult.ghostScore,
                       )
                     }
-                    className="px-10 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-full shadow-lg uppercase tracking-wider text-sm transition-all hover:scale-105 active:scale-95"
+                    focused={screenCtaFocused}
+                    tone="emerald"
+                    size="md"
                   >
                     Continue Run
-                  </button>
+                  </CtaButton>
                 ) : (
-                  <button
+                  <CtaButton
                     onClick={() => setShowStartScreen(true)}
-                    className="px-10 py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-bold rounded-full shadow-lg uppercase tracking-wider text-sm transition-all hover:scale-105 active:scale-95"
+                    focused={screenCtaFocused}
+                    tone="rose"
+                    size="md"
                   >
                     New Game
-                  </button>
+                  </CtaButton>
                 )}
               </motion.div>
             )}
@@ -3693,41 +3765,120 @@ const HandCard = ({
 };
 
 /**
+ * Lock In / Next At-Bat / Continue Run / New Game pill. Wraps a plain
+ * <button> with a tone-aware base style + an OPTIONAL controller focus
+ * affordance (`focused`). When `focused` is true the button gets a
+ * bright amber ring + animated halo + scale-up so a controller user
+ * can see at a glance which CTA CROSS will fire. When `focused` is
+ * false the button renders exactly like the original inline JSX did,
+ * so mouse-only players see no behavioural change.
+ */
+type CtaTone = 'blue' | 'emerald' | 'rose';
+type CtaSize = 'md' | 'lg';
+
+const CTA_TONE_BASE: Record<CtaTone, string> = {
+  blue: 'bg-blue-600 hover:bg-blue-500 shadow-blue-900/50',
+  emerald: 'bg-emerald-600 hover:bg-emerald-500',
+  rose: 'bg-rose-600 hover:bg-rose-500',
+};
+
+const CTA_SIZE_BASE: Record<CtaSize, string> = {
+  md: 'px-10 py-2.5 text-sm',
+  lg: 'px-12 py-3 text-lg',
+};
+
+function CtaButton({
+  onClick,
+  focused,
+  tone,
+  size,
+  children,
+  ...rest
+}: {
+  onClick: () => void;
+  focused: boolean;
+  tone: CtaTone;
+  size: CtaSize;
+  children: React.ReactNode;
+  'data-tutorial'?: string;
+}) {
+  return (
+    <motion.button
+      type="button"
+      onClick={onClick}
+      animate={
+        focused
+          ? {
+              scale: [1.04, 1.08, 1.04],
+              transition: { duration: 1.2, repeat: Infinity, ease: 'easeInOut' },
+            }
+          : { scale: 1, transition: { duration: 0.2 } }
+      }
+      whileHover={{ scale: focused ? 1.1 : 1.05 }}
+      whileTap={{ scale: 0.95 }}
+      className={`${CTA_SIZE_BASE[size]} ${CTA_TONE_BASE[tone]} text-white font-bold rounded-full shadow-lg uppercase tracking-wider relative ${
+        focused
+          ? 'ring-4 ring-amber-300 ring-offset-2 ring-offset-transparent shadow-[0_0_28px_8px_rgba(252,211,77,0.7)]'
+          : ''
+      }`}
+      {...rest}
+    >
+      {children}
+    </motion.button>
+  );
+}
+
+/**
  * Controller focus / grab indicator. Renders as a pointer-events-none
  * overlay so it never steals clicks from the underlying CardItem (the
  * card must stay mouse-draggable and hover-tooltip-able). Two visual
  * states:
- *  - focused (grabbed=false): amber 2-pixel ring + soft glow, the
- *    "D-Pad cursor sits on this card" hint.
- *  - grabbed (grabbed=true): violet ring + pulsing glow, the "SQUARE
- *    picked this up, DPAD LEFT/RIGHT shifts it" affordance. Mirrors the
- *    footer's grab visual so the controller language stays uniform
- *    across surfaces.
+ *  - focused (grabbed=false): amber 4-pixel ring + bright glow with a
+ *    subtle constant pulse so the D-Pad cursor is impossible to miss
+ *    against the busy at-bat surface (the previous 2-pixel ring was
+ *    drowning behind player card art / shape chips during playtest).
+ *  - grabbed (grabbed=true): violet ring + stronger pulsing glow, the
+ *    "SQUARE picked this up, DPAD LEFT/RIGHT shifts it" affordance.
+ *    Mirrors the footer's grab visual so the controller language stays
+ *    uniform across surfaces.
+ *
+ * We render the ring slightly OUTSIDE the card (-inset-1.5 + scale up)
+ * so the bright border doesn't crop the underlying card art — important
+ * because the previous inset:0 ring was sitting on top of the value
+ * pill and shape-connector chips, which optically dimmed it.
  */
 function GamepadFocusRing({ grabbed }: { grabbed: boolean }) {
   return (
     <motion.div
       key={grabbed ? 'grabbed' : 'focused'}
-      initial={{ opacity: 0, scale: 0.95 }}
+      initial={{ opacity: 0, scale: 0.92 }}
       animate={
         grabbed
           ? {
               opacity: [0.9, 1, 0.9],
-              scale: [1.02, 1.05, 1.02],
+              scale: [1.04, 1.08, 1.04],
               transition: {
-                duration: 0.9,
+                duration: 0.8,
                 repeat: Infinity,
                 ease: 'easeInOut',
               },
             }
-          : { opacity: 1, scale: 1.02 }
+          : {
+              opacity: [0.85, 1, 0.85],
+              scale: [1.02, 1.04, 1.02],
+              transition: {
+                duration: 1.4,
+                repeat: Infinity,
+                ease: 'easeInOut',
+              },
+            }
       }
-      exit={{ opacity: 0, scale: 0.95 }}
+      exit={{ opacity: 0, scale: 0.92 }}
       transition={{ duration: 0.15 }}
-      className={`pointer-events-none absolute inset-0 z-30 rounded-xl border-2 ${
+      className={`pointer-events-none absolute -inset-1.5 z-40 rounded-2xl border-4 ${
         grabbed
-          ? 'border-violet-300 shadow-[0_0_20px_4px_rgba(167,139,250,0.55)]'
-          : 'border-amber-300 shadow-[0_0_14px_2px_rgba(252,211,77,0.45)]'
+          ? 'border-violet-300 shadow-[0_0_32px_8px_rgba(167,139,250,0.85),inset_0_0_18px_rgba(167,139,250,0.55)]'
+          : 'border-amber-300 shadow-[0_0_28px_8px_rgba(252,211,77,0.85),inset_0_0_14px_rgba(252,211,77,0.45)]'
       }`}
       aria-hidden
     />
