@@ -815,6 +815,10 @@ const CardItem = ({
 
 /** Brawl Mode snap window before auto-lock. Shared by timer + hint UI. */
 const BRAWL_SNAP_DURATION_MS = 15000;
+/** How often the AI re-optimizes its hand against the user's current layout. */
+const BRAWL_AI_REEVAL_MS = 2500;
+/** Delay between each opponent card shuffle / seam snap during selection. */
+const BRAWL_OPPONENT_ARRANGE_STEP_MS = 420;
 /** Show "snap to attack" nudge when timer drops below this threshold. */
 const BRAWL_SNAP_HINT_THRESHOLD_MS = 5000;
 
@@ -946,6 +950,8 @@ export const CardGameOverlay = () => {
   // chained, and dispatches `affirmDraggedCard` on drag-end so the seam set
   // refreshes against the new layout.
   const affirmedSeams = useGameStore((s) => s.affirmedSeams);
+  const brawlOpponentSeams = useGameStore((s) => s.brawlOpponentSeams);
+  const brawlOpponentPlanHand = useGameStore((s) => s.brawlOpponentPlanHand);
   const affirmDraggedCard = useGameStore((s) => s.affirmDraggedCard);
   // Bag <-> hand recall. The footer rail's CROSS / mouse-click already
   // wires the deal direction (bag -> hand); the in-hand controller
@@ -1003,6 +1009,8 @@ export const CardGameOverlay = () => {
       awayScore,
       inning,
       affirmedSeams,
+      brawlOpponentSeams,
+      brawlOpponentPlanHand,
     ],
   );
   const batterPreview = matchup.batterScoringResult;
@@ -1986,15 +1994,29 @@ export const CardGameOverlay = () => {
             />
           </div>
           <div data-tutorial="opponent-hand" data-brawl-hand="opponent">
-            <FlipPitcherStrip
-              hand={aiHand}
-              modifiers={aiModifiers}
-              revealed={!isSelecting}
-              atBatId={atBatId}
-              compact
-              valueOverrides={aiValueOverrides}
-              highlightTones={aiHighlights}
-            />
+            {brawlMode && isSelecting ? (
+              <BrawlOpponentArrangeStrip
+                dealtHand={aiHand}
+                planHand={
+                  brawlOpponentPlanHand.length > 0 ? brawlOpponentPlanHand : aiHand
+                }
+                planSeams={brawlOpponentSeams}
+                modifiers={aiModifiers}
+                atBatId={atBatId}
+                compact
+              />
+            ) : (
+              <FlipPitcherStrip
+                hand={aiHand}
+                modifiers={aiModifiers}
+                revealed={!isSelecting}
+                atBatId={atBatId}
+                compact
+                valueOverrides={aiValueOverrides}
+                highlightTones={aiHighlights}
+                affirmedSeams={brawlMode ? brawlOpponentSeams : undefined}
+              />
+            )}
           </div>
         </div>
       </motion.div>
@@ -2493,6 +2515,7 @@ function BrawlSnapTimer({
   /** Fires every animation frame while selecting so sibling UI (hints) can react. */
   onRemainingMsChange?: (ms: number) => void;
 }) {
+  const prepareBrawlOpponent = useGameStore((s) => s.prepareBrawlOpponent);
   const [remainingMs, setRemainingMs] = useState(BRAWL_SNAP_DURATION_MS);
   const firedRef = useRef(false);
   const onTimeoutRef = useRef(onTimeout);
@@ -2503,6 +2526,15 @@ function BrawlSnapTimer({
   useEffect(() => {
     onRemainingMsChangeRef.current = onRemainingMsChange;
   }, [onRemainingMsChange]);
+
+  // Re-run the brawl optimizer while the user rearranges cards so the
+  // opponent adapts to the player's current order and forged seams.
+  useEffect(() => {
+    if (phase !== 'selecting') return;
+    prepareBrawlOpponent();
+    const id = window.setInterval(() => prepareBrawlOpponent(), BRAWL_AI_REEVAL_MS);
+    return () => window.clearInterval(id);
+  }, [phase, atBatId, prepareBrawlOpponent]);
 
   // Drive the countdown off a fresh start time each time we (re)enter
   // selecting. Without re-anchoring, the user could "save" leftover
@@ -4367,6 +4399,27 @@ function buildEntryConfig(
   };
 }
 
+/** Milliseconds until the last card in a strip finishes its deal-in spring. */
+function computeHandDealCompleteMs(hand: CardDefinition[]): number {
+  if (hand.length === 0) return 0;
+  const signatureCount = hand.filter((c) => c.abilityType !== 'General Draw').length;
+  const lastSigIdx = Math.max(signatureCount - 1, 0);
+  const signaturesEndAt = SIGNATURE_DELAY_CHILDREN + lastSigIdx * SIGNATURE_STAGGER;
+  const signaturesSettled = signaturesEndAt + SIGNATURE_SETTLE_PAD;
+
+  let maxDelaySec = 0;
+  for (let mountIndex = 0; mountIndex < hand.length; mountIndex++) {
+    const isGeneral = hand[mountIndex].abilityType === 'General Draw';
+    const delay = isGeneral
+      ? signaturesSettled +
+        Math.max(mountIndex - signatureCount, 0) * GENERAL_STAGGER
+      : SIGNATURE_DELAY_CHILDREN + mountIndex * SIGNATURE_STAGGER;
+    maxDelaySec = Math.max(maxDelaySec, delay);
+  }
+  // Buffer for the spring to settle after the last card's delayed start.
+  return Math.ceil(maxDelaySec * 1000 + 650);
+}
+
 function makeItemExitTransition(reverseStaggerCount: number, index: number) {
   return {
     duration: 0.28,
@@ -4405,7 +4458,197 @@ interface FlipPitcherStripProps {
   valueOverrides?: Record<string, number>;
   /** Reveal-sequence per-card highlight tones, keyed by card id. */
   highlightTones?: Record<string, 'source' | 'target'>;
+  /** When set, only affirmed adjacent pairs render as connected. */
+  affirmedSeams?: ReadonlySet<string>;
 }
+
+/** Move one card one slot closer to its target index in `plan`. */
+function stepHandTowardPlan(
+  display: CardDefinition[],
+  plan: CardDefinition[],
+): { hand: CardDefinition[]; movedId: string | null } {
+  for (let i = 0; i < plan.length; i++) {
+    if (display[i]?.id === plan[i]?.id) continue;
+    const targetId = plan[i].id;
+    const currentIdx = display.findIndex((c) => c.id === targetId);
+    if (currentIdx === -1) return { hand: display, movedId: null };
+    const next = [...display];
+    if (currentIdx > i) {
+      [next[currentIdx - 1], next[currentIdx]] = [next[currentIdx], next[currentIdx - 1]];
+    } else {
+      [next[currentIdx], next[currentIdx + 1]] = [next[currentIdx + 1], next[currentIdx]];
+    }
+    return { hand: next, movedId: targetId };
+  }
+  return { hand: display, movedId: null };
+}
+
+function nextOpponentSeamToAffirm(
+  hand: CardDefinition[],
+  displaySeams: ReadonlySet<string>,
+  planSeams: ReadonlySet<string>,
+): string | null {
+  for (let i = 1; i < hand.length; i++) {
+    const key = seamKey(hand[i - 1].id, hand[i].id);
+    if (
+      planSeams.has(key) &&
+      !displaySeams.has(key) &&
+      canConnectAny(hand[i - 1], hand[i])
+    ) {
+      return key;
+    }
+  }
+  return null;
+}
+
+interface BrawlOpponentArrangeStripProps {
+  dealtHand: CardDefinition[];
+  planHand: CardDefinition[];
+  planSeams: ReadonlySet<string>;
+  modifiers: Record<string, { value: number; color?: string }>;
+  atBatId: number;
+  compact?: boolean;
+}
+
+/**
+ * Brawl snap phase: opponent cards deal in loose, then shuffle and forge
+ * seams face-down toward the AI plan — mirroring the user's snap UX.
+ */
+const BrawlOpponentArrangeStrip = ({
+  dealtHand,
+  planHand,
+  planSeams,
+  modifiers,
+  atBatId,
+  compact = true,
+}: BrawlOpponentArrangeStripProps) => {
+  const [displayHand, setDisplayHand] = useState(dealtHand);
+  const [displaySeams, setDisplaySeams] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
+  const [arrangingId, setArrangingId] = useState<string | null>(null);
+  const [dealComplete, setDealComplete] = useState(false);
+  const displayHandRef = useRef(displayHand);
+  const displaySeamsRef = useRef(displaySeams);
+  displayHandRef.current = displayHand;
+  displaySeamsRef.current = displaySeams;
+
+  useEffect(() => {
+    setDisplayHand(dealtHand);
+    setDisplaySeams(new Set());
+    setArrangingId(null);
+    setDealComplete(false);
+  }, [atBatId, dealtHand]);
+
+  // Wait for the staggered deal-in (signature fly + general draws) to finish
+  // before the opponent starts shuffling cards into their target layout.
+  useEffect(() => {
+    const ms = computeHandDealCompleteMs(dealtHand);
+    const t = window.setTimeout(() => setDealComplete(true), ms);
+    return () => window.clearTimeout(t);
+  }, [atBatId, dealtHand]);
+
+  useEffect(() => {
+    if (!arrangingId) return;
+    const t = window.setTimeout(() => setArrangingId(null), 320);
+    return () => window.clearTimeout(t);
+  }, [arrangingId]);
+
+  useEffect(() => {
+    if (!dealComplete) return;
+    const effectivePlan = planHand.length > 0 ? planHand : dealtHand;
+    const tick = () => {
+      const current = displayHandRef.current;
+      const orderMatch =
+        current.length === effectivePlan.length &&
+        current.every((c, i) => c.id === effectivePlan[i]?.id);
+
+      if (!orderMatch) {
+        const { hand: next, movedId } = stepHandTowardPlan(current, effectivePlan);
+        if (movedId) setArrangingId(movedId);
+        setDisplayHand(next);
+        return;
+      }
+
+      const seamKeyToAdd = nextOpponentSeamToAffirm(
+        current,
+        displaySeamsRef.current,
+        planSeams,
+      );
+      if (seamKeyToAdd) {
+        for (let i = 1; i < current.length; i++) {
+          if (seamKey(current[i - 1].id, current[i].id) === seamKeyToAdd) {
+            setArrangingId(current[i].id);
+            break;
+          }
+        }
+        setDisplaySeams((prev) => {
+          const next = new Set(prev);
+          next.add(seamKeyToAdd);
+          return next;
+        });
+      }
+    };
+
+    tick();
+    const id = window.setInterval(tick, BRAWL_OPPONENT_ARRANGE_STEP_MS);
+    return () => window.clearInterval(id);
+  }, [dealComplete, atBatId, dealtHand, planHand, planSeams]);
+
+  const sz = compact
+    ? { card: 'w-20 h-28 rounded-lg', gap: 4, connectedGap: 0 }
+    : { card: 'w-32 h-44 rounded-xl', gap: 8, connectedGap: 0 };
+  const fromY = -180;
+  const fromRot = -12;
+  const signatureCount = displayHand.filter((c) => c.abilityType !== 'General Draw').length;
+
+  return (
+    <motion.div
+      className="flex flex-row items-center justify-center"
+      style={{ perspective: '1200px' }}
+    >
+      <AnimatePresence>
+        {displayHand.map((card, index) => {
+          const seamLeftAffirmed =
+            index > 0 &&
+            displaySeams.has(seamKey(displayHand[index - 1].id, card.id));
+          const seamRightAffirmed =
+            index < displayHand.length - 1 &&
+            displaySeams.has(seamKey(card.id, displayHand[index + 1].id));
+          const isConnectedLeft =
+            index > 0 &&
+            canConnectAny(displayHand[index - 1], card) &&
+            seamLeftAffirmed;
+          const isConnectedRight =
+            index < displayHand.length - 1 &&
+            canConnectAny(card, displayHand[index + 1]) &&
+            seamRightAffirmed;
+          const modifier = modifiers[card.id];
+          const isGeneral = card.abilityType === 'General Draw';
+          return (
+            <PitcherCard
+              key={`${atBatId}-${card.id}`}
+              card={card}
+              index={index}
+              handLength={displayHand.length}
+              signatureCount={signatureCount}
+              isGeneral={isGeneral}
+              isConnectedLeft={isConnectedLeft}
+              isConnectedRight={isConnectedRight}
+              modifier={modifier}
+              revealed={false}
+              compact={compact}
+              sz={sz}
+              fromY={fromY}
+              fromRot={fromRot}
+              isArranging={arrangingId === card.id}
+            />
+          );
+        })}
+      </AnimatePresence>
+    </motion.div>
+  );
+};
 
 /**
  * Pitcher hand that always renders the real cards underneath but presents them
@@ -4421,6 +4664,7 @@ const FlipPitcherStrip = ({
   compact = true,
   valueOverrides,
   highlightTones,
+  affirmedSeams,
 }: FlipPitcherStripProps) => {
   const sz = compact
     ? { card: 'w-20 h-28 rounded-lg', gap: 4, connectedGap: 0 }
@@ -4438,8 +4682,20 @@ const FlipPitcherStrip = ({
     >
       <AnimatePresence>
         {hand.map((card, index) => {
-          const isConnectedLeft = index > 0 && canConnectAny(hand[index - 1], card);
-          const isConnectedRight = index < hand.length - 1 && canConnectAny(card, hand[index + 1]);
+          const seamLeftAffirmed =
+            index > 0 &&
+            (affirmedSeams === undefined ||
+              affirmedSeams.has(seamKey(hand[index - 1].id, card.id)));
+          const seamRightAffirmed =
+            index < hand.length - 1 &&
+            (affirmedSeams === undefined ||
+              affirmedSeams.has(seamKey(card.id, hand[index + 1].id)));
+          const isConnectedLeft =
+            index > 0 && canConnectAny(hand[index - 1], card) && seamLeftAffirmed;
+          const isConnectedRight =
+            index < hand.length - 1 &&
+            canConnectAny(card, hand[index + 1]) &&
+            seamRightAffirmed;
           const modifier = modifiers[card.id];
           const isGeneral = card.abilityType === 'General Draw';
           return (
@@ -4484,6 +4740,8 @@ interface PitcherCardProps {
   fromRot: number;
   valueOverride?: number;
   highlightTone?: 'source' | 'target' | null;
+  /** Brawl snap phase: lift the card being shuffled into place. */
+  isArranging?: boolean;
 }
 
 /**
@@ -4506,6 +4764,7 @@ const PitcherCard = ({
   fromRot,
   valueOverride,
   highlightTone,
+  isArranging = false,
 }: PitcherCardProps) => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const entry = useMemo(() => buildEntryConfig(isGeneral, index, signatureCount, fromY, fromRot), []);
@@ -4533,7 +4792,12 @@ const PitcherCard = ({
         transformStyle: 'preserve-3d',
       }}
       initial={entry.initial}
-      animate={entry.animate}
+      animate={{
+        ...entry.animate,
+        scale: isArranging ? 1.07 : 1,
+        y: isArranging ? -10 : 0,
+        zIndex: isArranging ? 20 : 0,
+      }}
       exit={exitConfig}
       transition={ITEM_LAYOUT_TRANSITION}
       // Brawl Mode reveal anchor -- the flying ghost launches from this

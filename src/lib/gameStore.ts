@@ -19,6 +19,7 @@ import { applyCardEffect, EffectContext, highestValueCard } from "./cardEffects"
 import { applyHandTransforms, HAND_TRANSFORMS } from "./handTransforms";
 import { applyDealEffects } from "./dealEffects";
 import { applyResolveStep, PendingDebuff, RunnerSlot } from "./resolveStep";
+import { optimizeBrawlOpponentHand } from "./brawlAi";
 import type { ShapeType } from "../components/cardShapes";
 import {
   aiBidAmount,
@@ -796,6 +797,20 @@ export interface GameState {
   affirmedSeams: ReadonlySet<string>;
 
   /**
+   * Brawl-only: seams the AI opponent deliberately forged on its hand.
+   * The user seat still uses `affirmedSeams`; this set drives the
+   * opponent's scoring groups during brawl probes and lock-in.
+   */
+  brawlOpponentSeams: ReadonlySet<string>;
+
+  /**
+   * Brawl-only: optimized opponent card order the AI is working toward
+   * during the snap timer. The live `pitcherHand` / `batterHand` stays at
+   * deal order until lock-in; the UI animates toward this plan.
+   */
+  brawlOpponentPlanHand: CardDefinition[];
+
+  /**
    * Coin flips resolved at lock-in time for cards whose effect tosses (e.g.
    * b-22 Power/Speed Threat). Keyed by cardId; absent during the selecting
    * phase so previews fall back to deterministic averages. Cleared on
@@ -1103,6 +1118,13 @@ export interface GameState {
    * is parked AWAY by default (bats first), matching SZN convention.
    */
   startBrawl: (team: Team) => void;
+
+  /**
+   * Brawl-only: re-run the opponent hand optimizer against the user's
+   * current snap layout. Called at at-bat start, on a timer during
+   * selection, and once more at lock-in.
+   */
+  prepareBrawlOpponent: () => void;
   equipItem: (itemId: string, targetCardId: string) => void;
   unEquipItem: (itemId: string, sourceCardId: string) => void;
   /**
@@ -2110,6 +2132,8 @@ function resetEphemeralGameplay(): Partial<GameState> {
     activeChoiceCardId: null,
     coinFlips: {},
     affirmedSeams: new Set<string>(),
+    brawlOpponentSeams: new Set<string>(),
+    brawlOpponentPlanHand: [],
     revealScript: [],
     pendingResolvedPhase: null,
     revealUiUserSide: null,
@@ -2234,6 +2258,8 @@ export const useGameStore = create<GameState>((set, get) => ({
   // happens to put two mateable cards next to each other, they don't
   // chain until the player drags one of them in place.
   affirmedSeams: new Set<string>(),
+  brawlOpponentSeams: new Set<string>(),
+  brawlOpponentPlanHand: [],
   recentBatterIds: [INITIAL_AT_BAT.batter.id],
   recentPitcherIds: [INITIAL_AT_BAT.pitcher.id],
 
@@ -2574,7 +2600,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     if (nextFlips !== sBefore.coinFlips) {
       set({ coinFlips: nextFlips });
     }
-    const s = get();
+    let s = get();
 
     // p-41 Sweeping Slider: post-arrangement combo break. The seam break
     // mutation lives only inside the scoring path -- the visible batterHand
@@ -2583,12 +2609,26 @@ export const useGameStore = create<GameState>((set, get) => ({
     // is identical to what they get at lock-in.
     const workingBatterHand = applySweepingSliderMutation(s);
 
-    // Re-derive scoring against the (possibly mutated) batter hand. We pass
-    // the working hand through a temporary state shim so scoreBatter sees it.
-    const rawBatterResult = workingBatterHand === s.batterHand
-      ? s.scoreBatter()
-      : scoreHandFor(s, workingBatterHand, "Batting");
-    const pitcherResult = s.scorePitcher();
+    let lockInState: GameState = { ...s, batterHand: workingBatterHand };
+    if (s.gameMode === "brawl") {
+      const brawlPrep = computeBrawlOpponentPrep(lockInState, { applyHand: true });
+      if (brawlPrep) {
+        lockInState = { ...lockInState, ...brawlPrep };
+        set({
+          ...(brawlPrep.pitcherHand ? { pitcherHand: brawlPrep.pitcherHand } : {}),
+          ...(brawlPrep.batterHand ? { batterHand: brawlPrep.batterHand } : {}),
+          brawlOpponentPlanHand: brawlPrep.brawlOpponentPlanHand ?? s.brawlOpponentPlanHand,
+          brawlOpponentSeams: brawlPrep.brawlOpponentSeams ?? s.brawlOpponentSeams,
+        });
+      }
+    }
+    s = get();
+    if (s.gameMode !== "brawl" && workingBatterHand !== s.batterHand) {
+      s = { ...s, batterHand: workingBatterHand };
+    }
+
+    const rawBatterResult = scoreHandFor(s, s.batterHand, "Batting");
+    const pitcherResult = scoreHandFor(s, s.pitcherHand, "Pitching");
 
     // SZN Deception edge: 25% chance per Deception snap on the defender's
     // chain to shatter the opposing chain. We roll once at lock-in so the
@@ -2944,6 +2984,8 @@ export const useGameStore = create<GameState>((set, get) => ({
       // Fresh hand -> zero affirmed connections. Player must re-forge any
       // chain by dragging cards in place.
       affirmedSeams: new Set<string>(),
+      brawlOpponentSeams: new Set<string>(),
+    brawlOpponentPlanHand: [],
       recentBatterIds: pushRecent(s.recentBatterIds, ab.batter.id, RECENT_BATTER_LIMIT),
       recentPitcherIds: pushRecent(s.recentPitcherIds, ab.pitcher.id, RECENT_PITCHER_LIMIT),
       revealScript: [],
@@ -2953,6 +2995,17 @@ export const useGameStore = create<GameState>((set, get) => ({
       questWildcardNextBatterHand: false,
       questLegendaryCelebratePulse: false,
     });
+    if (get().gameMode === "brawl") {
+      const prep = computeBrawlOpponentPrep(get());
+      if (prep) set(prep);
+    }
+  },
+
+  prepareBrawlOpponent: () => {
+    const s = get();
+    if (s.gameMode !== "brawl" || s.phase !== "selecting") return;
+    const prep = computeBrawlOpponentPrep(s);
+    if (prep) set(prep);
   },
 
   reset: (team) => {
@@ -2987,6 +3040,8 @@ export const useGameStore = create<GameState>((set, get) => ({
       activeChoiceCardId: null,
       coinFlips: {},
       affirmedSeams: new Set<string>(),
+      brawlOpponentSeams: new Set<string>(),
+    brawlOpponentPlanHand: [],
       recentBatterIds: [ab.batter.id],
       recentPitcherIds: [ab.pitcher.id],
       revealScript: [],
@@ -3280,6 +3335,8 @@ export const useGameStore = create<GameState>((set, get) => ({
       questShakeRequestId: 0,
       ...QUEST_REWARD_INITIAL,
     });
+    const prep = computeBrawlOpponentPrep(get());
+    if (prep) set(prep);
   },
 
   // =========================================================================
@@ -4239,6 +4296,8 @@ export const useGameStore = create<GameState>((set, get) => ({
       activeChoiceCardId: null,
       coinFlips: {},
       affirmedSeams: new Set<string>(),
+      brawlOpponentSeams: new Set<string>(),
+    brawlOpponentPlanHand: [],
       revealScript: [],
       pendingResolvedPhase: null,
       revealUiUserSide: null,
@@ -5132,6 +5191,153 @@ export const useGameStore = create<GameState>((set, get) => ({
   },
 }));
 /**
+ * Which seam set each seat uses during scoring. Brawl routes the AI
+ * opponent through `brawlOpponentSeams` so it can forge selective
+ * chains instead of naively auto-connecting every adjacent pair.
+ */
+function seamAffirmationForSide(
+  s: GameState,
+  side: "Batting" | "Pitching",
+): { self: ReadonlySet<string> | null; opponent: ReadonlySet<string> | null } {
+  const userSide = getUserSide(s);
+  if (side === userSide) {
+    return {
+      self: s.affirmedSeams,
+      opponent: s.gameMode === "brawl" ? s.brawlOpponentSeams : null,
+    };
+  }
+  if (s.gameMode === "brawl") {
+    return { self: s.brawlOpponentSeams, opponent: s.affirmedSeams };
+  }
+  return { self: null, opponent: s.affirmedSeams };
+}
+
+type BrawlSeamPack = {
+  batter: ReadonlySet<string> | null;
+  pitcher: ReadonlySet<string> | null;
+};
+
+function scoreHandForExplicit(
+  s: GameState,
+  batterHand: CardDefinition[],
+  pitcherHand: CardDefinition[],
+  side: "Batting" | "Pitching",
+  seams: BrawlSeamPack,
+): ScoringResult {
+  const isBatting = side === "Batting";
+  const hand = isBatting ? batterHand : pitcherHand;
+  const opponent = isBatting ? pitcherHand : batterHand;
+  const nullified = new Set<string>();
+
+  if (isBatting) {
+    if (pitcherHand.some((c) => c.id === "p-36")) {
+      const top = highestValueCard(hand);
+      if (top) nullified.add(top.id);
+    }
+  } else {
+    const batterAffirmed = seams.batter;
+    if (
+      batterHand.some((c) => c.id === "b-127") &&
+      isCardCombinedInHand(batterHand, "b-127", batterAffirmed)
+    ) {
+      const target = lowestUncombinedInHand(hand, seams.pitcher);
+      if (target) nullified.add(target.id);
+    }
+  }
+
+  const nullifyOpponentBaseMechanic =
+    !isBatting && batterHand.some((c) => c.id === "b-105");
+  const offSpeedThreat = !isBatting && batterHand.some((c) => c.id === "b-108");
+  const nullifyOpponentTagMechanics = offSpeedThreat
+    ? (["off-speed"] as const)
+    : undefined;
+
+  const ctx: ScoringContext = {
+    side,
+    inning: s.inning,
+    equippedItems: s.equippedItems,
+    isFirstAtBatOfInning: s.isFirstAtBatOfInning,
+    outs: s.outs,
+    isFinalInning: s.inning === s.totalInnings,
+    batterHandedness: s.batter.handedness,
+    pitcherHandedness: s.pitcher.handedness,
+    opponentHand: opponent,
+    opponentBaseCard: highestValueCard(opponent),
+    nullifiedCardIds: nullified.size > 0 ? nullified : undefined,
+    coinFlips: s.coinFlips,
+    bases: s.bases,
+    half: s.half,
+    homeScore: s.homeScore,
+    awayScore: s.awayScore,
+    nullifyOpponentBaseMechanic: nullifyOpponentBaseMechanic || undefined,
+    nullifyOpponentTagMechanics,
+    affirmedSeams: isBatting ? seams.batter : seams.pitcher,
+    opponentAffirmedSeams: isBatting ? seams.pitcher : seams.batter,
+    questHitScaleBonus:
+      isBatting && s.questPendingBattingHitScale > 0
+        ? s.questPendingBattingHitScale
+        : undefined,
+    sznRallyFireActive:
+      s.gameMode === "szn" &&
+      side === getUserSide(s) &&
+      (s.run?.rallyFireWeeksLeft ?? 0) > 0,
+    sznSpeedMultiplierBonus: sznSpeedMultiplierForSide(s, side),
+    sznChainLengthForgiveness: sznChainLengthForgivenessForSide(s, side),
+  };
+  return scoreHand(hand, ctx);
+}
+
+function computeBrawlOpponentPrep(
+  s: GameState,
+  opts?: { applyHand?: boolean },
+): Partial<GameState> | null {
+  if (s.gameMode !== "brawl") return null;
+  const userSide = getUserSide(s);
+  const opponentHand = userSide === "Batting" ? s.pitcherHand : s.batterHand;
+  if (opponentHand.length === 0) return null;
+
+  const optimized = optimizeBrawlOpponentHand(opponentHand, userSide, (hand, seams) => {
+    const batterHand = userSide === "Batting" ? s.batterHand : hand;
+    const pitcherHand = userSide === "Batting" ? hand : s.pitcherHand;
+    const seamPack: BrawlSeamPack = {
+      batter: userSide === "Batting" ? s.affirmedSeams : seams,
+      pitcher: userSide === "Pitching" ? s.affirmedSeams : seams,
+    };
+    const batterResult = scoreHandForExplicit(
+      s,
+      batterHand,
+      pitcherHand,
+      "Batting",
+      seamPack,
+    );
+    const pitcherResult = scoreHandForExplicit(
+      s,
+      batterHand,
+      pitcherHand,
+      "Pitching",
+      seamPack,
+    );
+    const m = computeMatchup(
+      { ...s, batterHand, pitcherHand },
+      batterResult,
+      pitcherResult,
+      false,
+    );
+    return { batterDisplay: m.batterDisplay, pitcherDisplay: m.pitcherDisplay };
+  });
+
+  const patch: Partial<GameState> = {
+    brawlOpponentPlanHand: optimized.hand,
+    brawlOpponentSeams: optimized.affirmedSeams,
+  };
+  if (opts?.applyHand) {
+    if (userSide === "Batting") patch.pitcherHand = optimized.hand;
+    else patch.batterHand = optimized.hand;
+  }
+  return patch;
+}
+
+/**
  * Score a hand using the same context the store would build, but with an
  * arbitrary card list substituted in. Used by lockIn / previewMatchup when
  * p-41 Sweeping Slider mutates the batter hand mid-resolution.
@@ -5157,18 +5363,12 @@ function scoreHandFor(
       if (top) nullified.add(top.id);
     }
   } else {
-    // Mirror scorePitcher: b-127 Mr. Smile silences the lowest UNCOMBINED
-    // pitcher card when b-127 itself is combined. We pass the same affirmed
-    // seams the pitcher hand would actually be scored under so the silence
-    // target matches the player's manual chain (M3).
-    const batterAffirmed =
-      getUserSide(s) === "Batting" ? s.affirmedSeams : null;
+    const { self: pitcherAffirmed } = seamAffirmationForSide(s, "Pitching");
+    const batterAffirmed = seamAffirmationForSide(s, "Batting").self;
     if (
       s.batterHand.some((c) => c.id === "b-127") &&
       isCardCombinedInHand(s.batterHand, "b-127", batterAffirmed)
     ) {
-      const pitcherAffirmed =
-        getUserSide(s) === "Pitching" ? s.affirmedSeams : null;
       const target = lowestUncombinedInHand(hand, pitcherAffirmed);
       if (target) nullified.add(target.id);
     }
@@ -5203,10 +5403,8 @@ function scoreHandFor(
     awayScore: s.awayScore,
     nullifyOpponentBaseMechanic: nullifyOpponentBaseMechanic || undefined,
     nullifyOpponentTagMechanics,
-    // The user's seat reads from affirmedSeams; the AI's seat stays on
-    // legacy auto-connect (null = "any adjacent canConnect pair chains").
-    affirmedSeams: side === getUserSide(s) ? s.affirmedSeams : null,
-    opponentAffirmedSeams: side !== getUserSide(s) ? s.affirmedSeams : null,
+    affirmedSeams: seamAffirmationForSide(s, side).self,
+    opponentAffirmedSeams: seamAffirmationForSide(s, side).opponent,
     questHitScaleBonus:
       isBatting && s.questPendingBattingHitScale > 0
         ? s.questPendingBattingHitScale
