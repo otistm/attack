@@ -15,6 +15,7 @@ import { FrontOfficeScreen } from './components/FrontOfficeScreen';
 import { SeriesIntroScreen } from './components/SeriesIntroScreen';
 import { SeriesResultScreen } from './components/SeriesResultScreen';
 import { EndRunScreen } from './components/EndRunScreen';
+import { BrawlRulesScreen } from './components/BrawlRulesScreen';
 import { RunHud } from './components/RunHud';
 import { SznFooterDecks } from './components/SznFooterDecks';
 import { PurchaseFlightOverlay } from './components/PurchaseFlightOverlay';
@@ -24,6 +25,14 @@ export default function App() {
   const phase = useGameStore((s) => s.phase);
   const gameMode = useGameStore((s) => s.gameMode);
   const run = useGameStore((s) => s.run);
+
+  // Brawl Mode strips every pre-game / between-day interstitial -- no
+  // Shop, no Front Office, no pack rip. The lane drops straight into
+  // a 5-second-timer at-bat and stays there. We hoist the flag here
+  // so the screen gates below stay explicit at the App level instead
+  // of relying on each child to self-suppress.
+  const inBrawl = gameMode === 'brawl';
+  const showBrawlRules = useGameStore((s) => s.showBrawlRules);
 
   // SZN Mode routing. Narrow `run` to a single non-null local up top so
   // every downstream branch reads against `sznRun` instead of sprinkling
@@ -52,7 +61,7 @@ export default function App() {
           to drive ONE WebGL context (Pack3D) instead of two. Browsers cap
           live contexts (~8-16 depending on driver) and the playtest hit a
           THREE.WebGLRenderer "Context Lost" when both ran together. */}
-      {!sznShowPack && (
+      {!sznShowPack && !showBrawlRules && (
         <div data-tutorial="field" className="absolute inset-0">
           <Scene />
         </div>
@@ -62,10 +71,18 @@ export default function App() {
       <RunHud />
       {/* Draft overlay sits ABOVE the game UI when phase === 'drafting'. */}
       {phase === 'drafting' && <DraftScreen />}
-      {phase === 'shop' && <ShopScreen />}
-      {/* SZN Mode screens — only one mounts at a time based on run state. */}
+      {/* Pre-game item shop. Brawl Mode skips this entirely (no
+          Manager's Hand to spend on) so even if some upstream flow
+          accidentally parked brawl in `phase === 'shop'`, the screen
+          stays unmounted. Belt-and-suspenders with `startBrawl` which
+          already lands the phase in `selecting`. */}
+      {phase === 'shop' && !inBrawl && <ShopScreen />}
+      {/* SZN Mode screens — only one mounts at a time based on run state.
+          All three guard on `sznRun !== null` upstream, which already
+          excludes brawl, but the explicit `!inBrawl` on the FO mount
+          documents the intent for the next reader. */}
       {sznShowPack && <PackRipScreen />}
-      {sznShowFrontOffice && <FrontOfficeScreen />}
+      {sznShowFrontOffice && !inBrawl && <FrontOfficeScreen />}
       {sznShowSeriesIntro && <SeriesIntroScreen />}
       {sznEndState && <EndRunScreen />}
       {/* SeriesResultScreen self-gates on `run.lastSeriesSummary`. It
@@ -77,7 +94,9 @@ export default function App() {
           `showStartScreen`; we additionally suppress it during an in-flight
           draft, the SZN run-screens, or any SZN end-state so they don't
           stack on top of each other. */}
-      {phase !== 'drafting' && !inSzn && <StartGameScreen />}
+      {phase !== 'drafting' && !inSzn && !showBrawlRules && <StartGameScreen />}
+      {/* Brawl rules primer — after lane pick, before the field. */}
+      <BrawlRulesScreen />
       {/* SZN team-selection overlay. Self-gates on `showSznTeamSelect`;
           mounted above the start screen so picking SZN doesn't require
           re-rendering the lane chooser between clicks. */}

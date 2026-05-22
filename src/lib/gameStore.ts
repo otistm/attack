@@ -1,7 +1,15 @@
 import { create } from "zustand";
 import { CardDefinition, SESSION_CARDS, randomizeCardEdges } from "./cards";
 import { BATTERS, dealHand, MlbPlayer, PITCHERS, PLAYERS } from "./players";
-import { HitOutcome, resolveHitScale, scoreHand, ScoringContext, ScoringResult } from "./scoring";
+import {
+  HitOutcome,
+  resolveBrawlOutcome,
+  resolveHitScale,
+  scoreHand,
+  ScoringContext,
+  ScoringResult,
+  type BrawlOutcomeResolution,
+} from "./scoring";
 import {
   applySznItemLockInEffects,
   sznItemAcquirePatch,
@@ -110,7 +118,20 @@ export type Side = "Batting" | "Pitching";
  * hasn't picked a lane yet (initial boot, post-`reset`); the StartGameScreen
  * is the source of truth in that case.
  */
-export type GameMode = "draft" | "quick-match" | "szn" | null;
+/**
+ * Top-level lane the player committed to from the StartGameScreen.
+ *
+ *   - "draft"       : auction draft -> Victory Mode single game.
+ *   - "quick-match" : random rosters -> single game.
+ *   - "szn"         : 12-week roguelike season run.
+ *   - "brawl"       : Brawl Mode -- single-game arena fight using the SZN
+ *                     ability + edge engine but without the season meta.
+ *                     Stubbed atop `startQuickMatch` for now; reserved as
+ *                     a discriminator so future game-mode branches can
+ *                     diverge cleanly.
+ *   - null          : no lane committed yet (initial boot / after `reset`).
+ */
+export type GameMode = "draft" | "quick-match" | "szn" | "brawl" | null;
 /**
  * `revealing` sits between `selecting` and `between-at-bats`. lockIn computes
  * the final outcome (and applies bases / runs / outs) but parks the phase here
@@ -669,6 +690,14 @@ export interface GameState {
   lastPitcherScore: number;
   lastResultMessage: string;
   /**
+   * Brawl Mode resolution snapshot from the most recent lock-in, or
+   * null if the last at-bat wasn't a brawl. Carries the HP ladder data
+   * (`winnerHP`, `grandSlam`) so the HitResultBanner can call out the
+   * margin of victory + flag grand slams without re-deriving them.
+   * Cleared on lane swap / reset like every other "last *" snapshot.
+   */
+  lastBrawlResolution: BrawlOutcomeResolution | null;
+  /**
    * Player-facing log lines produced by the resolve step of the most recent
    * at-bat (e.g. "Stolen Bag: extra runner placed on 1B"). Surfaced under the
    * hit-result banner so post-hit card effects don't read as visual glitches:
@@ -803,6 +832,17 @@ export interface GameState {
    * same tick as `lockIn`, but the reveal is still for the prior at-bat.
    */
   revealUiUserSide: Side | null;
+
+  /**
+   * Brawl-only stash: `lockIn` commits runs/outs immediately but holds
+   * bases + runner animation until `completeReveal` so the diamond and
+   * scoreboard don't show a new occupant while cards are still attacking.
+   */
+  pendingBrawlBasePatch: {
+    bases: Bases;
+    baseRunners: BaseRunners;
+    runnerMoves: RunnerMove[];
+  } | null;
 
   /**
    * Active draft state when `phase === "drafting"`. Null whenever the user
@@ -991,6 +1031,12 @@ export interface GameState {
    */
   showSznTeamSelect: boolean;
   setShowSznTeamSelect: (open: boolean) => void;
+  /**
+   * Brawl Mode rules primer — shown after the player picks the brawl lane
+   * and before the field + snap timer mount. Closed by `startBrawl`.
+   */
+  showBrawlRules: boolean;
+  setShowBrawlRules: (open: boolean) => void;
 
   // ----- Learn-to-Play tutorial -----
   /**
@@ -1048,6 +1094,15 @@ export interface GameState {
    * player confirms a custom roll from the pre-game quest picker.
    */
   startQuickMatch: (team: Team, questSlate?: string[]) => void;
+  /**
+   * Brawl Mode lane -- a single-game arena fight. Initial implementation
+   * delegates to {@link startQuickMatch} so the existing scoring engine
+   * + roster pool light up immediately; the `gameMode` flag flips to
+   * `"brawl"` after the quick-match scaffold runs so downstream code
+   * (HUD copy, future arena-specific rules) can discriminate. The user
+   * is parked AWAY by default (bats first), matching SZN convention.
+   */
+  startBrawl: (team: Team) => void;
   equipItem: (itemId: string, targetCardId: string) => void;
   unEquipItem: (itemId: string, sourceCardId: string) => void;
   /**
@@ -2044,6 +2099,7 @@ function resetEphemeralGameplay(): Partial<GameState> {
     lastBatterScore: 0,
     lastPitcherScore: 0,
     lastResultMessage: "",
+    lastBrawlResolution: null,
     lastResolveLog: [],
     lastBatterCardModifiers: {},
     lastPitcherCardModifiers: {},
@@ -2057,6 +2113,7 @@ function resetEphemeralGameplay(): Partial<GameState> {
     revealScript: [],
     pendingResolvedPhase: null,
     revealUiUserSide: null,
+    pendingBrawlBasePatch: null,
   };
 }
 
@@ -2150,6 +2207,7 @@ export const useGameStore = create<GameState>((set, get) => ({
   showStartScreen: true,
   // Stay hidden until the user explicitly clicks the SZN lane.
   showSznTeamSelect: false,
+  showBrawlRules: false,
 
   // Tutorial defaults to off. Activated by `startTutorial()` (called
   // immediately after `startQuickMatch('AWAY')` from the Learn to Play
@@ -2161,6 +2219,7 @@ export const useGameStore = create<GameState>((set, get) => ({
   lastBatterScore: 0,
   lastPitcherScore: 0,
   lastResultMessage: "",
+  lastBrawlResolution: null,
   lastResolveLog: [],
   lastBatterCardModifiers: {},
   lastPitcherCardModifiers: {},
@@ -2181,6 +2240,7 @@ export const useGameStore = create<GameState>((set, get) => ({
   revealScript: [],
   pendingResolvedPhase: null,
   revealUiUserSide: null,
+  pendingBrawlBasePatch: null,
 
   // Empty until the player picks a lane on the StartGameScreen. Auction
   // path: `startDraft` populates with `initDraftState()` and the user
@@ -2552,8 +2612,25 @@ export const useGameStore = create<GameState>((set, get) => ({
       ? { ...batterResult, forcedOutcome: "homerun" as const }
       : batterResult;
 
+    // Brawl Mode re-routes the entire outcome ladder: matchup totals
+    // are read as HPs, the side whose pill outlasts the other wins,
+    // and the WINNER's leftover HP is laddered into a hit type from
+    // the batter's POV (0-5 single, 6-10 double, 11-15 triple, 16-20
+    // HR, 21+ grand slam). Pitcher winning = strikeout. We compute
+    // the brawl resolution UP FRONT so the rest of lockIn (resolve
+    // step, runner queue, banner formatting) sees a normal HitOutcome
+    // and stays oblivious to the override; the grand-slam flag is
+    // surfaced via `lastBrawlResolution` and used below to pre-load
+    // the bases so the swing actually clears 4 runs.
+    const isBrawl = s.gameMode === "brawl";
+    const brawlResolution: BrawlOutcomeResolution | null = isBrawl
+      ? resolveBrawlOutcome(m.batterDisplay, m.pitcherDisplay)
+      : null;
+
     let outcome: HitOutcome;
-    if (effectiveBatterResult.forcedOutcome && m.batterWins) {
+    if (brawlResolution) {
+      outcome = brawlResolution.outcome;
+    } else if (effectiveBatterResult.forcedOutcome && m.batterWins) {
       outcome = effectiveBatterResult.forcedOutcome;
     } else if (pitcherResult.forcedOutcome && !m.batterWins) {
       outcome = pitcherResult.forcedOutcome;
@@ -2564,7 +2641,11 @@ export const useGameStore = create<GameState>((set, get) => ({
     }
 
     // Resolve-step hook: cards may bend the outcome (extra outs, pickoff,
-    // sacrifice fly, queue cross-at-bat debuffs).
+    // sacrifice fly, queue cross-at-bat debuffs). In Brawl Mode the step
+    // must follow the HP-ladder winner, not the raw chain `>` comparison
+    // (a 10-vs-10 lock is a batter single in brawl but `m.batterWins`
+    // is false).
+    const brawlBatterWon = brawlResolution?.batterWon ?? m.batterWins;
     const resolveDelta = applyResolveStep({
       batterHand: s.batterHand,
       pitcherHand: s.pitcherHand,
@@ -2573,11 +2654,35 @@ export const useGameStore = create<GameState>((set, get) => ({
       pitcherResult,
       batterTotal: m.batterTotal,
       pitcherTotal: m.pitcherTotal,
-      batterWins: m.batterWins,
+      batterWins: brawlBatterWon,
     });
 
-    const next = applyOutcome(s, outcome, resolveDelta);
-    const message = formatOutcome(outcome, m.batterDisplay, m.pitcherDisplay, s.batter.name);
+    // Brawl Mode grand-slam (winnerHP >= 21) forces the bases loaded
+    // BEFORE applyOutcome so the homerun clears all four runs (batter
+    // + three baserunners) -- without this, a 21+ HP swing on empty
+    // bases would still only score one. We override at the s-snapshot
+    // level so applyOutcome stays unaware of brawl; the runner-move
+    // queue + base-clear logic that already drives HRs just reads the
+    // freshly-loaded bases and animates a proper 4-RBI swing. Phantom
+    // (null-player) runners are used because brawl doesn't have an
+    // off-base roster to draw drafted identities from.
+    const sForOutcome =
+      brawlResolution?.grandSlam && brawlResolution.batterWon
+        ? {
+            ...s,
+            bases: [true, true, true] as [boolean, boolean, boolean],
+            baseRunners: [null, null, null] as BaseRunners,
+          }
+        : s;
+    const next = applyOutcome(sForOutcome, outcome, resolveDelta);
+    const message = brawlResolution
+      ? formatOutcome(
+          outcome,
+          brawlResolution.batterRemainingHP,
+          brawlResolution.pitcherRemainingHP,
+          s.batter.name,
+        )
+      : formatOutcome(outcome, m.batterDisplay, m.pitcherDisplay, s.batter.name);
 
     const battingTeam: Team = s.half === "top" ? "AWAY" : "HOME";
     const isUserTeamBatting = battingTeam === s.userTeam;
@@ -2692,11 +2797,31 @@ export const useGameStore = create<GameState>((set, get) => ({
         ? { run: { ...s.run, ...sznSide.runPatch } }
         : null;
 
+    const brawlBasePatch = isBrawl
+      ? {
+          bases: next.bases,
+          baseRunners: next.baseRunners,
+          runnerMoves: next.runnerMoves,
+        }
+      : null;
+
     set({
-      ...next,
+      ...(isBrawl
+        ? {
+            ...next,
+            bases: s.bases,
+            baseRunners: s.baseRunners,
+            runnerMoves: [],
+          }
+        : next),
+      pendingBrawlBasePatch: brawlBasePatch,
       ...questPatch,
       ...(sznRunPatch ?? {}),
       lastOutcome: outcome,
+      // Brawl Mode HP-ladder snapshot. Always set (`null` when not in
+      // brawl) so a quick-match lockIn after a brawl can't read stale
+      // grand-slam cues into the result banner.
+      lastBrawlResolution: brawlResolution,
       // Persist the COMPREHENSIVE display values (not the raw head-to-head
       // totals) so the resolved view matches the live preview pill.
       lastBatterScore: m.batterDisplay,
@@ -2732,11 +2857,20 @@ export const useGameStore = create<GameState>((set, get) => ({
   completeReveal: () => {
     const s = get();
     if (s.phase !== "revealing") return;
+    const brawlBases = s.pendingBrawlBasePatch;
     set({
       phase: s.pendingResolvedPhase ?? "between-at-bats",
       pendingResolvedPhase: null,
       revealScript: [],
       revealUiUserSide: null,
+      ...(brawlBases
+        ? {
+            bases: brawlBases.bases,
+            baseRunners: brawlBases.baseRunners,
+            runnerMoves: brawlBases.runnerMoves,
+            pendingBrawlBasePatch: null,
+          }
+        : {}),
     });
   },
 
@@ -2815,6 +2949,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       revealScript: [],
       pendingResolvedPhase: null,
       revealUiUserSide: null,
+      pendingBrawlBasePatch: null,
       questWildcardNextBatterHand: false,
       questLegendaryCelebratePulse: false,
     });
@@ -2881,6 +3016,7 @@ export const useGameStore = create<GameState>((set, get) => ({
 
   setShowStartScreen: (open) => set({ showStartScreen: open }),
   setShowSznTeamSelect: (open) => set({ showSznTeamSelect: open }),
+  setShowBrawlRules: (open) => set({ showBrawlRules: open }),
 
   startTutorial: () => set({ tutorialActive: true, tutorialStepIndex: 0 }),
 
@@ -3109,6 +3245,40 @@ export const useGameStore = create<GameState>((set, get) => ({
       // Draft state stays in place AFTER completion -- gameplay reads
       // `draft.roster` to pick the next batter/pitcher each at-bat. Cleared
       // by `reset` or replaced by the next `startDraft`.
+    });
+  },
+
+  // =========================================================================
+  // Brawl Mode (single-game arena fight) -- stub atop startQuickMatch.
+  // =========================================================================
+
+  startBrawl: (team) => {
+    // Brawl Mode reuses the Quick Match scaffold (random rosters, fresh
+    // at-bat) then overrides arena-specific slices:
+    //
+    //   1. `gameMode: "brawl"` for HUD / scoring / snap-timer branches.
+    //   2. `phase: "selecting"` — skip the pre-game Shop entirely.
+    //   3. `totalInnings: 3` — short arena fights, not a full 9.
+    //   4. `showBrawlRules: false` — rules primer dismisses on commit.
+    //
+    // `startQuickMatch` already nulls `run` and clears inventory /
+    // equipped items, so brawl can never inherit a stale SZN Front
+    // Office surface or a previous quick match's inventory.
+    get().startQuickMatch(team);
+    set({
+      gameMode: "brawl",
+      phase: "selecting",
+      totalInnings: 3,
+      showBrawlRules: false,
+      // Brawl is a stripped arena fight — no quest strip, POW overlays,
+      // or reward side-effects from the quick-match quest slate.
+      activeQuests: [],
+      questProgress: {},
+      completedQuests: [],
+      questCelebrationQueue: [],
+      questTick: 0,
+      questShakeRequestId: 0,
+      ...QUEST_REWARD_INITIAL,
     });
   },
 
@@ -6466,7 +6636,7 @@ function applyOutcome(
   // RunnerMove and baseRunners slot both record `null`. The 3D label
   // renderer treats null as "anonymous" and falls back to a generic
   // "RUNNER" tag.
-  if (resolveDelta.extraRunnerOn) {
+  if (resolveDelta.extraRunnerOn && outcome !== "out") {
     const idx =
       resolveDelta.extraRunnerOn === "first"
         ? 0

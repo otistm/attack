@@ -780,3 +780,85 @@ export function resolveHitScale(score: number): HitOutcome {
   if (score >= 5) return "single";
   return "out";
 }
+
+/**
+ * Brawl Mode outcome resolution.
+ *
+ * Each side enters combat with HP equal to their locked-in matchup total
+ * (the "shield" built by snapping cards during the snap timer). Cards
+ * attack in sequence — user's cards first, then opponent's — each side
+ * dealing damage equal to its locked-in total. After both waves:
+ *
+ *   batterRemaining  = max(0, batterStarting − pitcherStarting)
+ *   pitcherRemaining = max(0, pitcherStarting − batterStarting)
+ *
+ * The side with HP left wins. The WINNER's remaining HP ladders into the
+ * at-bat result from the batter's POV:
+ *
+ *   - 0 - 5  : single
+ *   - 6 - 10 : double
+ *   - 11 - 15: triple
+ *   - 16 - 20: homerun
+ *   - 21 +   : homerun, flagged `grandSlam`
+ *
+ * If the pitcher's remaining HP exceeds the batter's, the at-bat is an out.
+ * Ties (both 0) go to the batter as a single.
+ */
+export interface BrawlOutcomeResolution {
+  outcome: HitOutcome;
+  batterWon: boolean;
+  /** Winner's remaining HP after combat — drives the hit ladder. */
+  winnerHP: number;
+  /** Batter HP remaining after the pitcher's cards attack. */
+  batterRemainingHP: number;
+  /** Pitcher HP remaining after the batter's cards attack. */
+  pitcherRemainingHP: number;
+  /** Locked-in batter total at combat start (shield max). */
+  batterStartingHP: number;
+  /** Locked-in pitcher total at combat start (shield max). */
+  pitcherStartingHP: number;
+  grandSlam: boolean;
+}
+
+export function resolveBrawlOutcome(
+  batterTotal: number,
+  pitcherTotal: number,
+): BrawlOutcomeResolution {
+  const batterStartingHP = Math.max(0, batterTotal);
+  const pitcherStartingHP = Math.max(0, pitcherTotal);
+
+  const batterRemainingHP = Math.max(0, batterStartingHP - pitcherStartingHP);
+  const pitcherRemainingHP = Math.max(0, pitcherStartingHP - batterStartingHP);
+
+  const base = {
+    batterRemainingHP,
+    pitcherRemainingHP,
+    batterStartingHP,
+    pitcherStartingHP,
+  };
+
+  if (pitcherRemainingHP > batterRemainingHP) {
+    return {
+      ...base,
+      outcome: "out",
+      batterWon: false,
+      winnerHP: pitcherRemainingHP,
+      grandSlam: false,
+    };
+  }
+
+  const winnerHP = batterRemainingHP;
+  if (winnerHP >= 21) {
+    return { ...base, outcome: "homerun", batterWon: true, winnerHP, grandSlam: true };
+  }
+  if (winnerHP >= 16) {
+    return { ...base, outcome: "homerun", batterWon: true, winnerHP, grandSlam: false };
+  }
+  if (winnerHP >= 11) {
+    return { ...base, outcome: "triple", batterWon: true, winnerHP, grandSlam: false };
+  }
+  if (winnerHP >= 6) {
+    return { ...base, outcome: "double", batterWon: true, winnerHP, grandSlam: false };
+  }
+  return { ...base, outcome: "single", batterWon: true, winnerHP, grandSlam: false };
+}

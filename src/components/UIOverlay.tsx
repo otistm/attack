@@ -6,7 +6,7 @@ import { QuestCompleteOverlay } from './QuestCompleteOverlay';
 import { ScreenShake } from './effects/ScreenShake';
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Calendar, Layers, LogOut, RotateCcw, ChevronDown, Trophy, Zap } from 'lucide-react';
+import { Calendar, Layers, LogOut, RotateCcw, ChevronDown, Trophy, Zap, Swords } from 'lucide-react';
 import { useGameStore, getUserSide, type Team, type GameMode } from '../lib/gameStore';
 
 const SPLASH_DURATION_MS = 3000;
@@ -43,12 +43,15 @@ export function UIOverlay() {
   // behind a SZN surface.
   const sznRunActive = useGameStore((s) => s.gameMode === 'szn' && !!s.run);
   const sznTeamPickerOpen = useGameStore((s) => s.showSznTeamSelect);
+  const showBrawlRules = useGameStore((s) => s.showBrawlRules);
+  const gameMode = useGameStore((s) => s.gameMode);
   const sznIntentActive = sznRunActive || sznTeamPickerOpen;
+  const brawlIntentActive = gameMode === 'brawl' || showBrawlRules;
   useEffect(() => {
-    if (!sznIntentActive) return;
+    if (!sznIntentActive && !brawlIntentActive) return;
     setSplashVisible(false);
     setCardsReady(true);
-  }, [sznIntentActive]);
+  }, [sznIntentActive, brawlIntentActive]);
 
   const inning = useGameStore((s) => s.inning);
   const half = useGameStore((s) => s.half);
@@ -60,12 +63,7 @@ export function UIOverlay() {
   const userTeam = useGameStore((s) => s.userTeam);
   const startDraft = useGameStore((s) => s.startDraft);
   const startQuickMatch = useGameStore((s) => s.startQuickMatch);
-  // Which lane the player committed to. The header's "New Game" button
-  // rematches in the SAME lane so locking in cards mid-quick-match doesn't
-  // surprise the player by punting them into an auction draft on the next
-  // tap. `null` (no lane committed yet) falls back to the auction path,
-  // which matches the legacy default behavior.
-  const gameMode = useGameStore((s) => s.gameMode);
+  const startBrawl = useGameStore((s) => s.startBrawl);
   // While the Learn-to-Play tutorial is running, the header's "New Game"
   // dropdown is replaced with an "End Tutorial" button that bails the
   // walkthrough and pops the start screen back up. Subscribed here so
@@ -85,6 +83,8 @@ export function UIOverlay() {
     if (s.run.series && !s.run.series.gameInProgress) return true;
     return false;
   });
+
+  const hideGameplayChrome = sznOutsideGameplay || showBrawlRules;
 
   const phaseLabel: Record<typeof phase, string> = {
     drafting: 'Draft',
@@ -116,7 +116,7 @@ export function UIOverlay() {
     >
     <div className="absolute inset-0 pointer-events-none flex flex-col justify-between overflow-hidden font-sans text-slate-100">
 
-      {!sznOutsideGameplay && (
+      {!hideGameplayChrome && (
       <header className="w-full grid grid-cols-[minmax(220px,1fr)_auto_minmax(220px,1fr)] items-stretch gap-4 px-6 py-3 bg-slate-900/85 border-b border-slate-700 backdrop-blur-sm pointer-events-auto shadow-md">
         {/* Left: game mode badge. Was previously the at-bat / pitcher
             matchup nameplate; replaced because the batter and pitcher
@@ -152,6 +152,7 @@ export function UIOverlay() {
               {phaseLabel[phase]}
             </span>
           </div>
+          {gameMode !== 'brawl' && (
           <button
             onClick={() => setShowCollection(true)}
             className="flex items-center gap-1.5 px-3 py-2 bg-slate-700/80 hover:bg-slate-600 rounded-md text-[11px] font-bold text-slate-200 hover:text-white transition-colors uppercase tracking-wide"
@@ -159,6 +160,7 @@ export function UIOverlay() {
             <Layers className="w-3.5 h-3.5" />
             Collection
           </button>
+          )}
           {tutorialActive ? (
             <button
               type="button"
@@ -184,11 +186,10 @@ export function UIOverlay() {
             // an active SZN run.
             <NewGamePicker
               onPick={(team) => {
-                // Rematch in the lane the player is already in. Quick Match
-                // stays Quick Match; auction Draft stays Draft; legacy null
-                // falls back to the auction path.
                 if (gameMode === 'quick-match') {
                   startQuickMatch(team);
+                } else if (gameMode === 'brawl') {
+                  startBrawl(team);
                 } else {
                   startDraft(team);
                 }
@@ -200,7 +201,7 @@ export function UIOverlay() {
       </header>
       )}
 
-      {cardsReady && !sznOutsideGameplay && (
+      {cardsReady && !hideGameplayChrome && (
         <motion.div
           key="game-overlay"
           className="absolute inset-0 pointer-events-none"
@@ -221,7 +222,7 @@ export function UIOverlay() {
           mount-frame race where the timer hasn't fired yet but the
           user has already clicked into the SZN lane. */}
       <AnimatePresence>
-        {splashVisible && !sznIntentActive && <IntroSplash key="intro-splash" />}
+        {splashVisible && !sznIntentActive && !brawlIntentActive && <IntroSplash key="intro-splash" />}
       </AnimatePresence>
 
       <AnimatePresence>
@@ -232,7 +233,7 @@ export function UIOverlay() {
       {cardsReady && !sznOutsideGameplay && <InfoRevealOverlay />}
       {cardsReady && !sznOutsideGameplay && <InningTransitionBanner />}
     </div>
-    <QuestCompleteOverlay />
+    {gameMode !== 'brawl' && <QuestCompleteOverlay />}
     </ScreenShake>
   );
 }
@@ -560,6 +561,13 @@ function GameModeBadge({ gameMode }: { gameMode: GameMode }) {
           icon: <Calendar className="w-4 h-4" />,
           accent: 'from-emerald-600/90 to-emerald-700/90',
           iconColor: 'text-emerald-300',
+        }
+      : gameMode === 'brawl'
+      ? {
+          label: 'Brawl Mode',
+          icon: <Swords className="w-4 h-4" />,
+          accent: 'from-violet-600/90 to-fuchsia-700/90',
+          iconColor: 'text-violet-300',
         }
       : {
           label: 'Match',
