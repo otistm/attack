@@ -1218,6 +1218,7 @@ export const CardGameOverlay = () => {
     pitcherHP: lastPitcherScore,
     userIsBatting,
     grandSlam: lastBrawlResolution?.grandSlam === true,
+    opponentHandLength: (userIsBatting ? pitcherHand : batterHand).length,
     onComplete: completeReveal,
     onImpact: (power, grand) => {
       // Scope shake to the brawl overlay and scale by impact power so

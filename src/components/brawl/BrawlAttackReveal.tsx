@@ -86,6 +86,8 @@ export interface BrawlRevealInput {
   userIsBatting: boolean;
   /** True if this is a 21+ HP grand-slam swing; pumps up the VFX intensity. */
   grandSlam: boolean;
+  /** Opponent hand size — used to delay attacks until flip reveal finishes. */
+  opponentHandLength: number;
   /** Reveal complete callback. Parent wires this to `completeReveal()`. */
   onComplete: () => void;
   /** Fired on every impact so the parent can ping the screen-shake. */
@@ -201,6 +203,28 @@ const ATTACK_GAP_MS = 320;
 const MID_PHASE_PAUSE_MS = 650;
 /** Pause after the last impact before completeReveal fires. */
 const DENOUEMENT_MS = 1000;
+/**
+ * Match `PitcherCard` flip timing in FlipPitcherStrip so attacks wait until
+ * the opponent's face-down cards finish turning over.
+ */
+const OPPONENT_FLIP_BASE_DELAY_S = 0.1;
+const OPPONENT_FLIP_STAGGER_S = 0.12;
+const OPPONENT_FLIP_DURATION_S = 0.7;
+const OPPONENT_REVEAL_SETTLE_MS = 200;
+
+/** Ms until the last opponent card finishes its flip-in at reveal start. */
+export function opponentHandRevealCompleteMs(handLength: number): number {
+  if (handLength <= 0) return 500;
+  const lastIdx = handLength - 1;
+  return (
+    Math.ceil(
+      (OPPONENT_FLIP_BASE_DELAY_S +
+        lastIdx * OPPONENT_FLIP_STAGGER_S +
+        OPPONENT_FLIP_DURATION_S) *
+        1000,
+    ) + OPPONENT_REVEAL_SETTLE_MS
+  );
+}
 /** Card flight time for user-phase projectiles. */
 const FLIGHT_MS = 460;
 /** Opponent dives travel farther (top strip -> bottom hand); give them
@@ -227,6 +251,7 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
     pitcherHP,
     userIsBatting,
     grandSlam,
+    opponentHandLength,
     onComplete,
     onImpact,
     runId,
@@ -445,7 +470,9 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
     const userPhaseIsBatterSeat = userIsBatting;
     const opponentPhaseIsBatterSeat = !userIsBatting;
 
-    let cursor = ARM_DELAY_MS + PHASE_INTRO_MS;
+    const opponentRevealMs = opponentHandRevealCompleteMs(opponentHandLength);
+
+    let cursor = ARM_DELAY_MS + PHASE_INTRO_MS + opponentRevealMs;
     const userPhaseStartMs = cursor;
 
     // ---- Phase 1: user's cards attack opponent's pill -----------------
@@ -627,7 +654,7 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       attackingRef.current = false;
       setAttacking(false);
     };
-  }, [enabled, runId, batterAttackers, pitcherAttackers, batterHP, pitcherHP, userIsBatting, grandSlam]);
+  }, [enabled, runId, batterAttackers, pitcherAttackers, batterHP, pitcherHP, userIsBatting, grandSlam, opponentHandLength]);
 
   return {
     displayedBatterHP,
