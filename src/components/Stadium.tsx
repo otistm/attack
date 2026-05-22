@@ -155,6 +155,11 @@ export function Stadium() {
       {!fieldEmpty && (() => {
         const showAnimated =
           phase === 'between-at-bats' && lastOutcome && lastOutcome !== 'out' && runnerMoves.length > 0;
+        // lockIn commits bases immediately but keeps phase in `revealing`
+        // until the card / brawl attack timeline finishes. Static runners
+        // during that window make a figure pop onto 1B while cards are
+        // still flying — especially noticeable in Brawl Mode's long reveal.
+        if (phase === 'revealing') return null;
         if (showAnimated) {
           return runnerMoves.map((move) => (
             <AnimatedRunner

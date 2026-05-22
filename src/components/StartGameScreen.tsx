@@ -9,6 +9,7 @@ import {
   Lock,
   Play,
   Settings,
+  Swords,
   Trophy,
   Zap,
 } from 'lucide-react';
@@ -40,9 +41,11 @@ import { useSznGamepad } from '../lib/useSznGamepad';
  */
 export function StartGameScreen() {
   const showStartScreen = useGameStore((s) => s.showStartScreen);
+  const setShowStartScreen = useGameStore((s) => s.setShowStartScreen);
   const phase = useGameStore((s) => s.phase);
   const startDraft = useGameStore((s) => s.startDraft);
   const startQuickMatch = useGameStore((s) => s.startQuickMatch);
+  const setShowBrawlRules = useGameStore((s) => s.setShowBrawlRules);
   const setShowSznTeamSelect = useGameStore((s) => s.setShowSznTeamSelect);
   const startTutorial = useGameStore((s) => s.startTutorial);
 
@@ -76,6 +79,10 @@ export function StartGameScreen() {
                 onAuction={(team) => startDraft(team)}
                 onQuickConfirm={(team, questSlate) => startQuickMatch(team, questSlate)}
                 onSzn={() => setShowSznTeamSelect(true)}
+                onBrawl={() => {
+                  setShowBrawlRules(true);
+                  setShowStartScreen(false);
+                }}
                 onLearn={() => {
                   // Tutorial always plays as AWAY so the user bats in the
                   // top of the 1st -- the modal copy assumes that seat.
@@ -142,7 +149,7 @@ function Logo() {
  * Main menu controls
  * --------------------------------------------------------------------------- */
 
-type Lane = 'auction' | 'quick' | 'szn';
+type Lane = 'auction' | 'quick' | 'szn' | 'brawl';
 
 function QuickQuestPickerModal({
   team,
@@ -234,6 +241,7 @@ function MainMenu({
   onAuction,
   onQuickConfirm,
   onSzn,
+  onBrawl,
   onLearn,
 }: {
   onAuction: (team: Team) => void;
@@ -244,6 +252,12 @@ function MainMenu({
    * chooses a franchise. The seat is always AWAY for SZN runs.
    */
   onSzn: () => void;
+  /**
+   * Brawl Mode entry. Single-game arena fight using the same engine as
+   * Quick Match for now -- skips the AWAY/HOME team picker (the seat is
+   * always AWAY so the user bats first, matching SZN convention).
+   */
+  onBrawl: () => void;
   onLearn: () => void;
 }) {
   const [openLane, setOpenLane] = useState<Lane | null>(null);
@@ -253,19 +267,21 @@ function MainMenu({
     rerollSpent: boolean;
   }>(null);
 
-  // Controller focus over the 4 active lane buttons (szn / auction /
-  // quick / learn). SZN is the headline lane (the only finished
-  // roguelike loop), so it sits at the top of the list AND is the
-  // default focus when the screen mounts -- a controller-first user
-  // mashes CROSS and lands directly in the SZN team picker. DPad
-  // cycles; CROSS activates. The SZN lane skips the AWAY/HOME team
-  // picker so CROSS launches the run directly. The auction / quick
+  // Controller focus over the 5 active lane buttons (brawl / szn /
+  // auction / quick / learn). Brawl Mode anchors the top of the list as
+  // the newest flagship single-game lane, but SZN stays the default
+  // focus (the most-finished roguelike loop) so the existing muscle
+  // memory -- mash CROSS -> SZN picker -- is preserved. DPad cycles;
+  // CROSS activates. The brawl / szn lanes both skip the AWAY/HOME team
+  // picker so CROSS launches the lane directly. The auction / quick
   // lanes expand into a team picker — CROSS expands and CROSS again
   // picks AWAY (the first option in the picker grid). The quick lane
   // additionally opens the quest picker modal (which owns higher-
   // priority input).
-  const [focus, setFocus] = useState(0);
-  const lanes = ['szn', 'auction', 'quick', 'learn'] as const;
+  const lanes = ['brawl', 'szn', 'auction', 'quick', 'learn'] as const;
+  // Default focus = index of 'szn' so the existing controller flow is
+  // preserved when Brawl Mode is added above it.
+  const [focus, setFocus] = useState<number>(lanes.indexOf('szn'));
   useSznGamepad({
     id: 'start-game-screen',
     priority: 10,
@@ -275,7 +291,8 @@ function MainMenu({
       else if (btn === 'DPAD_DOWN') setFocus((i) => Math.min(lanes.length - 1, i + 1));
       else if (btn === 'CROSS') {
         const lane = lanes[focus];
-        if (lane === 'szn') onSzn();
+        if (lane === 'brawl') onBrawl();
+        else if (lane === 'szn') onSzn();
         else if (lane === 'learn') onLearn();
         else if (lane === 'auction') onAuction('AWAY');
         else if (lane === 'quick') {
@@ -322,12 +339,27 @@ function MainMenu({
 
   return (
     <div className="flex flex-col gap-4 w-full max-w-md">
-      {/* SZN Mode anchors the top of the list — it's the flagship
-          roguelike loop and the only lane that skips straight into a
-          full run instead of a single-game flow. Anchoring it at
-          index 0 also makes it the default gamepad focus when the
-          screen mounts so a controller-first user can boot the lane
-          with a single CROSS press. */}
+      {/* Brawl Mode anchors the top of the list — newest flagship lane,
+          a single-game arena fight built on the SZN ability + edge
+          engine. Skips the AWAY/HOME picker (the seat is always AWAY,
+          matching SZN convention) so CROSS launches the match
+          directly. */}
+      <LaneButton
+        lane="brawl"
+        title="Brawl Mode"
+        subtitle="Single-game arena fight"
+        icon={<Swords className="w-6 h-6" />}
+        variant="violet"
+        expanded={openLane === 'brawl'}
+        focused={focus === 0}
+        onHover={() => setFocus(0)}
+        onToggle={() => toggle('brawl')}
+        onPickTeam={() => onBrawl()}
+      />
+      {/* SZN Mode anchors the second slot — the flagship roguelike loop
+          that skips straight into a full run instead of a single-game
+          flow. Default gamepad focus lives here (see `focus` init
+          above) so the existing controller muscle memory survives. */}
       <LaneButton
         lane="szn"
         title="SZN Mode"
@@ -335,8 +367,8 @@ function MainMenu({
         icon={<Calendar className="w-6 h-6" />}
         variant="emerald"
         expanded={openLane === 'szn'}
-        focused={focus === 0}
-        onHover={() => setFocus(0)}
+        focused={focus === 1}
+        onHover={() => setFocus(1)}
         onToggle={() => toggle('szn')}
         onPickTeam={() => onSzn()}
       />
@@ -347,8 +379,8 @@ function MainMenu({
         icon={<Trophy className="w-6 h-6" />}
         variant="red"
         expanded={openLane === 'auction'}
-        focused={focus === 1}
-        onHover={() => setFocus(1)}
+        focused={focus === 2}
+        onHover={() => setFocus(2)}
         onToggle={() => toggle('auction')}
         onPickTeam={(team) => onAuction(team)}
       />
@@ -359,8 +391,8 @@ function MainMenu({
         icon={<Zap className="w-6 h-6" />}
         variant="gold"
         expanded={openLane === 'quick'}
-        focused={focus === 2}
-        onHover={() => setFocus(2)}
+        focused={focus === 3}
+        onHover={() => setFocus(3)}
         onToggle={() => toggle('quick')}
         onPickTeam={(team) => {
           const s = rollQuestSlate();
@@ -378,10 +410,10 @@ function MainMenu({
       <button
         type="button"
         onClick={onLearn}
-        onMouseEnter={() => setFocus(3)}
-        onFocus={() => setFocus(3)}
+        onMouseEnter={() => setFocus(4)}
+        onFocus={() => setFocus(4)}
         className={`group w-full flex items-center justify-center gap-2 mt-1 px-4 py-3 rounded-lg border bg-slate-900/40 hover:bg-slate-800/70 transition-colors dugout-font-base text-sm font-bold uppercase tracking-widest text-amber-200 hover:text-amber-100 ${
-          focus === 3
+          focus === 4
             ? 'border-amber-300 ring-2 ring-amber-400/70'
             : 'border-amber-400/40 hover:border-amber-300/70'
         }`}
@@ -439,7 +471,7 @@ function LaneButton({
   title: string;
   subtitle: string;
   icon: React.ReactNode;
-  variant: 'red' | 'gold' | 'emerald';
+  variant: 'red' | 'gold' | 'emerald' | 'violet';
   expanded: boolean;
   focused?: boolean;
   onHover?: () => void;
@@ -451,12 +483,15 @@ function LaneButton({
       ? 'dugout-btn-primary text-white shadow-[0_0_20px_rgba(227,24,55,0.4)] hover:shadow-[0_0_30px_rgba(227,24,55,0.7)]'
       : variant === 'emerald'
         ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-[0_0_20px_rgba(16,185,129,0.4)] hover:shadow-[0_0_30px_rgba(16,185,129,0.7)] transition-colors'
-        : 'dugout-btn-gold text-stone-900 shadow-[0_0_20px_rgba(255,215,0,0.35)] hover:shadow-[0_0_30px_rgba(255,215,0,0.6)]';
-  // SZN Mode skips the AWAY/HOME team picker -- a run is asynchronous
-  // weekend baseball, not a coin-flip game, so the seat distinction is
-  // meaningless to a player just picking up the lane. Clicking "SZN Mode"
-  // jumps straight into the pack rip with the user batting first (AWAY).
-  const skipTeamPicker = lane === 'szn';
+        : variant === 'violet'
+          ? 'bg-violet-600 hover:bg-violet-500 text-white shadow-[0_0_20px_rgba(139,92,246,0.45)] hover:shadow-[0_0_30px_rgba(139,92,246,0.7)] transition-colors'
+          : 'dugout-btn-gold text-stone-900 shadow-[0_0_20px_rgba(255,215,0,0.35)] hover:shadow-[0_0_30px_rgba(255,215,0,0.6)]';
+  // SZN Mode and Brawl Mode both skip the AWAY/HOME team picker -- the
+  // seat distinction is meaningless to a player just committing to a
+  // headline lane (SZN is an asynchronous weekend-baseball run; Brawl
+  // is a one-off arena fight). Both launch with the user batting first
+  // (AWAY) so the controller-first flow stays one CROSS press deep.
+  const skipTeamPicker = lane === 'szn' || lane === 'brawl';
   const handleClick = () => {
     if (skipTeamPicker) {
       onPickTeam('AWAY');

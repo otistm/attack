@@ -4,13 +4,19 @@ import { Reorder, motion, AnimatePresence } from 'motion/react';
 import { CardDefinition } from '../lib/cards';
 import { canConnect, canConnectAny, shapeModeForSide, seamKey } from '../lib/connect';
 import { useGameStore, getUiUserSide, isLowLeverageAtBat, ResolutionBeat, Phase } from '../lib/gameStore';
-import { HitOutcome } from '../lib/scoring';
+import { HitOutcome, type BrawlOutcomeResolution } from '../lib/scoring';
 import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
 import { SznEdgeHalf } from './SznEdgeHalf';
 import type { SznEdgeId } from '../lib/sznEdges';
 import { PlayerHero } from './PlayerHero';
 import { ManagerHand } from './ManagerHand';
 import { QuestStrip } from './QuestStrip';
+import {
+  BrawlAttackOverlay,
+  useBrawlAttackReveal,
+  type BrawlShakePulse,
+} from './brawl/BrawlAttackReveal';
+import type { BrawlAura } from './brawl/BrawlImpactCanvas';
 import { teamPalette } from '../lib/teamColors';
 import { RARITY_BASE_VALUE } from '../lib/run';
 import { activeSynergies, teamBatterBonus, teamPitcherBonus } from '../lib/synergies';
@@ -779,6 +785,11 @@ const CardItem = ({
   );
 };
 
+/** Brawl Mode snap window before auto-lock. Shared by timer + hint UI. */
+const BRAWL_SNAP_DURATION_MS = 15000;
+/** Show "snap to attack" nudge when timer drops below this threshold. */
+const BRAWL_SNAP_HINT_THRESHOLD_MS = 5000;
+
 export const CardGameOverlay = () => {
   // SZN deck-footer height (the always-visible two-row decks rendered by
   // `SznFooterDecks` at the App level). Read it from the store so the
@@ -800,6 +811,12 @@ export const CardGameOverlay = () => {
   // "New Game" button becomes "Continue Run" and reports the result back
   // to the run controller (advances to game 2/3 or ends the series).
   const sznRunActive = useGameStore((s) => s.gameMode === 'szn' && !!s.run);
+  // Brawl Mode flag. Strips the at-bat down to its core combat loop:
+  // no Manager's Hand, no Quest strip, no Lock-In button (a 5-second
+  // timer auto-locks for both sides). The opponent's value pill flips
+  // to sit BELOW their cards, and both PlayerHero rails are hidden so
+  // the pills are the canonical HP readouts during the snap.
+  const brawlMode = useGameStore((s) => s.gameMode === 'brawl');
   const run = useGameStore((s) => s.run);
   const reportSeriesGameResult = useGameStore((s) => s.reportSeriesGameResult);
   // Tri-state result for the SZN "Continue Run" handoff: ties cap at one
@@ -818,6 +835,11 @@ export const CardGameOverlay = () => {
   const lastBatterScore = useGameStore((s) => s.lastBatterScore);
   const lastPitcherScore = useGameStore((s) => s.lastPitcherScore);
   const lastResultMessage = useGameStore((s) => s.lastResultMessage);
+  // Brawl Mode HP-ladder snapshot. Feeds the HitResultBanner so the
+  // scoreline reads as HP and the 21+ swing pops a GRAND SLAM cue.
+  // Null on every non-brawl at-bat; the banner falls back to the
+  // standard chain-math copy.
+  const lastBrawlResolution = useGameStore((s) => s.lastBrawlResolution);
   const scoreBatterFn = useGameStore((s) => s.scoreBatter);
   const scorePitcherFn = useGameStore((s) => s.scorePitcher);
   const previewMatchupFn = useGameStore((s) => s.previewMatchup);
@@ -1016,21 +1038,215 @@ export const CardGameOverlay = () => {
     finalBatterScore: lastBatterScore,
     finalPitcherScore: lastPitcherScore,
     onComplete: completeReveal,
+    // Brawl Mode disables the standard per-beat orchestrator; the
+    // BrawlAttackReveal below owns the reveal timeline + pill HP
+    // depletion and is responsible for calling `completeReveal()`.
+    disabled: brawlMode,
   });
+
+  // -------------------------------------------------------------------------
+  // Brawl Mode attack reveal: cards fly at HP pills, R3F VFX on impact.
+  // -------------------------------------------------------------------------
+  // Bumped on every impact so the parent ScreenShake re-fires for each
+  // card landing. Starts at the gameStore's quest shake counter and
+  // increments locally so we don't fight the quest-completion shake
+  // (which already lives on the outer ScreenShake wrapper).
+  const [brawlShake, setBrawlShake] = useState<BrawlShakePulse>({
+    id: 0,
+    power: 0,
+    grand: false,
+  });
+  const [brawlSnapRemainingMs, setBrawlSnapRemainingMs] = useState(BRAWL_SNAP_DURATION_MS);
+  // Attacker queues are derived from the locked-in card chains in the
+  // reveal math snapshot. Falling back to the raw hand keeps us
+  // resilient if the snapshot hasn't populated yet.
+  //
+  // CRITICAL: each side's per-card damage values are SCALED so they sum
+  // EXACTLY to that side's locked-in pill total (`lastBatterScore` /
+  // `lastPitcherScore`). The raw per-card modifiers only capture the
+  // best-chain contribution; they ignore comprehensive bonuses like
+  // synergies, opponentModifier debuffs, edge stacking, etc. that move
+  // the pill. Without scaling, the bar drains by a number smaller (or
+  // larger) than the pill total and the winner's residual HP doesn't
+  // match `winnerHP = winnerTotal - loserTotal` -- which is the number
+  // resolveBrawlOutcome uses to pick single / double / triple / HR /
+  // grand slam. Scaling guarantees the visual depletion lands on the
+  // exact value the at-bat ladder is judged against.
+  const brawlAttackers = useMemo(() => {
+    if (!brawlMode) return { batter: [], pitcher: [] };
+    const buildSide = (
+      hand: typeof batterHand,
+      cardMods: Record<string, { value: number }>,
+      sideTotal: number,
+    ) => {
+      // Only include cards that actually SCORED into a group on this
+      // at-bat. `scoreGroup` only writes a `cardModifiers` entry when
+      // it processes a card inside a group; singletons / unconnected
+      // cards never land in the map. Those cards didn't contribute to
+      // the pill total and so they shouldn't launch a projectile here
+      // -- otherwise an unsnapped card would visibly attack and look
+      // like it dealt phantom damage. Cards with a 0 modifier value
+      // (chain-too-short, fully debuffed) are also filtered so the
+      // reveal doesn't fire empty ghosts.
+      const raw = hand
+        .filter((c) => {
+          const mod = cardMods[c.id];
+          return mod !== undefined && Math.max(0, Math.round(mod.value)) > 0;
+        })
+        .map((c) => ({
+          id: c.id,
+          power: Math.max(0, Math.round(cardMods[c.id].value)),
+          label: c.name ?? c.id,
+        }));
+      const target = Math.max(0, Math.round(sideTotal));
+      if (target === 0) return [];
+      if (raw.length === 0) {
+        // Side has HP but no per-card modifier entries (aggregate-only
+        // bonuses). Still animate every hand card so the opponent's
+        // projectiles visibly fly on phase 2.
+        if (hand.length === 0) return [];
+        const base = Math.floor(target / hand.length);
+        const remainder = target - base * hand.length;
+        return hand.map((c, i) => ({
+          id: c.id,
+          power: base + (i === hand.length - 1 ? remainder : 0),
+          label: c.name ?? c.id,
+        }));
+      }
+      const rawSum = raw.reduce((s, c) => s + c.power, 0);
+      // Defensive: if every contributing card somehow rounds to 0
+      // (target > 0 but rawSum === 0), distribute the target evenly so
+      // the bar still drains visibly.
+      if (rawSum === 0) {
+        const base = Math.floor(target / raw.length);
+        const remainder = target - base * raw.length;
+        return raw.map((c, i) => ({
+          ...c,
+          power: base + (i === raw.length - 1 ? remainder : 0),
+        }));
+      }
+      // Common path: scale proportionally so sum === target. Cards
+      // that contributed more to the raw chain hit harder; the relative
+      // weighting is preserved.
+      const scaled = raw.map((c) => ({
+        ...c,
+        power: Math.max(0, Math.round((c.power * target) / rawSum)),
+      }));
+      // Push any rounding residual into the highest-damage card so the
+      // sum lands exactly on `target`. We pick the heaviest card (not
+      // just the last) so the "finishing blow" feels like a heavyweight
+      // landed it rather than a chip card silently absorbing slack.
+      let residual = target - scaled.reduce((s, c) => s + c.power, 0);
+      if (residual !== 0) {
+        let idx = 0;
+        for (let i = 1; i < scaled.length; i++) {
+          if (scaled[i].power > scaled[idx].power) idx = i;
+        }
+        scaled[idx] = {
+          ...scaled[idx],
+          power: Math.max(0, scaled[idx].power + residual),
+        };
+      }
+      return scaled;
+    };
+    return {
+      batter: buildSide(batterHand, lastBatterCardModifiers, lastBatterScore),
+      pitcher: buildSide(pitcherHand, lastPitcherCardModifiers, lastPitcherScore),
+    };
+  }, [
+    brawlMode,
+    batterHand,
+    pitcherHand,
+    lastBatterCardModifiers,
+    lastPitcherCardModifiers,
+    lastBatterScore,
+    lastPitcherScore,
+  ]);
+
+  const brawlReveal = useBrawlAttackReveal({
+    enabled: brawlMode && phase === 'revealing',
+    batterAttackers: brawlAttackers.batter,
+    pitcherAttackers: brawlAttackers.pitcher,
+    batterHP: lastBatterScore,
+    pitcherHP: lastPitcherScore,
+    userIsBatting,
+    grandSlam: lastBrawlResolution?.grandSlam === true,
+    onComplete: completeReveal,
+    onImpact: (power, grand) => {
+      // Scope shake to the brawl overlay and scale by impact power so
+      // big swings read heavier than chip hits.
+      setBrawlShake((prev) => ({
+        id: prev.id + 1,
+        power,
+        grand,
+      }));
+    },
+    // runId pins the timeline to the current at-bat -- two sequential
+    // brawl at-bats can't have the second one inherit timers from the
+    // first because atBatId increments on every deal.
+    runId: atBatId,
+  });
+  // ---- end brawl reveal wiring -----------------------------------------
+
+  // The pills in brawl mode read from `brawlReveal.displayed*HP` during
+  // the reveal phase; outside reveal they fall back to `lastBatterScore`
+  // / `lastPitcherScore` (which already are the locked-in totals).
+  // Auras hover next to the pills so the R3F canvas can paint ambient
+  // sparkles at the live pill coordinates. We update them lazily via a
+  // small DOM-rect probe inside an effect (cheap; runs once on reveal
+  // start) so we don't measure on every render.
+  const [brawlAuras, setBrawlAuras] = useState<BrawlAura[]>([]);
+  useEffect(() => {
+    if (!brawlMode || phase !== 'revealing') {
+      setBrawlAuras([]);
+      return;
+    }
+    const probe = () => {
+      const user = document.querySelector<HTMLElement>('[data-brawl-pill="user"]');
+      const opp = document.querySelector<HTMLElement>('[data-brawl-pill="opponent"]');
+      const center = (el: HTMLElement | null) => {
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      };
+      const u = center(user);
+      const o = center(opp);
+      const auras: BrawlAura[] = [];
+      if (u) auras.push({ side: 'user', x: u.x, y: u.y, defeated: brawlReveal.displayedBatterHP === 0 && userIsBatting || brawlReveal.displayedPitcherHP === 0 && !userIsBatting });
+      if (o) auras.push({ side: 'opponent', x: o.x, y: o.y, defeated: brawlReveal.displayedPitcherHP === 0 && userIsBatting || brawlReveal.displayedBatterHP === 0 && !userIsBatting });
+      setBrawlAuras(auras);
+    };
+    probe();
+    // Re-probe on resize so the aura tracks if the user shrinks the window.
+    window.addEventListener('resize', probe);
+    return () => window.removeEventListener('resize', probe);
+  }, [brawlMode, phase, brawlReveal.displayedBatterHP, brawlReveal.displayedPitcherHP, userIsBatting]);
 
   // Batter/pitcher numbers used for pills: during `revealing`, both lanes follow
   // the orchestrator; in `selecting` the matchup preview still computes both
   // totals but the opponent readout is fogged via `hideOpponentTotals`.
+  // Brawl Mode swaps the reveal source so the pills tick DOWN (HP depletion)
+  // instead of UP -- the brawl reveal owns the displayed values until its
+  // attack sequence completes. After resolve, pills show post-combat
+  // remaining HP (the shield depleted), not the pre-attack starting totals.
   const batterDisplayValue = isResolved
-    ? lastBatterScore
+    ? brawlMode && lastBrawlResolution
+      ? lastBrawlResolution.batterRemainingHP
+      : lastBatterScore
     : isRevealing
-    ? reveal.displayedBatter
-    : matchup.batterDisplay;
+      ? brawlMode
+        ? Math.round(brawlReveal.displayedBatterHP)
+        : reveal.displayedBatter
+      : matchup.batterDisplay;
   const pitcherDisplayValue = isResolved
-    ? lastPitcherScore
+    ? brawlMode && lastBrawlResolution
+      ? lastBrawlResolution.pitcherRemainingHP
+      : lastPitcherScore
     : isRevealing
-    ? reveal.displayedPitcher
-    : matchup.pitcherDisplay;
+      ? brawlMode
+        ? Math.round(brawlReveal.displayedPitcherHP)
+        : reveal.displayedPitcher
+      : matchup.pitcherDisplay;
   const outcomeBadgeStyle = outcomeStyle(lastOutcome);
 
   // After a hit the camera zooms out to follow the runner. Previously the
@@ -1049,6 +1265,17 @@ export const CardGameOverlay = () => {
   // keeps the rest of the JSX agnostic to which role the user is in.
   const userHand = userIsBatting ? batterHand : pitcherHand;
   const aiHand = userIsBatting ? pitcherHand : batterHand;
+  // True when the user has snapped at least one adjacent pair in their
+  // hand. Brawl's attack phase only credits chained cards, so we nudge
+  // the player when the timer is winding down and they haven't snapped yet.
+  const userHasSnapChain = useMemo(() => {
+    for (let i = 0; i < userHand.length - 1; i++) {
+      if (affirmedSeams.has(seamKey(userHand[i].id, userHand[i + 1].id))) {
+        return true;
+      }
+    }
+    return false;
+  }, [userHand, affirmedSeams]);
   const userModifiers = userIsBatting ? batterModifiersForStrip : pitcherModifiersForStrip;
   const aiModifiers = userIsBatting ? pitcherModifiersForStrip : batterModifiersForStrip;
   const reorderUser = userIsBatting ? reorderBatter : reorderPitcher;
@@ -1060,6 +1287,42 @@ export const CardGameOverlay = () => {
   const aiBanner = userIsBatting ? reveal.pitcherBanner : reveal.batterBanner;
   const userPillValue = userIsBatting ? batterDisplayValue : pitcherDisplayValue;
   const aiPillValue = userIsBatting ? pitcherDisplayValue : batterDisplayValue;
+  // Brawl pill fill: always on in brawl mode. During selection the bar
+  // tracks the live preview (full). During reveal it drains against the
+  // locked-in shield. After the result it stays visible showing
+  // remaining HP vs the starting shield max.
+  const userBrawlHpMax =
+    !brawlMode
+      ? null
+      : isSelecting
+        ? Math.max(1, userPillValue ?? 0)
+        : lastBrawlResolution
+          ? userIsBatting
+            ? lastBrawlResolution.batterStartingHP
+            : lastBrawlResolution.pitcherStartingHP
+          : isRevealing
+            ? userIsBatting
+              ? lastBatterScore
+              : lastPitcherScore
+            : Math.max(1, userPillValue ?? 0);
+  const opponentBrawlHpMax =
+    !brawlMode
+      ? null
+      : isSelecting && hideOpponentTotals
+        ? null
+        : isSelecting
+          ? Math.max(1, aiPillValue ?? 0)
+          : lastBrawlResolution
+            ? userIsBatting
+              ? lastBrawlResolution.pitcherStartingHP
+              : lastBrawlResolution.batterStartingHP
+            : isRevealing
+              ? userIsBatting
+                ? lastPitcherScore
+                : lastBatterScore
+              : Math.max(1, aiPillValue ?? 0);
+  const userBrawlHpFill = brawlMode && userBrawlHpMax != null;
+  const opponentBrawlHpFill = brawlMode && opponentBrawlHpMax != null;
   const userLabel = userIsBatting ? 'Batter' : 'Pitcher';
   const aiLabel = userIsBatting ? 'Pitcher' : 'Batter';
   const userTone = userIsBatting ? 'batter' : 'pitcher';
@@ -1532,38 +1795,51 @@ export const CardGameOverlay = () => {
         batterName={batter?.name ?? null}
         pitcherName={pitcher?.name ?? null}
         userIsBatting={userIsBatting}
+        brawlResolution={lastBrawlResolution}
       />
 
-      <QuestStrip />
+      {!brawlMode && <QuestStrip />}
 
-      <RevealBeatSpotlight
-        active={isRevealing}
-        spotlight={reveal.revealSpotlight}
-        batterCardIds={batterCardIds}
-        batterModifiers={batterModifiersForStrip}
-        pitcherModifiers={pitcherModifiersForStrip}
-        batterOverrides={reveal.batterValueOverrides}
-        pitcherOverrides={reveal.pitcherValueOverrides}
-      />
+      {/* Brawl Mode owns its own reveal spotlight via the BrawlAttackOverlay
+          mounted at the end of this file -- the per-beat highlight ring
+          is the wrong vocabulary for "cards smash into HP pill" so we
+          suppress it whenever the brawl reveal is active. */}
+      {!brawlMode && (
+        <RevealBeatSpotlight
+          active={isRevealing}
+          spotlight={reveal.revealSpotlight}
+          batterCardIds={batterCardIds}
+          batterModifiers={batterModifiersForStrip}
+          pitcherModifiers={pitcherModifiersForStrip}
+          batterOverrides={reveal.batterValueOverrides}
+          pitcherOverrides={reveal.pitcherValueOverrides}
+        />
+      )}
 
       {/* Player hero rail: top slot = opponent (fog `?` only during selection),
           bottom = you (live total once that side has a committed layout). Pairs
-          with your hand at the bottom whether you bat or pitch. */}
-      <div className="hidden md:block pointer-events-none absolute left-8 top-32 z-20">
-        <PlayerHero
-          player={userIsBatting ? pitcher : batter}
-          value={hideOpponentTotals ? null : aiPillValue}
-          role={userIsBatting ? 'PITCHER' : 'BATTER'}
-          dimmed={hideOpponentTotals}
-          showTotalBesideCard={false}
-        />
-      </div>
+          with your hand at the bottom whether you bat or pitch.
+          Brawl Mode strips BOTH rails -- the HP pills above/below the cards
+          are the canonical reads for that lane, and a side-rail hero would
+          just duplicate the matchup total beside the pill. */}
+      {!brawlMode && (
+        <div className="hidden md:block pointer-events-none absolute left-8 top-32 z-20">
+          <PlayerHero
+            player={userIsBatting ? pitcher : batter}
+            value={hideOpponentTotals ? null : aiPillValue}
+            role={userIsBatting ? 'PITCHER' : 'BATTER'}
+            dimmed={hideOpponentTotals}
+            showTotalBesideCard={false}
+          />
+        </div>
+      )}
       {/* SZN Mode: the user's player already shows as a card in the
           bottom hand strip, so the left-rail hero would just duplicate
           the same identity (same name, same team colors). Suppress it
           for SZN runs to keep the player rail clean; non-SZN lanes keep
-          the hero rail because their hand is dealt cards (no player). */}
-      {!sznRunActive && (
+          the hero rail because their hand is dealt cards (no player).
+          Brawl Mode also bows out -- the user's pill is the HP readout. */}
+      {!sznRunActive && !brawlMode && (
         <div className="hidden md:block pointer-events-none absolute left-8 bottom-32 z-20">
           <PlayerHero
             player={userIsBatting ? batter : pitcher}
@@ -1576,26 +1852,45 @@ export const CardGameOverlay = () => {
 
       {/* AI hand - top of screen. Face-down during selection regardless of
           whether the AI is playing batter or pitcher this half (same
-          fog-of-war either direction). */}
+          fog-of-war either direction).
+          Brawl Mode flips the inner column so the opponent's HP pill sits
+          BELOW their cards (the user requested the value pill on the side
+          farther from the player on their opponent's side, mirroring how
+          the user's pill sits above the user's cards on the bottom). The
+          cards stay anchored to the top edge of the screen so the field
+          stays visible between the two strips. */}
       <motion.div
         className="absolute inset-x-0 top-24 pointer-events-none flex flex-col items-center pt-4 pb-3 bg-gradient-to-b from-slate-900/70 via-slate-900/30 to-transparent"
         initial={false}
         animate={{ y: 0, opacity: 1 }}
         transition={{ duration: 0.55, ease: [0.4, 0, 0.2, 1] }}
       >
-        <div className="pointer-events-auto flex flex-col items-center gap-2">
-          <ScorePill
-            label={aiLabel}
-            tone={aiTone}
-            value={hideOpponentTotals ? null : aiPillValue}
-            outcomeStyle={outcomeBadgeStyle}
-            compact
-            banner={hideOpponentTotals ? null : aiBanner}
-            /* Left-rail opponent hero omits the giant total (`showTotalBesideCard={false}`),
-             * so this pill must remain the canonical readout at every breakpoint. */
-            heroHasValue={false}
-          />
-          <div data-tutorial="opponent-hand">
+        <div
+          className={`pointer-events-auto flex flex-col items-center gap-2 ${
+            brawlMode ? 'flex-col-reverse' : ''
+          }`}
+        >
+          {/* Wrap the AI's ScorePill so the brawl reveal can locate the
+              opponent HP pill via a stable selector. Wrapper is purely a
+              positional reference; it doesn't change layout. */}
+          <div
+            data-brawl-pill="opponent"
+            data-brawl-pill-seat={userIsBatting ? 'pitcher' : 'batter'}
+          >
+            <ScorePill
+              label={aiLabel}
+              tone={aiTone}
+              value={hideOpponentTotals ? null : aiPillValue}
+              outcomeStyle={outcomeBadgeStyle}
+              compact
+              banner={hideOpponentTotals ? null : aiBanner}
+              heroHasValue={false}
+              brawlHpMax={opponentBrawlHpMax}
+              brawlHpSide="opponent"
+              brawlHpFill={opponentBrawlHpFill}
+            />
+          </div>
+          <div data-tutorial="opponent-hand" data-brawl-hand="opponent">
             <FlipPitcherStrip
               hand={aiHand}
               modifiers={aiModifiers}
@@ -1626,26 +1921,39 @@ export const CardGameOverlay = () => {
       >
 
         <div className="pointer-events-auto flex flex-col items-center gap-4">
-          <ScorePill
-            label={userLabel}
-            tone={userTone}
-            value={userPillValue}
-            outcome={isResolved ? lastResultMessage : undefined}
-            outcomeStyle={outcomeBadgeStyle}
-            atBatId={atBatId}
-            banner={userBanner}
-            // SZN hides the bottom PlayerHero rail; keep the matchup total in the pill at md+.
-            heroHasValue={!sznRunActive}
-            // Hit Scale hint is a batter-only concept ("if you win, +N to
-            // your hit"). Only show it when the user IS the batter.
-            hitScaleHint={
-              userIsBatting && isSelecting && matchup.batterWinning && matchup.batterHitScaleBonus !== 0
-                ? matchup.batterHitScaleBonus
-                : null
-            }
-            rosterSynergyHint={userSznRosterSynergyAmount}
-            rosterSynergyTitle={userSznRosterSynergyTitle}
-          />
+          {/* User pill wrapper carries the brawl reveal anchor so the
+              flying-card ghosts the AI launches can land on the right
+              screen coordinate. */}
+          <div
+            data-brawl-pill="user"
+            data-brawl-pill-seat={userIsBatting ? 'batter' : 'pitcher'}
+          >
+            <ScorePill
+              label={userLabel}
+              tone={userTone}
+              value={userPillValue}
+              outcome={isResolved && !brawlMode ? lastResultMessage : undefined}
+              outcomeStyle={outcomeBadgeStyle}
+              atBatId={atBatId}
+              banner={userBanner}
+              // SZN hides the bottom PlayerHero rail; keep the matchup total in
+              // the pill at md+. Brawl Mode also hides the rail (the pill IS
+              // the HP readout) so it's likewise canonical there.
+              heroHasValue={!sznRunActive && !brawlMode}
+              // Hit Scale hint is a batter-only concept ("if you win, +N to
+              // your hit"). Only show it when the user IS the batter.
+              hitScaleHint={
+                userIsBatting && isSelecting && matchup.batterWinning && matchup.batterHitScaleBonus !== 0
+                  ? matchup.batterHitScaleBonus
+                  : null
+              }
+              rosterSynergyHint={userSznRosterSynergyAmount}
+              rosterSynergyTitle={userSznRosterSynergyTitle}
+              brawlHpMax={userBrawlHpMax}
+              brawlHpSide="user"
+              brawlHpFill={userBrawlHpFill}
+            />
+          </div>
 
           {/* Math breakdown: explains why the pill differs from the visible
               chain sum when an opponent debuff (p-38 / p-50 / p-60 / p-72 /
@@ -1717,7 +2025,14 @@ export const CardGameOverlay = () => {
             />
           )}
 
-          <div data-tutorial="user-hand">
+          {brawlMode && isSelecting && (
+            <BrawlSnapAttackHint
+              remainingMs={brawlSnapRemainingMs}
+              hasSnapChain={userHasSnapChain}
+            />
+          )}
+
+          <div data-tutorial="user-hand" data-brawl-hand="user">
             <HandStrip
               hand={userHand}
               onReorder={reorderUser}
@@ -1775,16 +2090,31 @@ export const CardGameOverlay = () => {
                 exit={{ opacity: 0, y: 10 }}
                 className="flex flex-col items-center gap-2"
               >
-                <CtaButton
-                  data-tutorial="lock-in"
-                  onClick={lockIn}
-                  focused={screenCtaFocused}
-                  tone="blue"
-                  size="lg"
-                >
-                  Lock In
-                </CtaButton>
-                {sznRunActive && !tutorialActive && (
+                {brawlMode ? (
+                  // Brawl Mode replaces the manual Lock In commit with the
+                  // 5-second snap timer. The countdown is the user's only
+                  // pre-resolution affordance: snap cards together until 0
+                  // and the engine commits whatever they've built. No
+                  // Quick-Resolve toggle here either -- the whole loop is
+                  // already on a 5-second leash.
+                  <BrawlSnapTimer
+                    phase={phase}
+                    atBatId={atBatId}
+                    onTimeout={lockIn}
+                    onRemainingMsChange={setBrawlSnapRemainingMs}
+                  />
+                ) : (
+                  <CtaButton
+                    data-tutorial="lock-in"
+                    onClick={lockIn}
+                    focused={screenCtaFocused}
+                    tone="blue"
+                    size="lg"
+                  >
+                    Lock In
+                  </CtaButton>
+                )}
+                {sznRunActive && !tutorialActive && !brawlMode && (
                   <QuickResolveToggle
                     enabled={quickResolveEnabled}
                     active={quickResolveActive}
@@ -1802,6 +2132,7 @@ export const CardGameOverlay = () => {
                     the pill's own state visuals. */}
                 {sznRunActive &&
                   !tutorialActive &&
+                  !brawlMode &&
                   !quickResolveEnabled &&
                   isLowLeverage && (
                     <button
@@ -1863,12 +2194,29 @@ export const CardGameOverlay = () => {
         </div>
       </motion.div>
 
-      <ManagerHand side={userSide} />
+      {!brawlMode && <ManagerHand side={userSide} />}
 
       {/* SZN deck footer is mounted at App level so it persists across
           the entire SZN experience (front office, draft, series intro,
           combat). It self-locates this overlay's user-hand container
           via the `data-szn-hand-drop-zone` attribute set above. */}
+
+      {/* Brawl Mode reveal: cards fly at HP pills, R3F-driven particle
+          impacts. Mounted *outside* the inner layout so the fullscreen
+          fixed overlay (canvas + DOM ghosts) draws above the field but
+          below the HitResultBanner that sits at the top of this
+          fragment. The components themselves are no-ops when there's
+          nothing in-flight (empty impacts + empty flying arrays). */}
+      {brawlMode && phase === 'revealing' && (
+        <BrawlAttackOverlay
+          impacts={brawlReveal.impacts}
+          flying={brawlReveal.flying}
+          auras={brawlAuras}
+          hitNumbers={brawlReveal.hitNumbers}
+          shakePulse={brawlShake}
+          attackPhase={brawlReveal.attackPhase}
+        />
+      )}
     </>
   );
 };
@@ -1939,6 +2287,171 @@ const QuickResolveToggle = ({
 };
 
 /**
+ * Brawl Mode snap timer. Replaces the manual Lock In button: the user has
+ * exactly 5 seconds to snap cards together and pump their HP pill before
+ * the at-bat auto-commits. Renders a chunky countdown directly under the
+ * user's hand so the urgency is unmissable; the bar drains left-to-right
+ * and the digit ticks down once per second.
+ *
+ * Mounts only during `phase === "selecting"`. Resets every time the phase
+ * re-enters selecting (next at-bat), so a 0s leftover from the previous
+ * play can't auto-lock the fresh one. The timeout calls `onTimeout` once
+ * and only once via a ref-guarded effect -- otherwise an `effect` re-run
+ * could fire the auto-commit twice (which would silently re-run `lockIn`
+ * after the engine already moved into `revealing`, no-op now but a tax on
+ * future refactors).
+ *
+ * Visual tone: amber-orange to read as "decision pressure" rather than
+ * the blue/emerald of the existing Lock In CTA -- a different vocabulary
+ * for a different lane. Pulses the ring on the final 2 seconds so the
+ * user feels the squeeze.
+ */
+function BrawlSnapAttackHint({
+  remainingMs,
+  hasSnapChain,
+}: {
+  remainingMs: number;
+  hasSnapChain: boolean;
+}) {
+  const show =
+    remainingMs <= BRAWL_SNAP_HINT_THRESHOLD_MS && remainingMs > 0 && !hasSnapChain;
+  const urgent = remainingMs <= 2000;
+
+  return (
+    <AnimatePresence>
+      {show && (
+        <motion.div
+          key="brawl-snap-hint"
+          initial={{ opacity: 0, y: 8, scale: 0.94 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: 6, scale: 0.96 }}
+          transition={{ duration: 0.28, ease: [0.4, 0, 0.2, 1] }}
+          className={`px-4 py-2 rounded-xl border-2 backdrop-blur-sm shadow-lg select-none ${
+            urgent
+              ? 'border-rose-300/80 bg-rose-950/85 text-rose-100 ring-2 ring-rose-400/35 animate-pulse'
+              : 'border-amber-300/70 bg-amber-950/80 text-amber-100 ring-1 ring-amber-400/25'
+          }`}
+          role="status"
+          aria-live="polite"
+        >
+          <div className="text-[10px] font-black uppercase tracking-[0.28em] text-center">
+            Snap to Attack
+          </div>
+          <div className="mt-0.5 text-[11px] font-semibold text-center opacity-90">
+            Drag adjacent cards together before time runs out
+          </div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+function BrawlSnapTimer({
+  phase,
+  atBatId,
+  onTimeout,
+  onRemainingMsChange,
+}: {
+  phase: Phase;
+  /** Resets the countdown when a fresh at-bat deals in. */
+  atBatId: number;
+  onTimeout: () => void;
+  /** Fires every animation frame while selecting so sibling UI (hints) can react. */
+  onRemainingMsChange?: (ms: number) => void;
+}) {
+  const [remainingMs, setRemainingMs] = useState(BRAWL_SNAP_DURATION_MS);
+  const firedRef = useRef(false);
+  const onTimeoutRef = useRef(onTimeout);
+  const onRemainingMsChangeRef = useRef(onRemainingMsChange);
+  useEffect(() => {
+    onTimeoutRef.current = onTimeout;
+  }, [onTimeout]);
+  useEffect(() => {
+    onRemainingMsChangeRef.current = onRemainingMsChange;
+  }, [onRemainingMsChange]);
+
+  // Drive the countdown off a fresh start time each time we (re)enter
+  // selecting. Without re-anchoring, the user could "save" leftover
+  // time between at-bats by ripping fast on the previous one.
+  useEffect(() => {
+    if (phase !== 'selecting') {
+      onRemainingMsChangeRef.current?.(BRAWL_SNAP_DURATION_MS);
+      return;
+    }
+    firedRef.current = false;
+    const startedAt = Date.now();
+    setRemainingMs(BRAWL_SNAP_DURATION_MS);
+    onRemainingMsChangeRef.current?.(BRAWL_SNAP_DURATION_MS);
+    let raf = 0;
+    const tick = () => {
+      const elapsed = Date.now() - startedAt;
+      const next = Math.max(0, BRAWL_SNAP_DURATION_MS - elapsed);
+      setRemainingMs(next);
+      onRemainingMsChangeRef.current?.(next);
+      if (next <= 0) {
+        if (!firedRef.current) {
+          firedRef.current = true;
+          // Defer the lockIn call by a frame so React can finish the
+          // current render before the store mutates the phase out from
+          // under us. Same trick the reveal orchestrator uses.
+          raf = requestAnimationFrame(() => onTimeoutRef.current());
+        }
+        return;
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+    };
+  }, [phase, atBatId]);
+
+  if (phase !== 'selecting') return null;
+
+  const seconds = Math.ceil(remainingMs / 1000);
+  const fillPct = Math.max(0, Math.min(100, (remainingMs / BRAWL_SNAP_DURATION_MS) * 100));
+  const fillScale = fillPct / 100;
+  const urgent = remainingMs <= 2000;
+
+  return (
+    <div
+      className={`relative flex items-center gap-3 px-5 py-3 rounded-xl bg-slate-950/85 border-2 shadow-[0_4px_24px_rgba(0,0,0,0.55)] backdrop-blur-sm select-none ${
+        urgent
+          ? 'border-rose-400/80 ring-2 ring-rose-400/40 animate-pulse'
+          : 'border-amber-400/70 ring-2 ring-amber-300/30'
+      }`}
+      role="timer"
+      aria-live="off"
+      aria-label={`Brawl snap timer: ${seconds} seconds remaining`}
+    >
+      <div className="flex flex-col items-start gap-1">
+        <span className="text-[10px] font-black uppercase tracking-[0.25em] text-amber-200/90">
+          Snap Timer
+        </span>
+        {/* Drains horizontally so the user reads "time slipping away"
+            without having to track the digit. Width is clamped to a
+            fixed 96px so the bar doesn't visually stretch the pill. */}
+        <div className="relative h-1.5 w-24 rounded-full bg-slate-800 overflow-hidden">
+          <div
+            className={`h-full w-full origin-left rounded-full ${
+              urgent ? 'bg-rose-400' : 'bg-amber-300'
+            }`}
+            style={{ transform: `scaleX(${fillScale})` }}
+          />
+        </div>
+      </div>
+      <div
+        className={`tabular-nums font-black text-4xl leading-none ${
+          urgent ? 'text-rose-300 drop-shadow-[0_0_12px_rgba(251,113,133,0.6)]' : 'text-amber-200'
+        }`}
+      >
+        {seconds}
+      </div>
+    </div>
+  );
+}
+
+/**
  * Big, transient outcome banner that pops over the field for ~1.6s right
  * after the reveal sequence finishes. Replaces the old "tiny chip on the
  * batter pill" treatment that playtest reports flagged as flat: hits should
@@ -1959,6 +2472,7 @@ const HitResultBanner = ({
   batterName,
   pitcherName,
   userIsBatting,
+  brawlResolution,
 }: {
   outcome: HitOutcome | null;
   phase: Phase;
@@ -1983,6 +2497,14 @@ const HitResultBanner = ({
   pitcherName: string | null;
   /** Drives the "You won by X" / "Beat you by X" wording polarity. */
   userIsBatting: boolean;
+  /**
+   * Brawl Mode HP-ladder snapshot from the last lock-in. When present
+   * we override the banner copy with the HP scoreline ("Batter HP 24
+   * vs Pitcher HP 3 · Grand Slam by 21") and pop a louder GRAND SLAM!
+   * sub-label on `grandSlam` outcomes. Null in non-brawl lanes -- the
+   * banner falls back to the regular chain-math scoreline.
+   */
+  brawlResolution: BrawlOutcomeResolution | null;
 }) => {
   const [visible, setVisible] = useState(false);
   // Re-enter every time a fresh resolved-state lands. We key on atBatId so a
@@ -2032,6 +2554,31 @@ const HitResultBanner = ({
       ? `Pitcher held you off by ${margin}`
       : `You shut it down by ${margin}`;
 
+  // Brawl Mode overrides. The "scoreline" reads as HP ("Batter HP 24
+  // vs Pitcher HP 3") instead of head-to-head chain totals, and the
+  // margin label uses HP-flavored verbiage so the user reads the
+  // ladder thresholds in the same vocabulary as the snap timer + pill.
+  const inBrawl = brawlResolution !== null;
+  const brawlBatterWon = inBrawl ? brawlResolution.batterWon : batterWon;
+  const brawlMargin = inBrawl ? brawlResolution.winnerHP : margin;
+  const brawlUserWon = userIsBatting ? brawlBatterWon : !brawlBatterWon;
+  const brawlVerb = inBrawl
+    ? brawlBatterWon
+      ? userIsBatting
+        ? `Finished with ${brawlMargin} HP`
+        : `They finished with ${brawlMargin} HP`
+      : userIsBatting
+        ? `Shield broken (${brawlResolution!.pitcherRemainingHP} HP left)`
+        : `Shut down — ${brawlResolution!.pitcherRemainingHP} HP left`
+    : verb;
+  const scorelineBatterLabel = inBrawl
+    ? `${batterName ?? 'Batter'} HP ${brawlResolution!.batterRemainingHP}`
+    : `${batterName ?? 'Batter'} ${batterTotal}`;
+  const scorelinePitcherLabel = inBrawl
+    ? `${pitcherName ?? 'Pitcher'} HP ${brawlResolution!.pitcherRemainingHP}`
+    : `${pitcherName ?? 'Pitcher'} ${pitcherTotal}`;
+  const isGrandSlam = brawlResolution?.grandSlam === true;
+
   return (
     <AnimatePresence>
       {visible && (
@@ -2052,12 +2599,23 @@ const HitResultBanner = ({
             style={{ textShadow: '0 2px 8px rgba(0,0,0,0.45)' }}
           >
             <span className="text-5xl font-black uppercase tracking-[0.18em] leading-none">
-              {cfg.label}
+              {isGrandSlam ? 'GRAND SLAM!' : cfg.label}
             </span>
-            {cfg.sub && (
-              <span className="text-xs font-bold uppercase tracking-[0.32em] opacity-80">
-                {cfg.sub}
+            {/* Grand-slam swap: replace the standard "HOMERUN" / "FOUR-
+                BAGGER" sub-label with a louder bases-cleared cue so
+                the 21+ HP swing reads as the apex outcome the brawl
+                ladder promises. Falls back to the normal `cfg.sub`
+                for everything else. */}
+            {isGrandSlam ? (
+              <span className="text-xs font-black uppercase tracking-[0.32em] opacity-90 text-amber-200 drop-shadow-[0_0_8px_rgba(251,191,36,0.65)]">
+                Bases cleared · 4 RBI · {brawlResolution!.winnerHP} HP swing
               </span>
+            ) : (
+              cfg.sub && (
+                <span className="text-xs font-bold uppercase tracking-[0.32em] opacity-80">
+                  {cfg.sub}
+                </span>
+              )
             )}
             {/* Scoreline chip -- the "why" line for the result. Shows
                 the locked-in batter / pitcher totals and the matchup
@@ -2071,21 +2629,21 @@ const HitResultBanner = ({
               <div className="mt-2 flex flex-col items-center gap-0.5">
                 <div className="flex items-center gap-2 text-[11px] font-black uppercase tracking-[0.2em] opacity-95">
                   <span className="rounded-md bg-slate-900/40 px-2 py-0.5 border border-white/25">
-                    {batterName ?? 'Batter'} {batterTotal}
+                    {scorelineBatterLabel}
                   </span>
                   <span className="opacity-70">vs</span>
                   <span className="rounded-md bg-slate-900/40 px-2 py-0.5 border border-white/25">
-                    {pitcherName ?? 'Pitcher'} {pitcherTotal}
+                    {scorelinePitcherLabel}
                   </span>
                 </div>
                 <span
                   className={`mt-0.5 rounded-full px-2.5 py-0.5 text-[10px] font-black uppercase tracking-[0.2em] border ${
-                    userWonMatchup
+                    (inBrawl ? brawlUserWon : userWonMatchup)
                       ? 'bg-emerald-500/30 border-emerald-200/60'
                       : 'bg-rose-500/30 border-rose-200/60'
                   }`}
                 >
-                  {verb}
+                  {brawlVerb}
                 </span>
               </div>
             )}
@@ -2359,6 +2917,16 @@ interface ScorePillProps {
    * the hero rail is hidden -- the pill stays the canonical readout.
    */
   heroHasValue?: boolean;
+  /**
+   * Brawl reveal: locked-in max HP. When set alongside a numeric `value`,
+   * the pill renders an internal left-to-right fill so the pill itself
+   * reads as an HP bar while keeping its rounded shape.
+   */
+  brawlHpMax?: number | null;
+  /** Brawl fill tint — user (amber) vs opponent (rose). */
+  brawlHpSide?: 'user' | 'opponent';
+  /** When true the pill always renders as an HP bar (track + fill). */
+  brawlHpFill?: boolean;
 }
 
 /**
@@ -2388,8 +2956,34 @@ const ScorePill = ({
   rosterSynergyTitle,
   atBatId,
   heroHasValue = false,
+  brawlHpMax = null,
+  brawlHpSide = 'user',
+  brawlHpFill = false,
 }: ScorePillProps) => {
-  const valueColor = tone === 'batter' ? 'text-blue-600' : 'text-rose-600';
+  const showBrawlFill = brawlHpFill && value != null && value >= 0;
+  const safeMax = Math.max(1, brawlHpMax ?? value ?? 1);
+  const clampedHp = showBrawlFill
+    ? Math.max(0, Math.min(safeMax, value!))
+    : 0;
+  const fillPct = showBrawlFill ? (clampedHp / safeMax) * 100 : 100;
+  const critical = showBrawlFill && fillPct > 0 && fillPct <= 25;
+  const brawlFillClass =
+    brawlHpSide === 'user'
+      ? 'bg-gradient-to-r from-amber-500/90 via-amber-400/85 to-yellow-300/80'
+      : 'bg-gradient-to-r from-rose-500/90 via-rose-400/85 to-red-300/80';
+  const brawlFillGlow =
+    brawlHpSide === 'user'
+      ? '0 0 16px rgba(251,191,36,0.45)'
+      : '0 0 16px rgba(244,63,94,0.45)';
+
+  const valueColor = showBrawlFill
+    ? 'text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.75)]'
+    : tone === 'batter'
+      ? 'text-blue-600'
+      : 'text-rose-600';
+  const labelColor = showBrawlFill
+    ? 'text-white/85 drop-shadow-[0_1px_2px_rgba(0,0,0,0.65)]'
+    : 'text-slate-500';
   const containerSize = compact
     ? 'px-4 py-1 text-sm gap-2'
     : 'px-6 py-2 text-xl gap-4';
@@ -2421,10 +3015,57 @@ const ScorePill = ({
     <div className="relative z-30 flex flex-col items-center">
       <motion.div
         layout
-        className={`bg-white/95 backdrop-blur rounded-full font-bold text-slate-900 shadow-xl border-2 border-white/50 flex flex-wrap items-center justify-center gap-1 ${containerSize} ${pillBgHiddenAtMd ? 'md:hidden' : ''}`}
+        className={`relative overflow-hidden rounded-full font-bold shadow-xl border-2 flex flex-wrap items-center justify-center gap-1 ${containerSize} ${pillBgHiddenAtMd ? 'md:hidden' : ''} ${
+          showBrawlFill
+            ? 'bg-slate-950/55 border-white/35 text-white'
+            : 'bg-white/95 backdrop-blur text-slate-900 border-white/50'
+        }`}
       >
+        {showBrawlFill && (
+          <>
+            <motion.div
+              className={`absolute inset-y-0 left-0 ${brawlFillClass}`}
+              initial={false}
+              animate={{
+                width: `${fillPct}%`,
+                filter: critical
+                  ? 'brightness(1.2) saturate(1.3)'
+                  : 'brightness(1) saturate(1)',
+              }}
+              transition={{
+                width: { duration: 0.4, ease: [0.4, 0, 0.2, 1] },
+                filter: { duration: 0.3 },
+              }}
+              style={{ boxShadow: brawlFillGlow }}
+              aria-hidden="true"
+            />
+            {[25, 50, 75].map((t) => (
+              <div
+                key={t}
+                className="absolute top-0 bottom-0 w-px bg-white/12 z-[1]"
+                style={{ left: `${t}%` }}
+                aria-hidden="true"
+              />
+            ))}
+            {critical && (
+              <motion.div
+                className="absolute inset-y-0 left-0 z-[1] pointer-events-none"
+                initial={false}
+                animate={{ opacity: [0.25, 0.55, 0.25] }}
+                transition={{ duration: 0.6, repeat: Infinity, ease: 'easeInOut' }}
+                style={{
+                  width: `${fillPct}%`,
+                  background:
+                    'linear-gradient(90deg, transparent, rgba(255,255,255,0.22), transparent)',
+                }}
+                aria-hidden="true"
+              />
+            )}
+          </>
+        )}
+        <div className="relative z-10 flex flex-wrap items-center justify-center gap-1">
         <span className={`flex items-center gap-2 ${valueGroupClass}`}>
-          <span className={compact ? 'text-[10px] font-extrabold uppercase tracking-widest text-slate-500' : 'text-xs font-extrabold uppercase tracking-widest text-slate-500'}>
+          <span className={compact ? `text-[10px] font-extrabold uppercase tracking-widest ${labelColor}` : `text-xs font-extrabold uppercase tracking-widest ${labelColor}`}>
             {label}
           </span>
           <motion.span
@@ -2495,6 +3136,7 @@ const ScorePill = ({
             </motion.span>
           )}
         </AnimatePresence>
+        </div>
       </motion.div>
 
       {/* Banner sits in flow below the pill so it doesn't visually shove the
@@ -3272,6 +3914,9 @@ const PitcherCard = ({
       animate={entry.animate}
       exit={exitConfig}
       transition={ITEM_LAYOUT_TRANSITION}
+      // Brawl Mode reveal anchor -- the flying ghost launches from this
+      // card's bounding rect. See `useBrawlAttackReveal` for the lookup.
+      data-brawl-card-id={card.id}
     >
       {/* Inner element does the in-place flip from back -> front. */}
       <motion.div
@@ -3736,6 +4381,10 @@ const HandCard = ({
       drag={lockReorder ? false : true}
       onDragStart={handleDragStart}
       onDragEnd={onDragEnd}
+      // Brawl Mode reveal needs a stable selector to grab each card's
+      // screen-space rect so the flying-card ghost can launch from the
+      // right coordinate. The attribute is otherwise inert.
+      data-brawl-card-id={card.id}
     >
       <CardItem
         card={card}
@@ -4007,6 +4656,17 @@ interface RevealOrchestratorInput {
   finalBatterScore: number;
   finalPitcherScore: number;
   onComplete: () => void;
+  /**
+   * Brawl Mode owns its own reveal timeline (cards fly at HP pills via
+   * `useBrawlAttackReveal`). When `disabled` is true the standard
+   * orchestrator goes inert: no script-walking, no per-beat highlights,
+   * no spotlight banners, and -- critically -- no auto `onComplete()`
+   * fire (the brawl reveal calls completeReveal itself when its attack
+   * sequence wraps). The displayed scores still snap to the final
+   * totals so any pill that DOES read off this output (e.g. an opaque
+   * "between-at-bats" landing surface) shows the right numbers.
+   */
+  disabled?: boolean;
 }
 
 interface RevealOrchestratorOutput {
@@ -4036,6 +4696,7 @@ function useRevealOrchestrator({
   finalBatterScore,
   finalPitcherScore,
   onComplete,
+  disabled = false,
 }: RevealOrchestratorInput): RevealOrchestratorOutput {
   const [displayedBatter, setDisplayedBatter] = useState(finalBatterScore);
   const [displayedPitcher, setDisplayedPitcher] = useState(finalPitcherScore);
@@ -4059,7 +4720,7 @@ function useRevealOrchestrator({
   }, [finalBatterScore, finalPitcherScore]);
 
   useEffect(() => {
-    if (phase !== 'revealing') {
+    if (phase !== 'revealing' || disabled) {
       // Reset visual state so the next reveal starts clean.
       setBatterOverrides({});
       setPitcherOverrides({});
@@ -4072,6 +4733,11 @@ function useRevealOrchestrator({
       // pills should track the source of truth).
       setDisplayedBatter(finalRef.current.b);
       setDisplayedPitcher(finalRef.current.p);
+      // When `disabled` is true (brawl mode), the brawl reveal hook is
+      // the sole driver -- it owns the pill values during its sequence
+      // and calls `completeReveal()` when done. We intentionally do NOT
+      // fire onComplete here; doing so would race the brawl timeline
+      // and immediately advance the phase before the cards have flown.
       return;
     }
 
@@ -4175,8 +4841,10 @@ function useRevealOrchestrator({
     };
     // batterHand / pitcherHand are stable across the reveal; including them
     // would re-trigger the effect mid-sequence on the rare deal-time mutation.
+    // `disabled` is included because brawl mode toggles the orchestrator on
+    // and off based on which lane is active.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, script]);
+  }, [phase, script, disabled]);
 
   return {
     displayedBatter,
