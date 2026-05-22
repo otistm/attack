@@ -2072,6 +2072,7 @@ function assertBeat(
 
   // startNextAtBat / reset both clear the active modal as part of their
   // standard cleanup. Smoke-test by re-planting and calling each.
+  useGameStore.getState().completeReveal();
   useGameStore.setState({ activeChoiceCardId: "b-65" });
   useGameStore.getState().startNextAtBat();
   assert(

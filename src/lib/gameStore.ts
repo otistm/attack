@@ -2697,24 +2697,18 @@ export const useGameStore = create<GameState>((set, get) => ({
       batterWins: brawlBatterWon,
     });
 
-    // Brawl Mode grand-slam (winnerHP >= 21) forces the bases loaded
-    // BEFORE applyOutcome so the homerun clears all four runs (batter
-    // + three baserunners) -- without this, a 21+ HP swing on empty
-    // bases would still only score one. We override at the s-snapshot
-    // level so applyOutcome stays unaware of brawl; the runner-move
-    // queue + base-clear logic that already drives HRs just reads the
-    // freshly-loaded bases and animates a proper 4-RBI swing. Phantom
-    // (null-player) runners are used because brawl doesn't have an
-    // off-base roster to draw drafted identities from.
-    const sForOutcome =
+    // Brawl Mode grand-slam (winnerHP >= 21) credits four runs without
+    // pre-loading phantom runners on the bases — that trick scored correctly
+    // but painted three gold "anonymous" figures on the diamond before the
+    // HR animation. `applyOutcome` handles the 4-RBI path directly.
+    const next = applyOutcome(
+      s,
+      outcome,
+      resolveDelta,
       brawlResolution?.grandSlam && brawlResolution.batterWon
-        ? {
-            ...s,
-            bases: [true, true, true] as [boolean, boolean, boolean],
-            baseRunners: [null, null, null] as BaseRunners,
-          }
-        : s;
-    const next = applyOutcome(sForOutcome, outcome, resolveDelta);
+        ? { brawlGrandSlam: true }
+        : undefined,
+    );
     const message = brawlResolution
       ? formatOutcome(
           outcome,
@@ -2898,8 +2892,12 @@ export const useGameStore = create<GameState>((set, get) => ({
     const s = get();
     if (s.phase !== "revealing") return;
     const brawlBases = s.pendingBrawlBasePatch;
+    const pendingPhase = s.pendingResolvedPhase ?? "between-at-bats";
+    const brawlAutoDeal =
+      s.gameMode === "brawl" && pendingPhase === "between-at-bats";
+    const sideSwitchDeal = brawlAutoDeal && s.isFirstAtBatOfInning;
     set({
-      phase: s.pendingResolvedPhase ?? "between-at-bats",
+      phase: pendingPhase,
       pendingResolvedPhase: null,
       revealScript: [],
       revealUiUserSide: null,
@@ -2912,6 +2910,20 @@ export const useGameStore = create<GameState>((set, get) => ({
           }
         : {}),
     });
+    // Brawl: after side retired the half flips and the user's seat swaps,
+    // but hands were still the prior half's deal until the player tapped
+    // Next At-Bat. If they entered the snap phase on those stale cards
+    // the timer would auto-lock a hand they never arranged. Deal fresh
+    // cards for both seats once the reveal finishes; linger longer on a
+    // side switch so the inning banner can land first.
+    if (sideSwitchDeal) {
+      window.setTimeout(() => {
+        const st = get();
+        if (st.gameMode !== "brawl" || st.phase !== "between-at-bats") return;
+        if (!st.isFirstAtBatOfInning) return;
+        get().startNextAtBat();
+      }, 2100);
+    }
   },
 
   completeQuestCelebration: () =>
@@ -2922,6 +2934,7 @@ export const useGameStore = create<GameState>((set, get) => ({
   startNextAtBat: () => {
     const s = get();
     if (s.phase === "game-over") return;
+    if (s.phase !== "between-at-bats") return;
     // Defensive: while the tutorial is active, never advance the at-bat.
     // The linear walkthrough doesn't reach this codepath (it ends at the
     // first lockIn, which clears tutorialActive before falling through),
@@ -6714,6 +6727,7 @@ function applyOutcome(
     runnerAdvanceBoost: number;
     extraRunnerOn: RunnerSlot | null;
   },
+  opts?: { brawlGrandSlam?: boolean },
 ): OutcomeApplyResult {
   let { inning, half, outs, homeScore, awayScore, totalInnings } = s;
   // SZN games cap extras at exactly one extra inning, then declare a
@@ -6821,7 +6835,22 @@ function applyOutcome(
       runs = advance(3, runnerBoost);
       break;
     case "homerun":
-      runs = advance(4, runnerBoost);
+      if (opts?.brawlGrandSlam) {
+        // Bases were empty; credit four runs and animate only the batter
+        // rounding the path so we never spawn gold phantom baserunners.
+        runs = 4;
+        bases = [false, false, false];
+        baseRunners = [null, null, null];
+        runnerMoves.push({
+          id: nextMoveId(),
+          from: "home",
+          to: "scored",
+          kind: "batter",
+          player: s.batter,
+        });
+      } else {
+        runs = advance(4, runnerBoost);
+      }
       break;
   }
 
