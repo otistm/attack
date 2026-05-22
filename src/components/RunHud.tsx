@@ -99,6 +99,14 @@ export function RunHud() {
   // descriptive, so we'd just be duplicating context. The pill replaces
   // the removed `FrontOfficeScreen` hero header so the FO label still
   // sits prominently alongside week / W-L / cash.
+  //
+  // Playtest note: the FO chip used the same sky-accent + icon pattern
+  // as interactive chips elsewhere, so testers reflexively tried to
+  // click it. It's a status indicator, not a button -- the user is
+  // already ON the Front Office surface when the chip is visible. The
+  // styling below intentionally drops the bordered "chip" framing to
+  // read as a label, and a tooltip spells out the role for anyone who
+  // hovers expecting a click target.
   const isFrontOffice = run.day !== "series";
   const stripInner = (
     <>
@@ -127,11 +135,13 @@ export function RunHud() {
       <span className="opacity-60 text-[10px]">·</span>
       {isFrontOffice && (
         <>
-          <Pill
-            icon={<Briefcase className="w-3.5 h-3.5" />}
-            label="FRONT OFFICE"
-            accent="sky"
-          />
+          <span
+            title="You're on the Front Office screen -- pick an encounter card below to use a daily slot."
+            className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-[0.2em] text-sky-300/80 cursor-default"
+          >
+            <Briefcase className="w-3 h-3" aria-hidden />
+            Front Office
+          </span>
           <span className="opacity-60 text-[10px]">·</span>
         </>
       )}

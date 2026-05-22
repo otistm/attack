@@ -17,6 +17,7 @@ import { SeriesResultScreen } from './components/SeriesResultScreen';
 import { EndRunScreen } from './components/EndRunScreen';
 import { RunHud } from './components/RunHud';
 import { SznFooterDecks } from './components/SznFooterDecks';
+import { PurchaseFlightOverlay } from './components/PurchaseFlightOverlay';
 import { useGameStore } from './lib/gameStore';
 
 export default function App() {
@@ -91,6 +92,12 @@ export default function App() {
           Mounted last so it sits above the field but below any modal
           / start-screen / tutorial chrome via its internal z-40. */}
       <SznFooterDecks />
+      {/* Top-most layer: encounter-purchase flight ghost. Portals
+          itself to document.body so it can fly past every modal
+          clipping ancestor unobstructed. Self-gates on
+          `purchaseFlight` so it costs nothing when no flight is
+          active. */}
+      <PurchaseFlightOverlay />
     </div>
   );
 }

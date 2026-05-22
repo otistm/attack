@@ -22,11 +22,72 @@ import { motion } from "motion/react";
 import { Trophy, Ghost as GhostIcon } from "lucide-react";
 import { useGameStore } from "../lib/gameStore";
 import { FooterStylePlayerCard } from "./FooterStylePlayerCard";
+import { playerDisplayValue, resolvePlayerEdges } from "../lib/cardDisplay";
 import { useSznGamepad } from "../lib/useSznGamepad";
-import { RARITY_BASE_VALUE, type RosterPlayer } from "../lib/run";
+import { type RosterPlayer } from "../lib/run";
 import { isSznPlayer } from "../lib/sznPlayers";
-import { teamLogoEdge } from "../lib/sznTeams";
 import type { SznEdgeId } from "../lib/sznEdges";
+
+/**
+ * Pre-canned weather lines for the Game-of-the-Week marquee. The
+ * series is a single game; the weather strip is pure flavor (no
+ * gameplay impact) but anchors the matchup in a SPECIFIC stadium
+ * mood instead of a generic void. Sportscaster-y phrasing so it
+ * pairs with the broadcaster bark below.
+ */
+const WEATHER_LINES = [
+  { icon: "☀️", text: "Sunny, 72°F · light wind to right field" },
+  { icon: "⛅", text: "Partly cloudy, 68°F · still air, low scoring" },
+  { icon: "🌧️", text: "Drizzling, 61°F · tarp on standby" },
+  { icon: "🌬️", text: "Gusts to 18 mph blowing out to center · dingers in play" },
+  { icon: "🌤️", text: "Crisp evening, 64°F · perfect for baseball" },
+  { icon: "🌫️", text: "Marine layer rolling in · sliders biting hard" },
+  { icon: "🔥", text: "Heat wave, 94°F · pitchers gassed by the 6th" },
+  { icon: "⚡", text: "Storms threatened all afternoon · they cleared by first pitch" },
+];
+
+/**
+ * Deterministic pick from `WEATHER_LINES` keyed off `week` + ghost
+ * label so the same week vs the same opponent always rolls the
+ * same weather (re-renders of this screen don't reshuffle the
+ * marquee). Cheap FNV-ish hash of the inputs -- doesn't need to
+ * be cryptographic, just stable.
+ */
+function pickWeather(week: number, ghostLabel: string): (typeof WEATHER_LINES)[number] {
+  let h = 2166136261;
+  const s = `${week}::${ghostLabel}`;
+  for (let i = 0; i < s.length; i++) {
+    h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+  }
+  const idx = Math.abs(h) % WEATHER_LINES.length;
+  return WEATHER_LINES[idx];
+}
+
+/**
+ * Broadcaster bark openers -- the "welcome to Yankee Stadium"
+ * pre-game flavor that introduces the matchup. Picked
+ * deterministically per week so the same week vs the same ghost
+ * keeps the same opener while the player is mid-week.
+ */
+const BROADCASTER_OPENERS = [
+  "Welcome back to baseball.",
+  "It's game day in the dugout.",
+  "Pack the stands, folks.",
+  "And here we go.",
+  "Friday Night Lights, baseball edition.",
+  "The marquee matchup of the week.",
+  "Both clubs took the field for warmups.",
+  "Pennant implications all over this one.",
+];
+
+function pickOpener(week: number, ghostLabel: string): string {
+  let h = 5381;
+  const s = `op::${week}::${ghostLabel}`;
+  for (let i = 0; i < s.length; i++) {
+    h = (h << 5) + h + s.charCodeAt(i);
+  }
+  return BROADCASTER_OPENERS[Math.abs(h) % BROADCASTER_OPENERS.length];
+}
 
 /**
  * Resolve a roster slot into the {value, leftEdge, rightEdge} the
@@ -41,28 +102,24 @@ function footerCardPropsFor(rp: RosterPlayer): {
   leftEdge: SznEdgeId | null;
   rightEdge: SznEdgeId | null;
   teamCode: string | null;
+  rarity: RosterPlayer["rarity"];
 } {
-  const value =
-    RARITY_BASE_VALUE[rp.rarity] +
-    (rp.permanentBoost ?? 0) +
-    (rp.scoreOverride ?? 0);
-  let leftEdge: SznEdgeId | null = null;
-  let rightEdge: SznEdgeId | null = null;
-  if (isSznPlayer(rp.player)) {
-    const leftRaw = (rp.leftEdgeOverride ?? rp.player.leftEdge) as SznEdgeId;
-    const rightRaw = (rp.rightEdgeOverride ?? rp.player.rightEdge) as SznEdgeId;
-    leftEdge =
-      leftRaw === "team-logo" ? teamLogoEdge(rp.player.teamId) : leftRaw;
-    rightEdge =
-      rightRaw === "team-logo" ? teamLogoEdge(rp.player.teamId) : rightRaw;
-  }
-  // Team code lets the FooterStylePlayerCard paint with the team
-  // palette so the marquee starter cards match the in-combat
-  // `PlayerCard` and the persistent footer rail exactly. SZN players
-  // use `teamId`; legacy MLB players use `team`. Mirrors the lookup
-  // in `SznFooterDecks.rosterToFooterCard`.
+  // Single source of truth — every value/edge/team/rarity lookup
+  // for a roster slot goes through `cardDisplay` so the marquee,
+  // the footer rail, the pickers, and the at-bat hero render the
+  // same numbers, same edges, and same rarity-driven body color.
+  // Override-aware (encounter stamps) and `team-logo`-synthetic-
+  // aware live in the shared resolver.
+  const value = playerDisplayValue(rp);
+  const { leftEdge, rightEdge } = resolvePlayerEdges(rp);
   const teamCode = isSznPlayer(rp.player) ? rp.player.teamId : rp.player.team;
-  return { value, leftEdge, rightEdge, teamCode: teamCode ?? null };
+  return {
+    value,
+    leftEdge,
+    rightEdge,
+    teamCode: teamCode ?? null,
+    rarity: rp.rarity,
+  };
 }
 
 export function SeriesIntroScreen() {
@@ -183,7 +240,65 @@ export function SeriesIntroScreen() {
               ? "You take the mound first"
               : "You step to the plate first"}
           </motion.p>
+
+          {/* Broadcaster opener -- short italic sportscaster line
+              that frames the screen as "we're on the air now." Sits
+              under the Mound/Plate notice and reads as the in-game
+              equivalent of a play-by-play guy clearing his throat
+              before the first pitch. Deterministic per (week, ghost)
+              so the line is stable across re-renders. */}
+          <motion.p
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ delay: 0.32 }}
+            className="text-xs italic text-slate-400 mt-1"
+            style={{ textShadow: "0 1px 4px rgba(0,0,0,0.7)" }}
+          >
+            "{pickOpener(run.week, ghost.label)}"
+          </motion.p>
         </div>
+
+        {/* Standings + Weather strip -- frames the matchup as a
+            specific game in a specific season, not "just another
+            at-bat." User record on the left, ghost record on the
+            right, weather pill in the middle. Pure flavor (no
+            gameplay effect) but cheap to render and dramatically
+            raises the "this is a baseball game in a real season"
+            ceiling. */}
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.42 }}
+          className="flex items-center gap-4 flex-wrap justify-center text-[11px] sm:text-xs uppercase tracking-widest font-black"
+        >
+          <span
+            className="px-3 py-1.5 rounded-full bg-amber-900/30 border border-amber-400/40 text-amber-200"
+            style={{ textShadow: "0 1px 3px rgba(0,0,0,0.7)" }}
+          >
+            {userTeam === "AWAY" ? "Away" : "Home"} · {run.wins}-{run.losses}
+          </span>
+          {(() => {
+            const w = pickWeather(run.week, ghost.label);
+            return (
+              <span
+                className="px-3 py-1.5 rounded-full bg-slate-800/60 border border-slate-600 text-slate-200 inline-flex items-center gap-2"
+                style={{ textShadow: "0 1px 3px rgba(0,0,0,0.7)" }}
+                title="First-pitch conditions"
+              >
+                <span aria-hidden>{w.icon}</span>
+                <span className="normal-case tracking-normal font-medium">
+                  {w.text}
+                </span>
+              </span>
+            );
+          })()}
+          <span
+            className="px-3 py-1.5 rounded-full bg-purple-900/30 border border-purple-400/40 text-purple-200"
+            style={{ textShadow: "0 1px 3px rgba(0,0,0,0.7)" }}
+          >
+            {ghost.label.replace(/^Ghost: /, "")}
+          </span>
+        </motion.div>
 
         {/* Tale of the tape: user starter vs ghost starter. Cards are
             the same `FooterStylePlayerCard` chips the persistent
@@ -211,6 +326,7 @@ export function SeriesIntroScreen() {
                     leftEdge={props.leftEdge}
                     rightEdge={props.rightEdge}
                     teamCode={props.teamCode}
+                    rarity={props.rarity}
                     ariaLabel={`Your starter ${userStarter.player.name}`}
                   />
                 );
@@ -260,6 +376,7 @@ export function SeriesIntroScreen() {
                     leftEdge={props.leftEdge}
                     rightEdge={props.rightEdge}
                     teamCode={props.teamCode}
+                    rarity={props.rarity}
                     ariaLabel={`Opponent starter ${ghostStarter.player.name}`}
                   />
                 );

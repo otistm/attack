@@ -25,13 +25,23 @@ import type { MlbPlayer } from "../lib/players";
 import { RARITY_BASE_VALUE, type Rarity, type RosterPlayer } from "../lib/run";
 import type { SznPlayer } from "../lib/sznPlayers";
 import { isSznPlayer } from "../lib/sznPlayers";
+import {
+  revealedAbilities,
+  totalPotentialSlots,
+  triggerGlyph,
+} from "../lib/sznPlayerAbilities";
 import { teamPalette } from "../lib/teamColors";
 import { ShapeHalf } from "./CardGameOverlay";
 import { shapeModeForSide } from "../lib/connect";
 import { playerAsCard } from "../lib/connect";
-import type { SznEdgeId } from "../lib/sznEdges";
-import { teamLogoEdge } from "../lib/sznTeams";
 import { SznEdgeHalf } from "./SznEdgeHalf";
+import {
+  RARITY_TEXT,
+  RARITY_GRADIENT,
+  rarityLabel,
+  resolvePlayerEdges,
+  resolveSznPlayerEdges,
+} from "../lib/cardDisplay";
 
 export interface PlayerCardProps {
   player: MlbPlayer | SznPlayer;
@@ -73,19 +83,9 @@ export interface PlayerCardProps {
   rosterSlot?: RosterPlayer;
 }
 
-const RARITY_LABEL: Record<Rarity, string> = {
-  common: "COMMON",
-  allstar: "ALL STAR",
-  veteran: "VETERAN",
-  legend: "LEGEND",
-};
-
-const RARITY_TEXT: Record<Rarity, string> = {
-  common: "text-orange-300",
-  allstar: "text-slate-200",
-  veteran: "text-amber-300",
-  legend: "text-cyan-200",
-};
+// Rarity label + text colors live in `cardDisplay.ts` so every
+// card surface (chip, Topps, combat hand) renders the same color
+// and same label for a given rarity. Imported above.
 
 export function PlayerCard({
   player,
@@ -106,33 +106,37 @@ export function PlayerCard({
 }: PlayerCardProps) {
   const isSzn = isSznPlayer(player);
   const teamCode = isSzn ? player.teamId : player.team;
-  const palette = teamPalette(teamCode);
-  // Score readout: encounter `scoreOverride` and rookie/veteran
-  // `permanentBoost` both stack on the rarity floor when no explicit
-  // value override is provided.
+  // Rarity gradient is the dominant body color now (audit moved
+  // team off the card body so rarity reads as the primary signal).
+  // The team is still painted in the top-left team-code chip below.
+  // Fall back to the legacy team palette only when no rarity is
+  // resolvable -- defensive against external callers that haven't
+  // wired rarity yet.
+  const rarityStops = RARITY_GRADIENT[rosterSlot?.rarity ?? rarity];
+  const fallbackPalette = teamPalette(teamCode);
+  const bodyStops = rarityStops ?? fallbackPalette;
+  // Score readout flows through the shared `cardDisplay` resolver
+  // when a roster slot is supplied — that guarantees the Topps card
+  // shows the same number as the footer chip, the at-bat hero, and
+  // the merchant preview for a given player. Falls back to the
+  // rarity floor when the card is rendered outside a run (collection
+  // / preview screens) and no slot is available.
   const baseValue =
     value ??
-    RARITY_BASE_VALUE[rarity] +
-      (rosterSlot?.permanentBoost ?? 0) +
-      (rosterSlot?.scoreOverride ?? 0);
-  // Encounter edge overrides take precedence over the static SznPlayer
-  // edges. team-logo syntheticas resolve to the holder's franchise
-  // logo so a Wildcard Sticker stamped as "team-logo" reads as
-  // "yankees-logo" on a Yankees player card.
-  const sznLeftRaw = isSzn ? (rosterSlot?.leftEdgeOverride ?? player.leftEdge) : null;
-  const sznRightRaw = isSzn ? (rosterSlot?.rightEdgeOverride ?? player.rightEdge) : null;
-  const sznLeft: SznEdgeId | null =
-    isSzn && sznLeftRaw
-      ? sznLeftRaw === "team-logo"
-        ? teamLogoEdge(player.teamId)
-        : sznLeftRaw
-      : null;
-  const sznRight: SznEdgeId | null =
-    isSzn && sznRightRaw
-      ? sznRightRaw === "team-logo"
-        ? teamLogoEdge(player.teamId)
-        : sznRightRaw
-      : null;
+    (rosterSlot
+      ? RARITY_BASE_VALUE[rosterSlot.rarity] +
+        (rosterSlot.permanentBoost ?? 0) +
+        (rosterSlot.scoreOverride ?? 0)
+      : RARITY_BASE_VALUE[rarity]);
+  // Edges flow through the shared resolver too — honors encounter
+  // overrides + `team-logo` synthetic. When a rosterSlot is supplied
+  // we use `resolvePlayerEdges` (override-aware); otherwise we fall
+  // back to the raw printed edges via `resolveSznPlayerEdges`.
+  const { leftEdge: sznLeft, rightEdge: sznRight } = isSzn
+    ? rosterSlot
+      ? resolvePlayerEdges(rosterSlot)
+      : resolveSznPlayerEdges(player)
+    : { leftEdge: null, rightEdge: null };
   // Legacy MlbPlayer uses the shape engine; SZN players render their
   // semantic edge badge instead. We only build the playerCard adapter
   // for legacy players so the shape-mode lookup stays scoped.
@@ -190,7 +194,7 @@ export function PlayerCard({
         ${selected ? "ring-2 ring-amber-300" : ""}
       `}
       style={{
-        background: `linear-gradient(160deg, ${palette.primary} 0%, ${palette.secondary} 100%)`,
+        background: `linear-gradient(160deg, ${bodyStops.primary} 0%, ${bodyStops.secondary} 100%)`,
         borderColor: selected ? "#fbbf24" : "rgba(255,255,255,0.85)",
         boxShadow: selected
           ? "0 0 18px rgba(251, 191, 36, 0.55)"
@@ -243,7 +247,7 @@ export function PlayerCard({
         <span
           className={`${sz.tierText} font-black uppercase tracking-widest ${RARITY_TEXT[rarity]} bg-black/40 rounded px-1`}
         >
-          {badge ?? RARITY_LABEL[rarity]}
+          {badge ?? rarityLabel(rarity)}
         </span>
       </div>
 
@@ -266,6 +270,17 @@ export function PlayerCard({
         )}
       </div>
 
+      {/* Abilities strip: passive glyph plus a row of revealed /
+          locked potential slots. SZN-only -- legacy MlbPlayer carries no
+          ability data so the row collapses to null for those. Skips the
+          compact (chip-scale) variant where there's no room. */}
+      {isSzn && !compact && (
+        <AbilitiesStrip
+          player={player}
+          rarity={rosterSlot?.rarity ?? rarity}
+        />
+      )}
+
       {/* Footer: role + tag chip. */}
       <div className={`absolute ${sz.bottomPad} left-0 right-0 flex justify-between items-end px-2 z-30`}>
         <span
@@ -281,5 +296,52 @@ export function PlayerCard({
         </span>
       </div>
     </motion.div>
+  );
+}
+
+/**
+ * Mini strip rendered between the value readout and the role / tag
+ * footer on the Topps PlayerCard. Shows the passive's trigger glyph
+ * plus 1-3 potential pips (filled if revealed at the current rarity,
+ * hollow / muted if still locked). The user gets a visual cue that
+ * the player has growth room WITHOUT needing the focused tooltip.
+ */
+function AbilitiesStrip({
+  player,
+  rarity,
+}: {
+  player: SznPlayer;
+  rarity: Rarity;
+}) {
+  const revealed = revealedAbilities(player, rarity);
+  const totalSlots = totalPotentialSlots(player);
+  const revealedPotentialCount = revealed.length - 1;
+  return (
+    <div
+      aria-hidden
+      className="absolute left-0 right-0 z-30 flex items-center justify-center gap-1"
+      style={{ bottom: "26px" }}
+      title={`Passive: ${player.passive.name}`}
+    >
+      <span
+        className="text-[10px] leading-none rounded-full bg-black/60 px-1.5 py-0.5 text-amber-200"
+        style={{ textShadow: "0 1px 1px rgba(0,0,0,0.7)" }}
+      >
+        {triggerGlyph(player.passive.trigger)}
+      </span>
+      {Array.from({ length: totalSlots }).map((_, i) => {
+        const unlocked = i < revealedPotentialCount;
+        return (
+          <span
+            key={i}
+            className="block h-1.5 w-1.5 rounded-full"
+            style={{
+              backgroundColor: unlocked ? "rgba(249, 226, 175, 0.9)" : "rgba(255, 255, 255, 0.18)",
+              boxShadow: unlocked ? "0 0 4px rgba(249, 226, 175, 0.6)" : undefined,
+            }}
+          />
+        );
+      })}
+    </div>
   );
 }

@@ -15,7 +15,17 @@
  * fails and the CI signal stays sharp.
  */
 
-import { ALL_CARDS, CardDefinition, ALL_TAGS, TAGS } from "./cards";
+import { ALL_CARDS, CardDefinition, ALL_TAGS, TAGS, SZN_ENCOUNTER_ITEM_CARDS } from "./cards";
+import {
+  SERIES_BASE_PAYOUT,
+  SERIES_WIN_BONUS,
+  STREAK_BONUS_STEP,
+  STREAK_BONUS_CAP,
+  COMEBACK_BONUS,
+  COMEBACK_LOSS_THRESHOLD,
+  MAX_BAG_SIZE,
+} from "./run";
+import type { ItemTier } from "./itemTiers";
 import { applyHandTransforms } from "./handTransforms";
 import { applyDealEffects } from "./dealEffects";
 import { applyResolveStep, PendingDebuff } from "./resolveStep";
@@ -31,6 +41,14 @@ import {
   derivePendingReveals,
 } from "./gameStore";
 import { TUTORIAL_STEPS } from "./tutorialSteps";
+import {
+  SZN_ITEM_EFFECTS,
+  sznItemAcquirePatch,
+  applySznItemLockInEffects,
+  applySznItemGroupEdgeMutations,
+  applySznItemGroupScoringEffects,
+  applySznItemSnapPairEffects,
+} from "./sznItemEffects";
 
 let failures = 0;
 let checks = 0;
@@ -4068,6 +4086,654 @@ import { BATTERS, PITCHERS, PLAYERS } from "./players";
     "Phase A: requireChainLength satisfied -> full chain scores",
     { maxValue: stubReqLong.maxValue },
   );
+}
+
+// ---------------------------------------------------------------------------
+// SZN Item Effect Registry smoke tests.
+//
+// Locks down the new `sznItemEffects.ts` registry surface so a future
+// edit doesn't silently re-orphan one of the items the registry was
+// built to keep wired (audit context: six SZN EncounterItems shipped
+// with described behaviours and no engine support; the registry is
+// their home, so a regression here removes a printed-on-the-card
+// promise from the game).
+// ---------------------------------------------------------------------------
+{
+  const itemById = (id: string): CardDefinition => {
+    const c = SZN_ENCOUNTER_ITEM_CARDS.find((c: CardDefinition) => c.id === id);
+    if (!c) throw new Error(`SZN item ${id} missing from SZN_ENCOUNTER_ITEM_CARDS`);
+    return c;
+  };
+
+  // ---- onAcquire: Rally Fire seeds one week of aura -----------------------
+  const rallyPatch = sznItemAcquirePatch("enc-rally-fire");
+  assert(
+    rallyPatch?.rallyFireWeeksAdd === 1,
+    "registry: Rally Fire acquire seeds +1 aura week",
+    rallyPatch,
+  );
+
+  // ---- onAcquire: Platinum Glove seeds one defense shield ----------------
+  const platPatch = sznItemAcquirePatch("enc-platinum-glove");
+  assert(
+    platPatch?.defenseShieldAdd === 1,
+    "registry: Platinum Glove acquire seeds +1 shield",
+    platPatch,
+  );
+
+  // ---- onAcquire: items without a hook return null -----------------------
+  assert(
+    sznItemAcquirePatch("enc-sticky-stuff") === null,
+    "registry: Sticky Stuff has no acquire hook",
+  );
+
+  // ---- onLockIn: Sticky Stuff 15% destroy (pinned RNG) -------------------
+  const sticky = itemById("enc-sticky-stuff");
+  const fakePlayer: CardDefinition = {
+    ...cardById("b-1"),
+    id: "player:test-judge",
+    name: "Test Judge",
+  };
+  const stickyFired = applySznItemLockInEffects([fakePlayer, sticky], {
+    side: "Batting",
+    rng: () => 0.05,
+  });
+  assert(
+    stickyFired.length === 1 &&
+      stickyFired[0].suspendPlayerId === "test-judge" &&
+      typeof stickyFired[0].logEntry === "string",
+    "registry: Sticky Stuff 0.05 < 0.15 suspends the snapped player",
+    stickyFired,
+  );
+  const stickySafe = applySznItemLockInEffects([fakePlayer, sticky], {
+    side: "Batting",
+    rng: () => 0.5,
+  });
+  assert(
+    stickySafe.length === 0,
+    "registry: Sticky Stuff 0.5 > 0.15 spares the player",
+    stickySafe,
+  );
+  const stickyPitcher = applySznItemLockInEffects([fakePlayer, sticky], {
+    side: "Pitching",
+    rng: () => 0.05,
+  });
+  assert(
+    stickyPitcher.length === 0,
+    "registry: Sticky Stuff only fires on Batting side",
+    stickyPitcher,
+  );
+
+  // ---- onLockIn: Platinum Glove banks +1 shield on pitching snap ---------
+  const plat = itemById("enc-platinum-glove");
+  const fakePitcher: CardDefinition = {
+    ...cardById("p-31"),
+    id: "player:test-pitcher",
+  };
+  const platFired = applySznItemLockInEffects([fakePitcher, plat], {
+    side: "Pitching",
+  });
+  assert(
+    platFired.length === 1 && platFired[0].defenseShieldAdd === 1,
+    "registry: Platinum Glove banks +1 shield when snapped on pitching side",
+    platFired,
+  );
+  const platAlone = applySznItemLockInEffects([plat], { side: "Pitching" });
+  assert(
+    platAlone.length === 0,
+    "registry: Platinum Glove brick (no neighbor) doesn't bank a shield",
+    platAlone,
+  );
+
+  // ---- scoreSnapPair: Duct Tape halves both halves ----------------------
+  const tape = itemById("enc-duct-tape");
+  const tapePartner: CardDefinition = { ...cardById("b-1"), id: "tape-partner" };
+  const tapeMods: Record<string, { value: number; color?: string }> = {
+    "tape-partner": { value: 20 },
+    [tape.id]: { value: 0 },
+  };
+  applySznItemSnapPairEffects([tape, tapePartner], tapeMods);
+  assert(
+    tapeMods["tape-partner"].value === 10 && tapeMods[tape.id].value === 0,
+    "registry: Duct Tape halves the partner contribution",
+    tapeMods,
+  );
+
+  // ---- scoreInGroup: Legal Rosin keeps +15 next to a Pitcher --------------
+  const rosin = itemById("enc-legal-rosin");
+  const aPitcher = cardById("p-31");
+  const aBatter = cardById("b-1");
+  const goodMods: Record<string, { value: number; color?: string }> = {
+    [rosin.id]: { value: rosin.baseValue },
+    [aPitcher.id]: { value: aPitcher.baseValue },
+  };
+  applySznItemGroupScoringEffects([aPitcher, rosin], goodMods);
+  assert(
+    goodMods[rosin.id].value === rosin.baseValue,
+    "registry: Legal Rosin keeps +15 when adjacent to a Pitcher",
+    goodMods[rosin.id],
+  );
+  const badMods: Record<string, { value: number; color?: string }> = {
+    [rosin.id]: { value: rosin.baseValue },
+    [aBatter.id]: { value: aBatter.baseValue },
+  };
+  applySznItemGroupScoringEffects([aBatter, rosin], badMods);
+  assert(
+    badMods[rosin.id].value === 0,
+    "registry: Legal Rosin zeros itself when no Pitcher neighbor",
+    badMods[rosin.id],
+  );
+
+  // ---- scoreInGroup: Corked Bat keeps +100 next to a Batter --------------
+  const cork = itemById("enc-corked-bat");
+  const corkGood: Record<string, { value: number; color?: string }> = {
+    [cork.id]: { value: cork.baseValue },
+    [aBatter.id]: { value: aBatter.baseValue },
+  };
+  applySznItemGroupScoringEffects([aBatter, cork], corkGood);
+  assert(
+    corkGood[cork.id].value === cork.baseValue,
+    "registry: Corked Bat keeps +100 when adjacent to a Batter",
+    corkGood[cork.id],
+  );
+  const corkBad: Record<string, { value: number; color?: string }> = {
+    [cork.id]: { value: cork.baseValue },
+    [aPitcher.id]: { value: aPitcher.baseValue },
+  };
+  applySznItemGroupScoringEffects([aPitcher, cork], corkBad);
+  assert(
+    corkBad[cork.id].value === 0,
+    "registry: Corked Bat zeros itself when no Batter neighbor",
+    corkBad[cork.id],
+  );
+
+  // ---- mutateGroupEdges: Classic Spikes adopts partner's edge -----------
+  const spikes = itemById("enc-classic-spikes");
+  const powerAnchor: CardDefinition = {
+    ...cardById("b-1"),
+    id: "anchor",
+    sznRightEdge: "power",
+  };
+  const mutated = applySznItemGroupEdgeMutations([powerAnchor, spikes]);
+  const mutatedSpikes = mutated.find((c) => c.id === spikes.id);
+  assert(
+    mutatedSpikes?.sznLeftEdge === "power" && mutatedSpikes?.sznRightEdge === "power",
+    "registry: Classic Spikes mirrors left partner's right edge",
+    mutatedSpikes,
+  );
+
+  // ---- mutateGroupEdges: The Torch mirrors player's left edge -----------
+  const torch = itemById("enc-the-torch");
+  const playerWithLeft: CardDefinition = {
+    ...cardById("b-1"),
+    id: "player:test-anchor",
+    sznLeftEdge: "speed",
+  };
+  const torchMutated = applySznItemGroupEdgeMutations([playerWithLeft, torch]);
+  const mutatedTorch = torchMutated.find((c) => c.id === torch.id);
+  assert(
+    mutatedTorch?.sznLeftEdge === "speed" && mutatedTorch?.sznRightEdge === "speed",
+    "registry: The Torch mirrors adjacent player's left edge",
+    mutatedTorch,
+  );
+
+  // ---- Tier scaling: scoring.ts multiplies baseValue + selfValueDelta -----
+  // Pick an item with a non-zero baseValue and a per-card effect; verify
+  // that stamping `sznItemTier` produces the expected multiplied
+  // contribution (bronze 1.0x, silver 1.5x, gold 2.0x).
+  const tierBase = cardById("b-1");
+  const bronzeStamp: CardDefinition = { ...tierBase, id: "tier-test", sznItemTier: "bronze" };
+  const silverStamp: CardDefinition = { ...tierBase, id: "tier-test", sznItemTier: "silver" };
+  const goldStamp: CardDefinition = { ...tierBase, id: "tier-test", sznItemTier: "gold" };
+  const bronzeRes = scoreHand([bronzeStamp], batterCtx([cardById("p-31")]));
+  const silverRes = scoreHand([silverStamp], batterCtx([cardById("p-31")]));
+  const goldRes = scoreHand([goldStamp], batterCtx([cardById("p-31")]));
+  assert(
+    bronzeRes.cardModifiers["tier-test"]?.value === tierBase.baseValue,
+    "tier: bronze stamp passes baseValue through unchanged",
+    { expected: tierBase.baseValue, got: bronzeRes.cardModifiers["tier-test"]?.value },
+  );
+  assert(
+    silverRes.cardModifiers["tier-test"]!.value ===
+      Math.round(tierBase.baseValue * 1.5),
+    "tier: silver stamp scales baseValue by 1.5x",
+    { expected: Math.round(tierBase.baseValue * 1.5), got: silverRes.cardModifiers["tier-test"]?.value },
+  );
+  assert(
+    goldRes.cardModifiers["tier-test"]!.value === tierBase.baseValue * 2,
+    "tier: gold stamp scales baseValue by 2.0x",
+    { expected: tierBase.baseValue * 2, got: goldRes.cardModifiers["tier-test"]?.value },
+  );
+
+  // ---- Tier scaling: onAcquire (Rally Fire) extends aura by tier ---------
+  // Bronze = +1 week, silver = +2 weeks (TIER_BINARY_STACK_BONUS), gold = +3.
+  const rallyBronze = sznItemAcquirePatch("enc-rally-fire", "bronze");
+  const rallySilver = sznItemAcquirePatch("enc-rally-fire", "silver");
+  const rallyGold = sznItemAcquirePatch("enc-rally-fire", "gold");
+  assert(
+    rallyBronze?.rallyFireWeeksAdd === 1,
+    "tier: Rally Fire bronze acquire = +1 week",
+    rallyBronze,
+  );
+  assert(
+    rallySilver?.rallyFireWeeksAdd === 2,
+    "tier: Rally Fire silver acquire = +2 weeks",
+    rallySilver,
+  );
+  assert(
+    rallyGold?.rallyFireWeeksAdd === 3,
+    "tier: Rally Fire gold acquire = +3 weeks",
+    rallyGold,
+  );
+
+  // ---- Tier scaling: onAcquire (Platinum Glove) banks more shields -------
+  const glovBronze = sznItemAcquirePatch("enc-platinum-glove", "bronze");
+  const glovSilver = sznItemAcquirePatch("enc-platinum-glove", "silver");
+  const glovGold = sznItemAcquirePatch("enc-platinum-glove", "gold");
+  assert(
+    glovBronze?.defenseShieldAdd === 1,
+    "tier: Platinum Glove bronze = +1 shield",
+    glovBronze,
+  );
+  assert(
+    glovSilver?.defenseShieldAdd === 2,
+    "tier: Platinum Glove silver = +2 shields",
+    glovSilver,
+  );
+  assert(
+    glovGold?.defenseShieldAdd === 3,
+    "tier: Platinum Glove gold = +3 shields",
+    glovGold,
+  );
+
+  // ---- Tier scaling: Sticky Stuff binary proc bonus ----------------------
+  // Bronze threshold 0.15, silver 0.20, gold 0.25. Pin RNG just below
+  // each threshold; bronze should fire, silver/gold each get a wider
+  // window before failing.
+  const stickyCard = itemById("enc-sticky-stuff");
+  const bronzeSticky: CardDefinition = { ...stickyCard, sznItemTier: "bronze" };
+  const silverSticky: CardDefinition = { ...stickyCard, sznItemTier: "silver" };
+  const goldSticky: CardDefinition = { ...stickyCard, sznItemTier: "gold" };
+  const stickyPlayer: CardDefinition = {
+    ...cardById("b-1"),
+    id: "player:tier-sticky",
+    name: "Sticky Target",
+  };
+  // RNG = 0.18: above bronze (0.15), below silver (0.20). Bronze should
+  // spare, silver/gold should suspend.
+  const stickyBronzeAtPoint18 = applySznItemLockInEffects(
+    [stickyPlayer, bronzeSticky],
+    { side: "Batting", rng: () => 0.18 },
+  );
+  const stickySilverAtPoint18 = applySznItemLockInEffects(
+    [stickyPlayer, silverSticky],
+    { side: "Batting", rng: () => 0.18 },
+  );
+  const stickyGoldAtPoint22 = applySznItemLockInEffects(
+    [stickyPlayer, goldSticky],
+    { side: "Batting", rng: () => 0.22 },
+  );
+  assert(
+    stickyBronzeAtPoint18.length === 0,
+    "tier: Sticky Stuff bronze spares at rng=0.18 (>0.15)",
+    stickyBronzeAtPoint18,
+  );
+  assert(
+    stickySilverAtPoint18.length === 1,
+    "tier: Sticky Stuff silver fires at rng=0.18 (<0.20)",
+    stickySilverAtPoint18,
+  );
+  assert(
+    stickyGoldAtPoint22.length === 1,
+    "tier: Sticky Stuff gold fires at rng=0.22 (<0.25)",
+    stickyGoldAtPoint22,
+  );
+
+  // ---- Tier scaling: Duct Tape softens penalty by tier --------------------
+  // bronze = -50%, silver = -25%, gold = 0%. Test that the partner's
+  // contribution scales accordingly.
+  const tapeBase = itemById("enc-duct-tape");
+  const dtBronze: CardDefinition = { ...tapeBase, sznItemTier: "bronze" };
+  const dtSilver: CardDefinition = { ...tapeBase, sznItemTier: "silver" };
+  const dtGold: CardDefinition = { ...tapeBase, sznItemTier: "gold" };
+  const dtPartner: CardDefinition = { ...cardById("b-1"), id: "dt-partner" };
+  function dtPair(item: CardDefinition): number {
+    const mods: Record<string, { value: number; color?: string }> = {
+      "dt-partner": { value: 20 },
+      [item.id]: { value: 0 },
+    };
+    applySznItemSnapPairEffects([item, dtPartner], mods);
+    return mods["dt-partner"].value;
+  }
+  assert(
+    dtPair(dtBronze) === 10,
+    "tier: Duct Tape bronze halves partner (20 -> 10)",
+  );
+  assert(
+    dtPair(dtSilver) === 15,
+    "tier: Duct Tape silver softens to -25% (20 -> 15)",
+  );
+  assert(
+    dtPair(dtGold) === 20,
+    "tier: Duct Tape gold removes the penalty (20 -> 20)",
+  );
+
+  // ---- requestAddItem: duplicate cardId -> tier upgrade (no second slot) -
+  // Drives the store action through a synthetic run state: pre-seed
+  // the bag with one bronze copy of a card, call requestAddItem with
+  // the same cardId, and assert the bag length stays at 1 with the
+  // copy bumped to silver.
+  {
+    const baseRun = useGameStore.getState().run;
+    try {
+      const dupCardId = "enc-sticky-stuff"; // any item def that exists
+      useGameStore.setState({
+        run: {
+          ...(baseRun ?? ({} as never)),
+          week: 1,
+          cash: 0,
+          itemBag: [{ instanceId: "tier-dup-inst", cardId: dupCardId, tier: "bronze" }],
+          pendingItemGrant: null,
+          seriesWinStreak: 0,
+          seriesLossStreak: 0,
+        } as never,
+      });
+      const ok = useGameStore.getState().requestAddItem(dupCardId, "merchant");
+      const afterRun = useGameStore.getState().run!;
+      assert(
+        ok === true,
+        "requestAddItem: duplicate buy returns true (upgrade path)",
+        { ok },
+      );
+      assert(
+        afterRun.itemBag.length === 1,
+        "requestAddItem: duplicate buy keeps bag length at 1",
+        { length: afterRun.itemBag.length },
+      );
+      assert(
+        afterRun.itemBag[0].tier === "silver",
+        "requestAddItem: duplicate buy bumps bronze -> silver",
+        { tier: afterRun.itemBag[0].tier },
+      );
+      // Second duplicate goes silver -> gold; third returns false.
+      useGameStore.getState().requestAddItem(dupCardId, "merchant");
+      const afterGold = useGameStore.getState().run!;
+      assert(
+        afterGold.itemBag[0].tier === "gold",
+        "requestAddItem: second duplicate buy bumps silver -> gold",
+        { tier: afterGold.itemBag[0].tier },
+      );
+      const okGoldAgain = useGameStore.getState().requestAddItem(
+        dupCardId,
+        "merchant",
+      );
+      assert(
+        okGoldAgain === false,
+        "requestAddItem: gold-capped duplicate buy returns false",
+        { okGoldAgain },
+      );
+    } finally {
+      useGameStore.setState({ run: baseRun });
+    }
+  }
+
+  // ---- Registry coverage: every item card with non-trivial effect text
+  // ---- has either a registry entry OR a known engine integration.
+  const itemsWithEngineIntegrationOutsideRegistry = new Set([
+    "enc-faded-scouting-report",
+    "enc-drip-cleats",
+    "enc-mega-left",
+    "enc-mega-right",
+  ]);
+  for (const item of SZN_ENCOUNTER_ITEM_CARDS) {
+    const wired =
+      !!SZN_ITEM_EFFECTS[item.id] ||
+      itemsWithEngineIntegrationOutsideRegistry.has(item.id);
+    assert(
+      wired,
+      `registry coverage: ${item.id} has registry entry or known engine integration`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SZN Bazaar-economy playtest sweep.
+//
+// Drives the new economy surfaces end-to-end against a real SZN run so we
+// can answer the three open questions from the plan in CI rather than by
+// hand-clicking through a week:
+//   1. Cash velocity: the streak-aware payout formula matches the design
+//      table (W=$16, WW=$18, WWW=$20, ..., Comeback-after-LL=$19).
+//   2. Reroll feel: rerollMerchant is gated by MERCHANT_REROLLS_PER_VISIT
+//      and by cash, and a successful reroll debits rerollCost(week).
+//   3. No silent drops: a full bag forces `pendingItemGrant`, never a
+//      no-op; cancel refunds half-value; confirm-replace swaps cleanly.
+// ---------------------------------------------------------------------------
+{
+  // ---- Cash velocity: payout formula vs. design table -------------------
+  // Each call computes the payout for a given (won, oldWinStreak,
+  // oldLossStreak) tuple using the exact formula from
+  // `reportSeriesGameResult`. Assert each line of the design doc:
+  //   W (cold)           -> $8 base + $8 win                = $16
+  //   W after 1 win      -> $8 + $8 + $2 streak             = $18
+  //   W after 2 wins     -> $8 + $8 + $4 streak             = $20
+  //   W after 5 wins     -> $8 + $8 + $10 (cap)             = $26
+  //   L (cold)           -> $8 base                          = $8
+  //   L (after streak)   -> $8 base                          = $8
+  //   W after 2 losses   -> $8 + $8 + $0 streak + $3 comeback = $19
+  // The function is intentionally inlined here (not imported) so a
+  // future refactor of the gameStore one-liner doesn't silently
+  // re-baseline this check.
+  function payoutFor(won: boolean, oldWinStreak: number, oldLossStreak: number): number {
+    const newWinStreak = won ? oldWinStreak + 1 : 0;
+    const base = SERIES_BASE_PAYOUT;
+    const winBonus = won ? SERIES_WIN_BONUS : 0;
+    const streak =
+      won && newWinStreak >= 2
+        ? Math.min(STREAK_BONUS_CAP, STREAK_BONUS_STEP * (newWinStreak - 1))
+        : 0;
+    const comeback =
+      won && oldLossStreak >= COMEBACK_LOSS_THRESHOLD ? COMEBACK_BONUS : 0;
+    return base + winBonus + streak + comeback;
+  }
+  assert(payoutFor(true, 0, 0) === 16, "payout: solo win pays $16", payoutFor(true, 0, 0));
+  assert(payoutFor(true, 1, 0) === 18, "payout: W2 pays $18", payoutFor(true, 1, 0));
+  assert(payoutFor(true, 2, 0) === 20, "payout: W3 pays $20", payoutFor(true, 2, 0));
+  assert(payoutFor(true, 5, 0) === 26, "payout: W6 caps streak at $10 (total $26)", payoutFor(true, 5, 0));
+  assert(
+    payoutFor(true, 10, 0) === SERIES_BASE_PAYOUT + SERIES_WIN_BONUS + STREAK_BONUS_CAP,
+    "payout: long streak hits cap and stops growing",
+    payoutFor(true, 10, 0),
+  );
+  assert(payoutFor(false, 0, 0) === 8, "payout: solo loss pays $8 appearance only", payoutFor(false, 0, 0));
+  assert(payoutFor(false, 3, 0) === 8, "payout: loss kills any prior streak (still $8)", payoutFor(false, 3, 0));
+  assert(
+    payoutFor(true, 0, COMEBACK_LOSS_THRESHOLD) === 19,
+    "payout: W breaking 2-loss skid pays $19 ($8 + $8 + $3 comeback)",
+    payoutFor(true, 0, COMEBACK_LOSS_THRESHOLD),
+  );
+  assert(
+    payoutFor(true, 0, 1) === 16,
+    "payout: W after a single loss (no streak threshold yet) pays $16",
+    payoutFor(true, 0, 1),
+  );
+
+  // ---- Real-run surfaces: reroll + bag-replace + sell -------------------
+  // Stash whatever run was on the store before driving startSznRun so
+  // later checks aren't perturbed.
+  const beforeRun = useGameStore.getState().run;
+  try {
+    useGameStore.getState().startSznRun("NYY");
+    const startState = useGameStore.getState();
+    const startRun = startState.run!;
+    assert(
+      typeof startRun.cash === "number" && startRun.cash > 0,
+      "playtest: startSznRun seeds a positive starting cash",
+      { cash: startRun.cash },
+    );
+    assert(
+      Array.isArray(startRun.itemBag) && startRun.itemBag.length === 0,
+      "playtest: starter run has an empty item bag",
+      { length: startRun.itemBag.length },
+    );
+
+    // Find a merchant offer on Monday so we can drive rerollMerchant.
+    const monIdx = 0; // FRONT_OFFICE_DAYS[0] = "mon"
+    const monDay = startRun.weekEncounters[monIdx];
+    const merchantSlot = monDay?.offers.findIndex((o) => o.kind === "merchant") ?? -1;
+
+    if (merchantSlot >= 0) {
+      // Give the user enough cash so rerolls aren't gated by funds.
+      const ample = 200;
+      useGameStore.setState({
+        run: { ...useGameStore.getState().run!, cash: ample },
+      });
+      const before = useGameStore.getState().run!;
+      const cost = (() => {
+        const w = before.week;
+        // Mirror items.ts.rerollCost without importing it (defensive
+        // duplicate; if the table shifts this check intentionally
+        // catches it via the cash math below).
+        if (w <= 2) return 1;
+        if (w <= 5) return 3;
+        return 5;
+      })();
+      const ok1 = useGameStore.getState().rerollMerchant(merchantSlot);
+      const after1 = useGameStore.getState().run!;
+      assert(ok1 === true, "reroll: first reroll succeeds at week 1");
+      assert(
+        after1.cash === before.cash - cost,
+        "reroll: first reroll debits the week-1 cost",
+        { before: before.cash, after: after1.cash, cost },
+      );
+      const ok2 = useGameStore.getState().rerollMerchant(merchantSlot);
+      assert(ok2 === true, "reroll: second reroll succeeds (cap = 2)");
+      const ok3 = useGameStore.getState().rerollMerchant(merchantSlot);
+      assert(ok3 === false, "reroll: third reroll is denied (visit cap = 2)");
+    }
+
+    // ---- No silent drops: fill bag to MAX_BAG_SIZE then request ---------
+    const fillerIds = SZN_ENCOUNTER_ITEM_CARDS.slice(0, MAX_BAG_SIZE).map((c) => c.id);
+    assert(
+      fillerIds.length === MAX_BAG_SIZE,
+      "playtest: enough SZN item defs exist to fill a 6-slot bag",
+      { found: fillerIds.length },
+    );
+    const cashBeforeFull = 50;
+    useGameStore.setState({
+      run: {
+        ...useGameStore.getState().run!,
+        cash: cashBeforeFull,
+        itemBag: fillerIds.map((cardId, i) => ({
+          instanceId: `pt-fill-${i}`,
+          cardId,
+          tier: "bronze" as ItemTier,
+        })),
+        pendingItemGrant: null,
+      },
+    });
+    const intruderId = SZN_ENCOUNTER_ITEM_CARDS.find(
+      (c) => !fillerIds.includes(c.id),
+    )?.id;
+    assert(
+      typeof intruderId === "string",
+      "playtest: SZN item pool has a 7th card to use as the intruder",
+    );
+    if (typeof intruderId === "string") {
+      const okFull = useGameStore.getState().requestAddItem(intruderId, "event");
+      const afterFull = useGameStore.getState().run!;
+      assert(
+        okFull === false,
+        "no-silent-drop: requestAddItem on full bag returns false (defers, not drops)",
+      );
+      assert(
+        afterFull.pendingItemGrant !== null &&
+          afterFull.pendingItemGrant?.cardId === intruderId,
+        "no-silent-drop: full bag stages pendingItemGrant for the user to resolve",
+        afterFull.pendingItemGrant,
+      );
+      assert(
+        afterFull.itemBag.length === MAX_BAG_SIZE,
+        "no-silent-drop: bag length untouched while pending",
+        { length: afterFull.itemBag.length },
+      );
+
+      // Cancel path refunds half-value and clears pending.
+      const refundPromised = afterFull.pendingItemGrant!.refundOnCancel;
+      useGameStore.getState().cancelPendingItemGrant();
+      const afterCancel = useGameStore.getState().run!;
+      assert(
+        afterCancel.pendingItemGrant === null,
+        "no-silent-drop: cancel clears pendingItemGrant",
+        afterCancel.pendingItemGrant,
+      );
+      assert(
+        afterCancel.cash === cashBeforeFull + refundPromised,
+        "no-silent-drop: cancel refunds the promised consolation cash",
+        { before: cashBeforeFull, after: afterCancel.cash, refundPromised },
+      );
+
+      // Re-queue + replace path lands the intruder by selling a slot.
+      useGameStore.setState({
+        run: { ...useGameStore.getState().run!, cash: cashBeforeFull },
+      });
+      useGameStore.getState().requestAddItem(intruderId, "event");
+      const queuedRun = useGameStore.getState().run!;
+      assert(
+        queuedRun.pendingItemGrant?.cardId === intruderId,
+        "no-silent-drop: re-queue stages the intruder again",
+      );
+      const replaceTarget = queuedRun.itemBag[0];
+      const ok = useGameStore.getState().confirmReplaceAndAdd(replaceTarget.instanceId);
+      const afterReplace = useGameStore.getState().run!;
+      assert(ok === true, "no-silent-drop: confirmReplaceAndAdd returns true");
+      assert(
+        afterReplace.pendingItemGrant === null,
+        "no-silent-drop: confirmReplaceAndAdd clears pendingItemGrant",
+      );
+      assert(
+        afterReplace.itemBag.length === MAX_BAG_SIZE,
+        "no-silent-drop: bag still 6 after replace (1 sold, 1 added)",
+        { length: afterReplace.itemBag.length },
+      );
+      assert(
+        afterReplace.itemBag.some((it) => it.cardId === intruderId),
+        "no-silent-drop: intruder card now sits in the bag",
+      );
+      assert(
+        !afterReplace.itemBag.some((it) => it.instanceId === replaceTarget.instanceId),
+        "no-silent-drop: replaced slot is gone",
+      );
+      assert(
+        afterReplace.cash > cashBeforeFull,
+        "no-silent-drop: replace refunds the sold slot's sell value",
+        { before: cashBeforeFull, after: afterReplace.cash },
+      );
+    }
+
+    // ---- sellItemForCash: shrink bag, bump cash --------------------------
+    const sellSetup = useGameStore.getState().run!;
+    const sellSlot = sellSetup.itemBag[0];
+    if (sellSlot) {
+      const cashBeforeSell = sellSetup.cash;
+      const refund = useGameStore.getState().sellItemForCash(sellSlot.instanceId);
+      const afterSell = useGameStore.getState().run!;
+      assert(refund > 0, "sell: sellItemForCash returns a positive refund", { refund });
+      assert(
+        afterSell.cash === cashBeforeSell + refund,
+        "sell: cash advances by the refund value",
+        { before: cashBeforeSell, after: afterSell.cash, refund },
+      );
+      assert(
+        !afterSell.itemBag.some((it) => it.instanceId === sellSlot.instanceId),
+        "sell: sold slot is removed from bag",
+      );
+    }
+  } finally {
+    // Restore whatever run snapshot existed before this block ran so any
+    // future checks downstream don't trip on synthetic state.
+    useGameStore.setState({ run: beforeRun });
+  }
 }
 
 // ---------------------------------------------------------------------------

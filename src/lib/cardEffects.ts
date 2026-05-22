@@ -180,6 +180,10 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
 
   // b-18 In The Gap: +3 to Hit Scale, but only when combined (Phase 4 nerf
   // -- requires playing it through a connection rather than as a 1-card brick).
+  // The description's "and you win" clause is structurally implicit: Hit
+  // Scale is only consulted by `resolveHitScale` after the batter wins
+  // head-to-head; a losing batter never reads the bonus, so we don't gate
+  // on win here. Same pattern for b-66 and b-134 below.
   "b-18": (ctx) => (ctx.isCombined ? r({ hitScaleBonus: 3 }) : NOOP),
 
   // b-19 Philly Clutch: +5 if your team has 2 outs.
@@ -266,9 +270,17 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // p-32 Triple Digits: +2 (always uncombined - noCombine is enforced by combineConstraint).
   "p-32": () => r({ selfValueDelta: 2 }),
 
-  // p-33 The Mustache: batter's Hit Scale requirements +3 (positive bonus on PITCHER side
-  // is read by lockIn as a debuff to the batter's effective Hit Scale).
-  "p-33": () => r({ hitScaleBonus: 3, log: ["p-33 raises batter Hit Scale requirement +3"] }),
+  // p-33 The Mustache: shrinks the batter's hit by 3 rungs on the Hit
+  // Scale ladder (a HR becomes a Triple, a Triple becomes a Double, etc).
+  // Implementation note: positive `hitScaleBonus` on the PITCHER side
+  // becomes `effPitcherHitScaleWall` in `computeMatchup`, which
+  // subtracts from the batter's `hitScaleValue` BEFORE the ladder is
+  // resolved. The wall only matters when the batter wins (a losing
+  // batter never reads the ladder anyway), so the previous card text
+  // "If the Batter wins, subtract 3 from the Batter's score" was
+  // functionally identical to the new "shrinks the Batter's hit" text
+  // -- both describe the same downstream behaviour.
+  "p-33": () => r({ hitScaleBonus: 3, log: ["p-33 shrinks batter hit by 3 (Hit Scale wall)"] }),
 
   // p-34 Cole Train: +3 if combined on the right side.
   "p-34": (ctx) => {

@@ -18,7 +18,12 @@
 import { AnimatePresence, motion } from "motion/react";
 import { ArrowLeft } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { PlayerCard } from "./PlayerCard";
+import { FooterStylePlayerCard } from "./FooterStylePlayerCard";
+import { isSznPlayer } from "../lib/sznPlayers";
+import {
+  playerDisplayValue,
+  resolvePlayerEdges,
+} from "../lib/cardDisplay";
 import type { RosterPlayer } from "../lib/run";
 import { useSznGamepad } from "../lib/useSznGamepad";
 
@@ -222,11 +227,17 @@ export function EdgeSwapPicker({
                           : "ring-0",
                       ].join(" ")}
                     >
-                      <PlayerCard
-                        player={rp.player}
+                      <FooterStylePlayerCard
+                        name={rp.player.name}
+                        role={rp.player.role}
+                        value={playerDisplayValue(rp)}
+                        teamCode={
+                          isSznPlayer(rp.player) ? rp.player.teamId : null
+                        }
                         rarity={rp.rarity}
-                        rosterSlot={rp}
-                        compact
+                        {...resolvePlayerEdges(rp)}
+                        focused={isFocused}
+                        ariaLabel={`Pick ${rp.player.name}`}
                       />
                     </button>
                   );

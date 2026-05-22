@@ -106,7 +106,7 @@ export const MLB_TEAMS: Record<MlbTeamId, MlbTeam> = {
   // ----- AL East -----
   NYY: T("NYY", "New York Yankees", "Yankees", "AL East", "#0c1a4a", "#c4ced4", "bronx-bombers", true),
   BOS: T("BOS", "Boston Red Sox", "Red Sox", "AL East", "#bd3039", "#0c2340", "tbd-passive"),
-  TOR: T("TOR", "Toronto Blue Jays", "Blue Jays", "AL East", "#134a8e", "#1d2d5c", "tbd-passive"),
+  TOR: T("TOR", "Toronto Blue Jays", "Blue Jays", "AL East", "#134a8e", "#1d2d5c", "north-of-the-border", true),
   BAL: T("BAL", "Baltimore Orioles", "Orioles", "AL East", "#df4601", "#000000", "tbd-passive"),
   TBR: T("TBR", "Tampa Bay Rays", "Rays", "AL East", "#092c5c", "#8fbce6", "tbd-passive"),
 
@@ -127,7 +127,7 @@ export const MLB_TEAMS: Record<MlbTeamId, MlbTeam> = {
   // ----- NL East -----
   ATL: T("ATL", "Atlanta Braves", "Braves", "NL East", "#ce1141", "#13274f", "tbd-passive"),
   NYM: T("NYM", "New York Mets", "Mets", "NL East", "#002d72", "#ff5910", "tbd-passive"),
-  PHI: T("PHI", "Philadelphia Phillies", "Phillies", "NL East", "#e81828", "#002d72", "tbd-passive"),
+  PHI: T("PHI", "Philadelphia Phillies", "Phillies", "NL East", "#e81828", "#002d72", "liberty-bell", true),
   MIA: T("MIA", "Miami Marlins", "Marlins", "NL East", "#00a3e0", "#ef3340", "tbd-passive"),
   WSN: T("WSN", "Washington Nationals", "Nationals", "NL East", "#ab0003", "#14225a", "tbd-passive"),
 

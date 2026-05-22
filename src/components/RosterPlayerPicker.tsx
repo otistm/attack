@@ -35,16 +35,20 @@
 import { AnimatePresence, motion } from "motion/react";
 import { ArrowLeft } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { RARITY_BASE_VALUE, type RosterPlayer } from "../lib/run";
+import { type RosterPlayer } from "../lib/run";
 import { isSznPlayer } from "../lib/sznPlayers";
-import { MLB_TEAMS, teamLogoEdge } from "../lib/sznTeams";
-import { SZN_EDGES, type SznEdgeId } from "../lib/sznEdges";
+import { MLB_TEAMS } from "../lib/sznTeams";
 import { FooterStylePlayerCard } from "./FooterStylePlayerCard";
 import {
   EncounterFocusPanel,
   type EncounterFocusCardData,
 } from "./EncounterFocusOverlay";
 import { useSznGamepad } from "../lib/useSznGamepad";
+import {
+  playerDisplayValue,
+  resolvePlayerEdges,
+  rarityTitle,
+} from "../lib/cardDisplay";
 
 export interface RosterPlayerPickerProps {
   open: boolean;
@@ -58,12 +62,9 @@ export interface RosterPlayerPickerProps {
   onCancel: () => void;
 }
 
-const RARITY_LABEL: Record<string, string> = {
-  common: "Common",
-  "all-star": "All-Star",
-  veteran: "Veteran",
-  legend: "Legend",
-};
+// Rarity-title strings now come from the shared `cardDisplay.rarityTitle`
+// helper so subtitles render consistently with the footer rail and the
+// audit-bug `'all-star'` vs `'allstar'` mismatch can never re-creep in.
 
 export function RosterPlayerPicker({
   open,
@@ -147,39 +148,27 @@ export function RosterPlayerPicker({
     } else {
       subtitleParts.push(rp.player.role);
     }
-    subtitleParts.push(RARITY_LABEL[rp.rarity] ?? rp.rarity);
+    subtitleParts.push(rarityTitle(rp.rarity));
     let description: string | undefined;
     if (isSznPlayer(rp.player) && rp.player.flavor) {
       description = rp.player.flavor;
     } else if (isSznPlayer(rp.player)) {
-      const left = SZN_EDGES[rp.player.leftEdge]?.label ?? rp.player.leftEdge;
-      const right = SZN_EDGES[rp.player.rightEdge]?.label ?? rp.player.rightEdge;
-      description = `${left} ← → ${right}`;
+      // Synthesize an edge-pair readout via the shared edge resolver.
+      const e = resolvePlayerEdges(rp);
+      description = `${e.leftEdge ?? "—"} ← → ${e.rightEdge ?? "—"}`;
     }
-    // Edge resolution mirrors `rosterToFooterCard` in SznFooterDecks
-    // and `PlayerCard`: overrides first, then printed edges, with
-    // `team-logo` synthetic resolving to the holder's real franchise
-    // logo edge. Legacy MlbPlayer rosters lack edges -> null chips.
-    let leftEdge: SznEdgeId | null = null;
-    let rightEdge: SznEdgeId | null = null;
-    if (isSznPlayer(rp.player)) {
-      const leftRaw = (rp.leftEdgeOverride ?? rp.player.leftEdge) as SznEdgeId;
-      const rightRaw = (rp.rightEdgeOverride ?? rp.player.rightEdge) as SznEdgeId;
-      leftEdge =
-        leftRaw === "team-logo" ? teamLogoEdge(rp.player.teamId) : leftRaw;
-      rightEdge =
-        rightRaw === "team-logo" ? teamLogoEdge(rp.player.teamId) : rightRaw;
-    }
+    // Edge resolution flows through `cardDisplay.resolvePlayerEdges`
+    // so the picker, the footer rail, and the at-bat hero all paint
+    // the SAME left/right halves for a given roster slot. Honors
+    // encounter overrides + `team-logo` synthetic.
+    const { leftEdge, rightEdge } = resolvePlayerEdges(rp);
     return {
       label: rp.player.name,
       subtitle: subtitleParts.join(" · "),
       description,
-      value:
-        RARITY_BASE_VALUE[rp.rarity] +
-        (rp.permanentBoost ?? 0) +
-        (rp.scoreOverride ?? 0),
-      leftEdge: leftEdge && leftEdge in SZN_EDGES ? leftEdge : null,
-      rightEdge: rightEdge && rightEdge in SZN_EDGES ? rightEdge : null,
+      value: playerDisplayValue(rp),
+      leftEdge,
+      rightEdge,
     };
   })();
 
@@ -285,32 +274,16 @@ function PickerPlayerCard({
   onHover: () => void;
   onPick: () => void;
 }) {
-  const value =
-    RARITY_BASE_VALUE[rp.rarity] +
-    (rp.permanentBoost ?? 0) +
-    (rp.scoreOverride ?? 0);
-
-  // Edge resolution mirrors `SznFooterDecks.rosterToFooterCard` so
-  // the picker card shows the SAME `SznEdgeHalf` halves the user
-  // sees in the always-on bottom rail. Encounter overrides win;
-  // `team-logo` synthetic resolves to the franchise logo edge.
-  let leftEdge: SznEdgeId | null = null;
-  let rightEdge: SznEdgeId | null = null;
-  if (isSznPlayer(rp.player)) {
-    const leftRaw = (rp.leftEdgeOverride ?? rp.player.leftEdge) as SznEdgeId;
-    const rightRaw = (rp.rightEdgeOverride ?? rp.player.rightEdge) as SznEdgeId;
-    leftEdge =
-      leftRaw === "team-logo" ? teamLogoEdge(rp.player.teamId) : leftRaw;
-    rightEdge =
-      rightRaw === "team-logo" ? teamLogoEdge(rp.player.teamId) : rightRaw;
-    if (leftEdge && !(leftEdge in SZN_EDGES)) leftEdge = null;
-    if (rightEdge && !(rightEdge in SZN_EDGES)) rightEdge = null;
-  }
+  const value = playerDisplayValue(rp);
+  const { leftEdge, rightEdge } = resolvePlayerEdges(rp);
+  const teamCode = isSznPlayer(rp.player) ? rp.player.teamId : null;
   return (
     <FooterStylePlayerCard
       name={rp.player.name}
       role={rp.player.role}
       value={value}
+      teamCode={teamCode}
+      rarity={rp.rarity}
       leftEdge={leftEdge}
       rightEdge={rightEdge}
       focused={focused}

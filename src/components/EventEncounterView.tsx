@@ -20,9 +20,9 @@
  * Walking away from the choice phase still spends the slot.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
-import { DollarSign, Lock, Sparkles, X } from "lucide-react";
+import { DollarSign, Lock, X } from "lucide-react";
 import { useGameStore } from "../lib/gameStore";
 import {
   EVENT_GLYPH,
@@ -31,11 +31,9 @@ import {
   type EventChoice,
 } from "../lib/run";
 import { SESSION_CARDS, SZN_ENCOUNTER_ITEMS_BY_ID, type CardDefinition } from "../lib/cards";
-import { ItemCardPreview } from "./ItemCardPreview";
-import {
-  EncounterFocusPanel,
-  type EncounterFocusCardData,
-} from "./EncounterFocusOverlay";
+import { SznCard } from "./SznCard";
+import { displayValueFor, resolveCardEdges } from "../lib/cardDisplay";
+import { useChoiceHover } from "./useAbilityHover";
 import { useSznGamepad, useFocusIndex } from "../lib/useSznGamepad";
 import { RosterPlayerPicker } from "./RosterPlayerPicker";
 import { EdgeSwapPicker } from "./EdgeSwapPicker";
@@ -52,6 +50,14 @@ export function EventEncounterView({
   onClose: () => void;
 }) {
   const resolveEventChoice = useGameStore((s) => s.resolveEventChoice);
+  const startPurchaseFlight = useGameStore((s) => s.startPurchaseFlight);
+  // Gamepad focus surface (see PlayerMarketView / MerchantView for the
+  // matching pattern). The handler below registers at priority 100 --
+  // when the user drops focus into the persistent SZN footer rail
+  // we let every press fall through so the priority-50 footer router
+  // owns DPAD nav / CROSS / collapse without this overlay swallowing
+  // it.
+  const focusSurface = useGameStore((s) => s.sznGamepadFocus);
   const [initialBagIds] = useState<string[]>(() => {
     const s = useGameStore.getState();
     return s.run ? s.run.itemBag.map((i) => i.instanceId) : [];
@@ -61,6 +67,16 @@ export function EventEncounterView({
   const cash = useGameStore((s) => s.run?.cash ?? 0);
   const [resolved, setResolved] = useState<EventChoice | null>(null);
   const [rewardCard, setRewardCard] = useState<CardDefinition | null>(null);
+  // Per-choice tile refs so we can capture the source rect at click
+  // time for the fly-to-footer animation on item-granting choices.
+  const choiceRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  // Source rect captured at commit time. Held across the
+  // `resolveEventChoice` → `rewardCard` resolution gap so the flight
+  // we eventually fire lifts off from where the user actually clicked,
+  // not from wherever the focus happened to be when the bag diff
+  // resolved.
+  const flightSourceRef = useRef<DOMRect | null>(null);
+  const flightFiredForRef = useRef<string | null>(null);
   // When a picker is open, `pickerFor` holds the choice that triggered
   // it. Closing the picker via cancel returns to the choice list;
   // committing fires `resolveEventChoice` with the chosen target id.
@@ -87,6 +103,33 @@ export function EventEncounterView({
     const card = SESSION_CARDS.find((c) => c.id === newOne.cardId) ?? null;
     setRewardCard(card);
   }, [resolved, bag, initialBagIds]);
+
+  // Fire the fly-to-footer flight once both the resolved choice and
+  // its rewardCard land. Source rect was captured at click time
+  // (`flightSourceRef`); target rect is the live footer abilities row.
+  // `flightFiredForRef` guards against re-firing on store re-renders
+  // (the effect's deps change when `bag` ticks for unrelated reasons).
+  useEffect(() => {
+    if (!resolved || !rewardCard) return;
+    if (flightFiredForRef.current === resolved.choiceId) return;
+    const source = flightSourceRef.current;
+    if (!source) return;
+    const targetEl = document.getElementById("szn-footer-row-right");
+    if (!targetEl) return;
+    const target = targetEl.getBoundingClientRect();
+    flightFiredForRef.current = resolved.choiceId;
+    startPurchaseFlight({
+      flightId: `event-${resolved.choiceId}`,
+      cardId: rewardCard.id,
+      source: {
+        x: source.x,
+        y: source.y,
+        width: source.width,
+        height: source.height,
+      },
+      target: { x: target.x, y: target.y, width: target.width, height: target.height },
+    });
+  }, [resolved, rewardCard, startPurchaseFlight]);
 
   // Persist the picked target so the resolution panel can name them
   // ("Stanton's left edge is now Wildcard.") instead of echoing the
@@ -118,9 +161,16 @@ export function EventEncounterView({
   const unaffordable = (c: EventChoice) =>
     !!(c.costPreview && c.costPreview > 0 && cash < c.costPreview);
 
-  const handleChoice = (c: EventChoice) => {
+  const handleChoice = (c: EventChoice, index: number) => {
     if (c.locked) return; // gamepad nav also skips, this is a click guard
     if (unaffordable(c)) return;
+    // Capture the source rect for the fly-to-footer flight BEFORE we
+    // commit -- the commit triggers the resolved-state re-render and
+    // the choice tile unmounts immediately after, so we'd lose the
+    // rect if we tried to measure post-commit. Only meaningful for
+    // item-granting choices; non-item choices ignore the rect.
+    const tile = choiceRefs.current[index];
+    flightSourceRef.current = tile?.getBoundingClientRect() ?? null;
     if (c.requiresPicker) {
       setPickerFor(c);
       return;
@@ -160,28 +210,6 @@ export function EventEncounterView({
     if (fi >= 0) setFocusableIdx(fi);
   };
 
-  // Focused-choice detail payload for the footer panel. Mirrors the
-  // merchant + player-market overlays: shows the focused choice's
-  // label and full result blurb so the user can read the *complete*
-  // description even when the choice tile truncated it. Price is
-  // deliberately omitted -- the chip below the choice tile already
-  // surfaces it, and the user explicitly asked for no duplicate
-  // price text in the description area. `null` when the resolution
-  // panel is showing (no choice grid to focus) or no focusable
-  // choice is selected.
-  const focusedChoice = !resolved ? offer.choices[focusedRealIdx] ?? null : null;
-  const focusedChoiceDetail: EncounterFocusCardData | null = (() => {
-    if (!focusedChoice) return null;
-    return {
-      label: focusedChoice.label,
-      description: focusedChoice.resultBlurb,
-      // No subtitle / numeric value / edge chips -- event choices
-      // aren't playable cards. Omitting these keeps the panel tight
-      // (just label + description) instead of forcing chip rendering
-      // for slots that don't apply.
-    };
-  })();
-
   useSznGamepad({
     id: "event-encounter-view",
     // Picker overlays own focus at 200; this view drops out when a
@@ -189,20 +217,52 @@ export function EventEncounterView({
     priority: 100,
     enabled: pickerFor === null,
     handler: (btn) => {
+      // Footer ownership escape: while the user has dropped focus
+      // into the persistent SZN footer rail, hand every press through
+      // to the priority-50 footer router. Without this gate the
+      // listing nav below would swallow DPAD presses while the
+      // overlay was open.
+      if (focusSurface !== "screen") return false;
       if (resolved) {
         if (btn === "CROSS" || btn === "CIRCLE" || btn === "TRIANGLE") {
           onClose();
+          return;
         }
-        return;
+        // Outcome panel only owns its three "dismiss" buttons -- any
+        // other press (DPAD_DOWN to drop into the footer rail, etc.)
+        // is passed through to the next handler so the user can still
+        // explore their roster + bag from this screen.
+        return false;
       }
-      if (btn === "DPAD_LEFT" || btn === "DPAD_UP") focusHelpers.prev();
-      else if (btn === "DPAD_RIGHT" || btn === "DPAD_DOWN") focusHelpers.next();
-      else if (btn === "CROSS") {
+      // 2D nav: choice tiles on row 0, [Walk Away] on row 1.
+      // DPAD_DOWN from a choice jumps straight to Walk Away rather
+      // than continuing to scroll the choice row -- matches the
+      // merchant + player-market overlays so all three encounter
+      // surfaces share the same "DOWN reaches the action row" rule.
+      // LEFT/RIGHT remain a linear walk within the focusable choice
+      // list (the choice grid wraps but is dense, so a true 2D
+      // mapping isn't worth the bookkeeping here).
+      if (btn === "DPAD_LEFT") {
+        if (!walkAwayFocused) focusHelpers.prev();
+      } else if (btn === "DPAD_RIGHT") {
+        if (!walkAwayFocused) focusHelpers.next();
+      } else if (btn === "DPAD_DOWN") {
+        // Walk-Away row already focused -> propagate the press to
+        // the footer router so it can flip focus into the persistent
+        // rail (roster + bag) without forcing the user to close the
+        // encounter. Returning `false` is how `useSznGamepad`
+        // forwards a press down the priority stack (here to the
+        // priority-50 footer handler).
+        if (walkAwayFocused) return false;
+        setFocusableIdx(walkAwayIdx);
+      } else if (btn === "DPAD_UP") {
+        if (walkAwayFocused && walkAwayIdx > 0) setFocusableIdx(walkAwayIdx - 1);
+      } else if (btn === "CROSS") {
         if (walkAwayFocused) {
           onClose();
         } else {
           const c = offer.choices[focusedRealIdx];
-          if (c) handleChoice(c);
+          if (c) handleChoice(c, focusedRealIdx);
         }
       } else if (btn === "CIRCLE") onClose();
     },
@@ -280,7 +340,10 @@ export function EventEncounterView({
                 broke={broke}
                 focused={focused}
                 onHover={() => setFocusByChoiceIndex(i)}
-                onPick={() => handleChoice(c)}
+                onPick={() => handleChoice(c, i)}
+                tileRef={(el) => {
+                  choiceRefs.current[i] = el;
+                }}
               />
             );
           })}
@@ -310,50 +373,30 @@ export function EventEncounterView({
               {resolved.resultBlurb}
             </p>
           )}
-          {rewardCard && (
-            <div className="flex flex-col items-center gap-2 pt-2 border-t border-emerald-500/20">
-              <span className="inline-flex items-center gap-1.5 text-[10px] font-black uppercase tracking-[0.4em] text-emerald-200">
-                <Sparkles className="w-3.5 h-3.5" />
-                Added to your bag
-              </span>
-              <motion.div
-                initial={{ scale: 0.6, rotate: -8, opacity: 0 }}
-                animate={{ scale: 1, rotate: 0, opacity: 1 }}
-                transition={{ type: "spring", stiffness: 240, damping: 20 }}
-              >
-                {/* Reward card preview KEEPS its hover tooltip --
-                    the reward reveal panel doesn't carry an
-                    EncounterFocusPanel underneath it, so the
-                    hover-tooltip is the only place the user can
-                    read the ability description for what they
-                    just earned. */}
-                <ItemCardPreview card={rewardCard} large />
-              </motion.div>
-              {/* Reward-card name label was rendered here as a
-                  caption -- removed because the card preview
-                  already paints the name plate prominently across
-                  the top of the card. Reading the same name twice
-                  in a row (on the card AND beneath it) was the
-                  textbook duplication the audit flagged. */}
-            </div>
-          )}
+          {/* Reward card preview removed -- when a choice grants an
+              item, the card now flies from the choice tile straight
+              into the footer abilities row via `startPurchaseFlight`,
+              so re-rendering the same chip here would just be a
+              second "look at the card you got" panel competing with
+              the flight animation. The resolution blurb above
+              ({resolved.resultBlurb}) is the only narrative payload
+              the panel needs; the bag chip itself lives in the
+              footer rail from this point on. */}
         </motion.div>
       )}
 
-      {/* Footer row: focused-choice detail panel on the LEFT, action
-          button on the right -- mirrors MerchantView /
-          PlayerMarketView so the three encounter surfaces share the
-          same vertical anchor for the focused-card readout + close
-          control. The panel returns `null` when the resolution view
-          is showing, so the action button gets the full row to
-          itself for the "Continue" CTA. The Walk away button is
-          ALSO a focusable cursor slot (`walkAwayIdx` -- the last
-          slot after every focusable choice), so the gamepad can
-          DPAD past the choice row and land on it. */}
-      <div className="flex items-stretch gap-3 relative z-10">
-        <div className="flex-1 min-w-0 flex items-center">
-          <EncounterFocusPanel card={focusedChoiceDetail} variant="ability" />
-        </div>
+      {/* Footer row: action button only. The focused-choice
+          description used to live on the LEFT side of this row, but
+          the audit asked for choice descriptions to surface as
+          hover/focus overlays ABOVE each choice tile (same slate
+          tooltip as item cards) instead of in a separate footer
+          panel. The ChoiceCard now owns its own description tooltip
+          via `useChoiceHover`, so this row collapses to just the
+          Walk away / Continue CTA. The Walk away button is still a
+          focusable cursor slot (`walkAwayIdx` -- the last slot after
+          every focusable choice), so the gamepad can DPAD past the
+          choice row and land on it. */}
+      <div className="flex items-stretch gap-3 relative z-10 justify-end">
         <div className="flex items-center">
           <button
             type="button"
@@ -498,10 +541,12 @@ function humanize(id: string): string {
  *   [ card-shaped tile  ]   <- label + result blurb, gradient background
  *   [   price chip      ]   <- "$N" cost, "FREE" pill, or "—" for locked
  *
- * The tile inherits the ItemCardPreview / PlayerCard footprint
- * (`w-32 h-44`) so the event-choice grid lines up cleanly against
- * the other encounter views and the user can scan all encounter types
- * with the same visual grammar.
+ * The tile shares the 96×136 `chip` footprint used by every other
+ * encounter overlay (MerchantView's `FooterStyleAbilityCard` and
+ * PlayerMarketView's `FooterStylePlayerCard` both render through
+ * `SznCard size="chip"`), so the event-choice grid lines up
+ * pixel-for-pixel against the other encounter views and the user
+ * can scan all encounter types with the same visual grammar.
  *
  * State styling
  * -------------
@@ -521,6 +566,7 @@ function ChoiceCard({
   focused,
   onHover,
   onPick,
+  tileRef,
 }: {
   choice: EventChoice;
   index: number;
@@ -529,12 +575,50 @@ function ChoiceCard({
   focused: boolean;
   onHover: () => void;
   onPick: () => void;
+  /**
+   * Forwarded to the button element so the parent can measure the
+   * tile's bounding rect at click time for the fly-to-footer flight
+   * animation on item-granting choices.
+   */
+  tileRef?: (el: HTMLButtonElement | null) => void;
 }) {
   const interactive = !locked && !broke;
   const cost = choice.costPreview ?? 0;
   const hasCost = cost > 0;
+  // When the choice grants a specific item, surface the actual card
+  // preview behind the choice label so the user reads exactly what
+  // they're about to acquire — same unified `<SznCard>` shell the
+  // merchant, footer rail, and bag picker render. Falls back to the
+  // standard purple tile when the effect doesn't grant a known card
+  // (cash, scoreOverride, addItemRandom from a pool, etc.).
+  const grantedCard: CardDefinition | undefined = (() => {
+    const eff = choice.effect;
+    if (eff && eff.kind === "grantItem") {
+      return SESSION_CARDS.find((c) => c.id === eff.cardId);
+    }
+    return undefined;
+  })();
+  const grantedEdges = grantedCard
+    ? (() => {
+        const e = resolveCardEdges(grantedCard);
+        return { left: e.leftEdge, right: e.rightEdge };
+      })()
+    : null;
+  // Description tooltip lives ABOVE the focused tile. Same slate
+  // portal as the merchant / bag chip ability hover, so a Yard Sale
+  // choice ("Pick a player. One of their edges becomes Wildcard.")
+  // reads in the same overlay style as an item description. `focused`
+  // drives `forceOpen` so the gamepad surfaces the same description
+  // the mouse hover would. Locked / broke tiles intentionally skip
+  // the overlay -- the disabled chip already communicates the gate
+  // ("Coming Soon" / "Need $N"), and surfacing a hover description
+  // for a choice the user can't take is just noise.
+  const choiceHover = useChoiceHover(choice, {
+    forceOpen: focused && interactive,
+  });
   return (
     <button
+      ref={tileRef}
       type="button"
       onClick={interactive ? onPick : undefined}
       onMouseEnter={onHover}
@@ -546,44 +630,84 @@ function ChoiceCard({
       } ${focused ? "ring-2 ring-amber-400/80 -translate-y-1" : ""}`}
       aria-label={`Choice ${index + 1}: ${choice.label}`}
     >
-      {/* Card-shaped tile. 5:7 ratio (`w-32 h-44`) matches the
-          ItemCardPreview / PlayerCard default footprint so the
-          encounter views all line up. The tile renders ONLY the
-          choice title -- the price is the chip below (so it does
-          NOT need to be repeated on the tile) and the full
-          description lives in the focused-choice detail panel docked
-          to the left of the Walk away button. A small lock icon
-          stays inside the tile for locked-state legibility since
-          the chip below is a generic "—" placeholder. */}
-      <div
-        className={`w-32 h-44 rounded-xl border-2 flex items-center justify-center p-3 shadow-md overflow-hidden relative transition-colors ${
-          locked
-            ? "border-slate-700 bg-slate-900/60 opacity-70"
-            : broke
-              ? "border-rose-600/50 bg-slate-900/60 opacity-80"
-              : focused
-                ? "border-amber-300 bg-gradient-to-br from-purple-700 via-purple-900 to-slate-950"
-                : "border-purple-400/40 bg-gradient-to-br from-purple-800/80 via-purple-950 to-slate-950 group-hover:border-purple-300"
-        }`}
-      >
-        {locked && (
-          <Lock
-            className="w-4 h-4 text-slate-500 absolute top-2 right-2"
-            aria-hidden
-          />
-        )}
+      {choiceHover.tooltip}
+      {/* Card-shaped tile. When the choice grants a specific item we
+          render the unified `<SznCard>` preview so the user sees the
+          exact card they're about to acquire (same font, edge, tier
+          glyph treatment as the merchant / footer / bag). The choice
+          label rides on a small ribbon below the card. For
+          non-grant choices (cash, score override, locked) we keep
+          the purple narrative tile with the choice label inside.
+          ----------------------------------------------------------
+          `choiceHover.surfaceRef` + `pointerHandlers` are spread on
+          the tile (NOT the outer button) so the description portal
+          anchors over the card surface rather than over the button
+          rect (which includes the price chip below the tile, which
+          would push the tooltip too low and partially hide it
+          behind the price chip on tight viewports). */}
+      {grantedCard && !locked && !broke ? (
         <div
-          className={`dugout-font-sport text-base leading-tight uppercase tracking-wide text-center line-clamp-5 ${
+          ref={choiceHover.surfaceRef}
+          className="flex flex-col items-center gap-1"
+          {...(choiceHover.pointerHandlers ?? {})}
+        >
+          <SznCard
+            variant="ability"
+            // Match the 96x136 chip footprint used by MerchantView's
+            // FooterStyleAbilityCard and PlayerMarketView's
+            // FooterStylePlayerCard so all three encounter overlays
+            // render cards at the same scale -- previously the event
+            // grant rendered as `size="standard"` (128x176) and stuck
+            // out as visually larger than the sibling overlays.
+            size="chip"
+            state={focused ? "focused" : "default"}
+            value={displayValueFor(grantedCard)}
+            label={grantedCard.name}
+            abilityType={grantedCard.abilityType}
+            edges={grantedEdges ?? undefined}
+          />
+          <span className="mt-1 inline-flex items-center px-2 py-0.5 rounded bg-purple-700/70 text-purple-50 text-[9px] font-bold uppercase tracking-widest border border-purple-300/40 max-w-[6rem] text-center line-clamp-2 leading-tight">
+            {choice.label}
+          </span>
+        </div>
+      ) : (
+        <div
+          ref={interactive ? choiceHover.surfaceRef : undefined}
+          {...(interactive ? choiceHover.pointerHandlers ?? {} : {})}
+          // Hard-pinned to 96x136 (the SZN_CARD_SIZES.chip footprint)
+          // so non-grant choices (cash, score override, locked) line
+          // up flush with the SznCard preview above and the chips in
+          // the sibling encounter overlays.
+          style={{ width: 96, height: 136 }}
+          className={`rounded-lg border-2 flex items-center justify-center p-2 shadow-md overflow-hidden relative transition-colors ${
             locked
-              ? "text-slate-400"
+              ? "border-slate-700 bg-slate-900/60 opacity-70"
               : broke
-                ? "text-rose-100"
-                : "text-white drop-shadow"
+                ? "border-rose-600/50 bg-slate-900/60 opacity-80"
+                : focused
+                  ? "border-amber-300 bg-gradient-to-br from-purple-700 via-purple-900 to-slate-950"
+                  : "border-purple-400/40 bg-gradient-to-br from-purple-800/80 via-purple-950 to-slate-950 group-hover:border-purple-300"
           }`}
         >
-          {choice.label}
+          {locked && (
+            <Lock
+              className="w-3.5 h-3.5 text-slate-500 absolute top-1.5 right-1.5"
+              aria-hidden
+            />
+          )}
+          <div
+            className={`dugout-font-sport text-[10px] leading-tight uppercase tracking-wide text-center line-clamp-6 ${
+              locked
+                ? "text-slate-400"
+                : broke
+                  ? "text-rose-100"
+                  : "text-white drop-shadow"
+            }`}
+          >
+            {choice.label}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Price chip below the tile -- same shape & vertical position
           as the merchant / player market chips so all three encounter

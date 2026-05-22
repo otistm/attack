@@ -55,15 +55,22 @@ import {
   getUserSide,
 } from '../lib/gameStore';
 import { useSznGamepad, type GamepadButton } from '../lib/useSznGamepad';
-import { RARITY_BASE_VALUE, type Item, type RosterPlayer } from '../lib/run';
+import { type Item, type Rarity, type RosterPlayer } from '../lib/run';
 import { SESSION_CARDS } from '../lib/cards';
 import type { CardDefinition } from '../lib/cards';
-import { isSznPlayer } from '../lib/sznPlayers';
-import { teamLogoEdge } from '../lib/sznTeams';
-import { SZN_EDGES, type SznEdgeId } from '../lib/sznEdges';
+import { getSznPlayer, isSznPlayer } from '../lib/sznPlayers';
+import {
+  revealedAbilities,
+  totalPotentialSlots,
+  triggerGlyph,
+  triggerLabel,
+} from '../lib/sznPlayerAbilities';
+import { PLAYERS } from '../lib/players';
+import { SZN_EDGES, canSznSnap, type SznEdgeId } from '../lib/sznEdges';
 import { SznEdgeHalf } from './SznEdgeHalf';
-import { MLB_TEAMS } from '../lib/sznTeams';
 import { teamPalette } from '../lib/teamColors';
+import { sellValueFor } from '../lib/items';
+import { TIER_GLYPH, TIER_TINT, type ItemTier } from '../lib/itemTiers';
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -152,19 +159,48 @@ interface FooterCardData {
   rightEdge: SznEdgeId | null;
   /**
    * Team code (SZN `teamId` or legacy `team`) for the player chip's
-   * gradient. Drives the body color so the footer chip is painted with
-   * the SAME team gradient the in-combat `PlayerCard` uses for the
-   * same player -- the user reads "Yankees Aaron Judge" identically
-   * whether they're looking at the footer rail or the at-bat lineup.
+   * Drives the team-code chip painted in the top-left corner of the
+   * card so the user can still read which team the player belongs to
+   * (the card body itself is now painted with a rarity gradient,
+   * not a team gradient -- see `rarity` below).
    * Null on ability/item cards (they keep the neutral blue gradient).
    */
   teamCode?: string | null;
   /**
+   * Roster-slot rarity. Drives the player chip body gradient
+   * (copper / silver / gold / cosmic) and the rarity badge. The
+   * audit asked for rarity, not team, to be the dominant color
+   * signal across every player surface so the user can scan a
+   * row of chips and see tiering at a glance. `undefined` on
+   * ability cards (they don't carry a rarity).
+   */
+  rarity?: Rarity;
+  /**
    * Role tag for the chip's accent ("BAT" / "PIT"). Surfaces the
-   * batter / pitcher distinction even when the team gradient swallows
-   * the old red/green role tint. Always `null` on ability cards.
+   * batter / pitcher distinction even when the rarity gradient
+   * swallows the old red/green role tint. Always `null` on ability
+   * cards.
    */
   roleTag?: 'BAT' | 'PIT' | null;
+  /**
+   * Bazaar tier of the source bag item (only set on ability cards;
+   * always `undefined` for player cards). Drives the tier glyph
+   * (B/S/G) painted in the top-left corner and the live sell-value
+   * subtitle. Defaults to "bronze" everywhere it's read.
+   */
+  itemTier?: ItemTier;
+  /**
+   * Source card's `abilityType` (Signature, General Draw, EncounterItem,
+   * MegaHalf, etc) -- used to look up the body gradient via
+   * {@link abilityCardGradient}. Always undefined for player cards.
+   */
+  abilityType?: string;
+  /**
+   * Live cash-back if the user sells this item from the footer's
+   * sell tray. Only set on item cards; `undefined` for players (the
+   * roster sell tray lives elsewhere).
+   */
+  sellValue?: number;
 }
 
 type ActiveSide = 'left' | 'right';
@@ -178,45 +214,26 @@ const FOOTER_HEIGHT_PX = 240;
 const CARD_WIDTH_PX = 96;
 const CARD_HEIGHT_PX = 136;
 
-/**
- * Human-readable label for each `Rarity` token so the focused-card
- * overlay can render "Aaron Judge — Yankees · OF · Common" instead of
- * the raw lowercase enum value.
- */
-const RARITY_LABEL: Record<string, string> = {
-  common: 'Common',
-  'all-star': 'All-Star',
-  veteran: 'Veteran',
-  legend: 'Legend',
-};
+// Rarity label, utility-tag table, value resolver, subtitle, and
+// description ALL live in `cardDisplay.ts` now so the footer rail
+// matches every other card-shaped surface in SZN mode pixel-for-pixel.
+// Previously each surface kept its own copy and the tables drifted
+// (`all-star` vs `allstar`, `SHIELD` vs `DEF`, etc.).
+import {
+  rosterSubtitle as sharedRosterSubtitle,
+  displayValueFor,
+  resolvePlayerEdges,
+  playerDisplayValue,
+  RARITY_GRADIENT,
+  abilityCardGradient,
+} from '../lib/cardDisplay';
 
-/**
- * Build the one-line subtitle for a roster player ("Yankees · OF ·
- * Common"). Drops the franchise segment if the player is on a legacy
- * placeholder team that isn't in `MLB_TEAMS` (older fallback rosters).
- */
 function rosterSubtitle(rp: RosterPlayer): string {
-  const parts: string[] = [];
-  if (isSznPlayer(rp.player)) {
-    const team = MLB_TEAMS[rp.player.teamId];
-    if (team) parts.push(team.shortName);
-    if (rp.player.position) parts.push(rp.player.position);
-  } else {
-    parts.push(rp.player.role);
-  }
-  parts.push(RARITY_LABEL[rp.rarity] ?? rp.rarity);
-  return parts.join(' · ');
+  return sharedRosterSubtitle(rp);
 }
 
-/**
- * Long-form description for a roster player. Prefers the curated
- * `flavor` text; falls back to a synthesized edge-pair readout so the
- * overlay always has SOMETHING informative under the subtitle.
- */
 function rosterDescription(rp: RosterPlayer): string | undefined {
   if (isSznPlayer(rp.player) && rp.player.flavor) return rp.player.flavor;
-  // Synthetic: "Power → Velocity" so the user knows what this card
-  // can snap to even without a flavor blurb.
   if (isSznPlayer(rp.player)) {
     const left = SZN_EDGES[rp.player.leftEdge]?.label ?? rp.player.leftEdge;
     const right = SZN_EDGES[rp.player.rightEdge]?.label ?? rp.player.rightEdge;
@@ -225,30 +242,8 @@ function rosterDescription(rp: RosterPlayer): string | undefined {
   return undefined;
 }
 
-/**
- * Utility-item value display tag — mirrors `ItemCardPreview.UTILITY_TAGS`
- * so the footer chip and the merchant preview agree on how
- * baseValue-0 utility cards present themselves. Keeps the user from
- * reading "0" as "useless".
- */
-const FOOTER_UTILITY_TAG: Record<string, string> = {
-  'enc-sticky-stuff': 'SNAP',
-  'enc-rally-fire': 'AURA',
-  'enc-platinum-glove': 'DEF',
-  'enc-classic-spikes': 'CPY',
-  'enc-the-torch': 'CPY',
-  'enc-duct-tape': 'SNAP',
-  'enc-faded-scouting-report': 'INTL',
-  'enc-mega-left': 'MEGA',
-  'enc-mega-right': 'MEGA',
-};
-
 function valueForCard(def: CardDefinition | undefined): number | string {
-  if (!def) return 0;
-  if (def.baseValue === 0 && def.abilityType === 'EncounterItem') {
-    return FOOTER_UTILITY_TAG[def.id] ?? '—';
-  }
-  return def.baseValue;
+  return displayValueFor(def);
 }
 
 /**
@@ -267,7 +262,7 @@ function rosterToFooterCard(
   rp: RosterPlayer,
   ctx: { inCombat: boolean; userSide: 'Batting' | 'Pitching'; seatedId: string | null },
 ): FooterCardData {
-  const value = RARITY_BASE_VALUE[rp.rarity] + (rp.permanentBoost ?? 0) + (rp.scoreOverride ?? 0);
+  const value = playerDisplayValue(rp);
   const type: CardType = rp.player.role === 'Pitcher' ? 'pitcher' : 'batter';
   const roleMatches =
     (ctx.userSide === 'Batting' && rp.player.role === 'Batter') ||
@@ -293,18 +288,11 @@ function rosterToFooterCard(
         ? `${rp.player.name} — wrong role for this seat`
         : `Swap ${rp.player.name} into your ${ctx.userSide.toLowerCase()} seat`;
 
-  // Edge resolution mirrors `PlayerCard.tsx`: overrides win, then the
-  // printed leftEdge / rightEdge, with `team-logo` resolving to the
-  // player's franchise logo so a Wildcard Sticker stamped as
-  // `team-logo` reads as `yankees-logo` on a Yankees player.
-  let leftEdge: SznEdgeId | null = null;
-  let rightEdge: SznEdgeId | null = null;
-  if (isSznPlayer(rp.player)) {
-    const leftRaw = (rp.leftEdgeOverride ?? rp.player.leftEdge) as SznEdgeId;
-    const rightRaw = (rp.rightEdgeOverride ?? rp.player.rightEdge) as SznEdgeId;
-    leftEdge = leftRaw === 'team-logo' ? teamLogoEdge(rp.player.teamId) : leftRaw;
-    rightEdge = rightRaw === 'team-logo' ? teamLogoEdge(rp.player.teamId) : rightRaw;
-  }
+  // Edge resolution flows through `cardDisplay.resolvePlayerEdges` so
+  // the footer rail, the at-bat hero, the pickers, and the Series
+  // intro all render the SAME edges for a given slot. Honors
+  // encounter overrides + `team-logo` synthetic resolution.
+  const { leftEdge, rightEdge } = resolvePlayerEdges(rp);
 
   // Team code drives the gradient on the footer chip so the rail
   // matches the at-bat card visually. SZN players use `teamId`;
@@ -329,6 +317,10 @@ function rosterToFooterCard(
     leftEdge,
     rightEdge,
     teamCode,
+    // Surface the slot rarity so the Card render below can paint
+    // the body with the rarity gradient (copper / silver / gold /
+    // cosmic) instead of the team palette.
+    rarity: rp.rarity,
     roleTag: rp.player.role === 'Pitcher' ? 'PIT' : 'BAT',
   };
 }
@@ -347,6 +339,7 @@ function itemToFooterCard(
   ctx: {
     inCombat: boolean;
     dealtInstanceIds: Set<string>;
+    week: number;
   },
 ): FooterCardData | null {
   const def = SESSION_CARDS.find((c) => c.id === item.cardId);
@@ -365,6 +358,9 @@ function itemToFooterCard(
   const leftEdge = sznEdgeFromString(def?.sznLeftEdge);
   const rightEdge = sznEdgeFromString(def?.sznRightEdge);
 
+  const itemTier: ItemTier = item.tier ?? 'bronze';
+  const sellValue = def ? sellValueFor(def, ctx.week, itemTier) : undefined;
+
   return {
     id: item.instanceId,
     value: valueForCard(def),
@@ -372,15 +368,25 @@ function itemToFooterCard(
     // Full item name on the card; multi-line wrap in CardLabel keeps
     // long names like "Faded Scouting Report" readable.
     label: def?.name ?? item.cardId,
-    subtitle: def?.abilityType
-      ? humanizeAbilityType(def.abilityType)
-      : undefined,
+    // Skip the humanized "Encounter Item" subtitle for SZN items --
+    // the user already knows they're looking at an item (they're on
+    // the bag rail / merchant / event grant), so reading "Encounter
+    // Item" on every overlay is pure noise. Other ability types
+    // (General Draw, Player, etc.) still surface their humanized
+    // label for context.
+    subtitle:
+      def?.abilityType && def.abilityType !== "EncounterItem"
+        ? humanizeAbilityType(def.abilityType)
+        : undefined,
     description: def?.description,
     action,
     state,
     title,
     leftEdge,
     rightEdge,
+    itemTier,
+    abilityType: def?.abilityType,
+    sellValue,
   };
 }
 
@@ -424,6 +430,7 @@ function decksFromRun(
     userSide: 'Batting' | 'Pitching';
     seatedId: string | null;
     dealtInstanceIds: Set<string>;
+    week: number;
   },
 ): DeckState {
   const left: FooterCardData[] = [];
@@ -465,6 +472,7 @@ export function SznFooterDecks() {
   // doesn't fire on unrelated store updates.
   const roster = useGameStore((s) => s.run?.roster ?? null);
   const itemBag = useGameStore((s) => s.run?.itemBag ?? null);
+  const week = useGameStore((s) => s.run?.week ?? 1);
   const userSide = useGameStore(getUserSide);
   const batter = useGameStore((s) => s.batter);
   const pitcher = useGameStore((s) => s.pitcher);
@@ -475,6 +483,25 @@ export function SznFooterDecks() {
   const sznSwapPlayer = useGameStore((s) => s.sznSwapPlayer);
   const sznSwapRoster = useGameStore((s) => s.sznSwapRoster);
   const sznSwapItemBag = useGameStore((s) => s.sznSwapItemBag);
+  const sellItemForCash = useGameStore((s) => s.sellItemForCash);
+
+  // Free-agency overflow flow. When `run.pendingPlayerGrant` is set,
+  // the user signed a player while the roster was already at the
+  // starter-pack cap; the cull must come out of the existing roster
+  // before the queued sign can land. We surface this entirely on the
+  // footer rail now (previously a separate full-screen
+  // `RosterReleasePicker` modal): the left deck paints each player
+  // chip with a red "RELEASE" overlay, CROSS / click confirms the
+  // cut, and CIRCLE cancels with a full refund.
+  const pendingPlayerGrant = useGameStore(
+    (s) => s.run?.pendingPlayerGrant ?? null,
+  );
+  const confirmReleaseAndSignPlayer = useGameStore(
+    (s) => s.confirmReleaseAndSignPlayer,
+  );
+  const cancelPendingPlayerGrant = useGameStore(
+    (s) => s.cancelPendingPlayerGrant,
+  );
 
   // Set of bag instance ids currently held in the user's hand. We
   // derive this every render from the live hand (whichever seat the
@@ -507,8 +534,9 @@ export function SznFooterDecks() {
         userSide,
         seatedId,
         dealtInstanceIds,
+        week,
       }),
-    [roster, itemBag, inCombat, userSide, seatedId, dealtInstanceIds],
+    [roster, itemBag, inCombat, userSide, seatedId, dealtInstanceIds, week],
   );
 
   // ----- Local UI state (focus + collapse + move mode) -----------------
@@ -524,12 +552,101 @@ export function SznFooterDecks() {
   // filters off the same roster array.
   const [moveMode, setMoveMode] = useState(false);
   const canMove = inFrontOffice && !inCombat;
+  // Sell mode is a sibling toggle to move mode -- entered via L2 (or
+  // the per-card `$` corner button on the abilities row, see Card
+  // below). While on, each ability card paints a red "SELL $X"
+  // overlay and clicking sells the item for cash. Gated to FO; combat
+  // owns the rail's deal surface and shouldn't lose items mid-at-bat.
+  // Move mode and sell mode are mutually exclusive -- entering one
+  // disables the other so the user can't accidentally swap-then-sell.
+  const [sellMode, setSellMode] = useState(false);
   // If the user leaves FO mid-shuffle (e.g., series starts), bounce
-  // out of move mode so the in-combat rail is back to its actionable
-  // baseline.
+  // out of move/sell mode so the in-combat rail is back to its
+  // actionable baseline.
   useEffect(() => {
     if (!canMove && moveMode) setMoveMode(false);
-  }, [canMove, moveMode]);
+    if (!canMove && sellMode) setSellMode(false);
+  }, [canMove, moveMode, sellMode]);
+
+  // ----- Release mode (free-agency overflow cull) ---------------------
+  // Active whenever `run.pendingPlayerGrant` is set. The user just
+  // bought a free agent while the roster was already at the cap, so
+  // they MUST pick one current roster slot to release before the new
+  // sign can land. Drives:
+  //   - Auto-focus into the left deck so the user lands on the
+  //     release picker without an extra DPAD press.
+  //   - A red "RELEASE" overlay on every player chip (mirrors sell
+  //     mode's per-card treatment for items).
+  //   - A `ReleaseTrayBanner` callout above the rail describing the
+  //     pending sign + CIRCLE-to-refund escape hatch.
+  //   - Per-player release validity: the same `sameRoleCount > 1 ||
+  //     incoming.role === releasing.role` rule
+  //     `confirmReleaseAndSignPlayer` enforces, surfaced visually so
+  //     the user can't click into a no-op.
+  const releaseMode = pendingPlayerGrant !== null;
+  // Resolve the incoming player from the same catalog gameStore uses
+  // (SZN pool first, legacy MLB fallback) so we know which role the
+  // grant fills. Needed to compute the per-player release validity
+  // below; null while there's no pending grant.
+  const incomingPlayerRole: 'Batter' | 'Pitcher' | null = useMemo(() => {
+    if (!pendingPlayerGrant) return null;
+    const p =
+      getSznPlayer(pendingPlayerGrant.playerId) ??
+      PLAYERS.find((pl) => pl.id === pendingPlayerGrant.playerId);
+    return p?.role ?? null;
+  }, [pendingPlayerGrant]);
+  // Set of roster player ids that can be safely released for the
+  // current pending grant. A slot is INVALID when releasing it would
+  // leave its role at zero AND the incoming player doesn't backfill
+  // that role -- exactly the gate `confirmReleaseAndSignPlayer`
+  // enforces. We surface it here so the chips that would no-op are
+  // visibly disabled instead of silently rejecting CROSS.
+  const releaseValidIds: Set<string> = useMemo(() => {
+    const out = new Set<string>();
+    if (!releaseMode || !roster) return out;
+    const batterCount = roster.filter((r) => r.player.role === 'Batter').length;
+    const pitcherCount = roster.filter(
+      (r) => r.player.role === 'Pitcher',
+    ).length;
+    for (const rp of roster) {
+      const sameRoleCount =
+        rp.player.role === 'Batter' ? batterCount : pitcherCount;
+      const incomingBackfills = incomingPlayerRole === rp.player.role;
+      if (sameRoleCount > 1 || incomingBackfills) {
+        out.add(rp.player.id);
+      }
+    }
+    return out;
+  }, [releaseMode, roster, incomingPlayerRole]);
+
+  // Enter release mode: pin focus to the footer + left deck and pop
+  // collapse / move / sell so the user lands directly on a clean
+  // release-picker surface. `pendingPlayerGrant?.playerId` is the
+  // re-trigger key -- a second pending grant queued after the first
+  // (defensive; the store currently refuses concurrent grants) would
+  // still re-snap focus to the new pick. Gated on `shouldRender` so
+  // a pending grant queued outside the FO / combat surfaces (a
+  // future caller path) doesn't strand focus on a rail that isn't
+  // mounted.
+  useEffect(() => {
+    if (!releaseMode || !shouldRender) return;
+    setFocusSurface('footer');
+    setActiveSide('left');
+    if (footerCollapsed) setFooterCollapsed(false);
+    if (moveMode) setMoveMode(false);
+    if (sellMode) setSellMode(false);
+    // Land on the first VALID release target so the user doesn't have
+    // to walk past a disabled chip on entry. Falls back to slot 0 if
+    // every chip happens to be invalid (defensive — the store-side
+    // guard prevents that, but we don't want to NaN here).
+    setFooterIndex(() => {
+      const first = roster?.findIndex((r) =>
+        releaseValidIds.has(r.player.id),
+      );
+      return first !== undefined && first >= 0 ? first : 0;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [releaseMode, shouldRender, pendingPlayerGrant?.playerId]);
 
   // Keep the focused index inside the current deck's bounds. When the
   // deck shrinks (item dealt out, player swapped in/out) we clamp so
@@ -571,6 +688,28 @@ export function SznFooterDecks() {
   const activateCard = useCallback(
     (card: FooterCardData | undefined): boolean => {
       if (!card) return false;
+      // Release mode (free-agency overflow cull) takes precedence over
+      // every other activation path -- when a pending grant is queued
+      // the only legal action on the left deck is releasing one of
+      // the focused player slots. Invalid targets (slot would leave
+      // the role at zero AND incoming player doesn't backfill) no-op
+      // so the user gets the same dead-click feedback the visual
+      // dim/grey treatment is telegraphing.
+      if (releaseMode && (card.type === 'batter' || card.type === 'pitcher')) {
+        if (!releaseValidIds.has(card.id)) return false;
+        confirmReleaseAndSignPlayer(card.id);
+        return true;
+      }
+      // Sell mode overrides normal activation for ability cards. The
+      // user explicitly opted into the sell tray (via L2 / the per-
+      // card $ chip / SQUARE if they're already in sell mode); a
+      // click on an item card commits the sale instead of dealing.
+      // Players are untouched by sell mode -- the roster sell loop
+      // lives in `sellPlayerForCash` elsewhere.
+      if (sellMode && card.type === 'ability') {
+        sellItemForCash(card.id);
+        return true;
+      }
       if (card.action === 'deal') {
         sznDealItem(card.id);
         return true;
@@ -581,8 +720,25 @@ export function SznFooterDecks() {
       }
       return false;
     },
-    [sznDealItem, sznSwapPlayer],
+    [
+      sznDealItem,
+      sznSwapPlayer,
+      sellItemForCash,
+      sellMode,
+      releaseMode,
+      releaseValidIds,
+      confirmReleaseAndSignPlayer,
+    ],
   );
+
+  const toggleSellMode = useCallback(() => {
+    if (!canMove) return;
+    setSellMode((prev) => {
+      const next = !prev;
+      if (next && moveMode) setMoveMode(false);
+      return next;
+    });
+  }, [canMove, moveMode]);
 
   // ----- Move mode shift (click arrows OR DPAD in move mode) ----------
   // Swap the focused card in `side` with its neighbor at `dir`. Returns
@@ -621,6 +777,47 @@ export function SznFooterDecks() {
   // ----- Gamepad focus router -----------------------------------------
   const onGamepadButton = useCallback(
     (btn: GamepadButton): boolean | void => {
+      // ---- Release mode overrides -------------------------------------
+      // While a free-agency overflow pick is pending the rail becomes a
+      // forced cull picker -- focus is pinned to the left deck, every
+      // non-release input is swallowed (so a stray TRIANGLE doesn't
+      // collapse the rail and hide the very chips the user needs to
+      // click), and only the explicit confirm / cancel keys advance.
+      // Mirrors the modal contract the legacy `RosterReleasePicker`
+      // exposed, but routed entirely through the footer's existing
+      // focus-router so the user never leaves the rail context.
+      if (releaseMode) {
+        switch (btn) {
+          case 'DPAD_LEFT': {
+            const list = decks.left;
+            if (list.length === 0) return true;
+            setFooterIndex((idx) => Math.max(0, idx - 1));
+            return true;
+          }
+          case 'DPAD_RIGHT': {
+            const list = decks.left;
+            if (list.length === 0) return true;
+            setFooterIndex((idx) => Math.min(list.length - 1, idx + 1));
+            return true;
+          }
+          case 'CROSS': {
+            const card = decks.left[footerIndex];
+            activateCard(card);
+            return true;
+          }
+          case 'CIRCLE':
+            cancelPendingPlayerGrant();
+            return true;
+          default:
+            // Everything else (DPAD_UP/DOWN, L1/R1, SQUARE, TRIANGLE,
+            // L2) is intentionally inert during release -- the user
+            // has one job, pick a player or cancel. Returning true
+            // consumes the press so a higher-priority handler doesn't
+            // get a second crack at it either.
+            return true;
+        }
+      }
+
       if (focusSurface !== 'footer') {
         // Either 'screen' or 'hand' surface owns input — the footer is
         // only a passive listener here. We grab DPAD_DOWN as the
@@ -728,7 +925,22 @@ export function SznFooterDecks() {
           // SQUARE grabs the focused card or drops the grabbed card.
           // Gated to FO -- combat owns the rail's deal/swap surface.
           if (!canMove) return false;
+          if (sellMode) {
+            // While the sell tray is open, SQUARE is the explicit exit
+            // affordance so the user can bail out of selling without
+            // accidentally dealing the focused card.
+            setSellMode(false);
+            return true;
+          }
           toggleMoveMode();
+          return true;
+        case 'L2':
+          // L2 toggles the sell tray (Bazaar parity: shoulder button
+          // surfaces the "I want to sell stuff" overlay). Gated to
+          // FO; entering sell mode also drops the move-mode grab so
+          // the user can't accidentally swap-then-sell.
+          if (!canMove) return false;
+          toggleSellMode();
           return true;
         default:
           return false;
@@ -744,9 +956,13 @@ export function SznFooterDecks() {
       footerIndex,
       activateCard,
       moveMode,
+      sellMode,
       canMove,
       shiftFocused,
       toggleMoveMode,
+      toggleSellMode,
+      releaseMode,
+      cancelPendingPlayerGrant,
     ],
   );
 
@@ -771,6 +987,14 @@ export function SznFooterDecks() {
   return (
     <>
       <FocusedCardDetail card={focusedCard} collapsed={footerCollapsed} moveMode={moveMode} />
+      {sellMode && canMove && <SellTrayBanner onClose={() => setSellMode(false)} />}
+      {releaseMode && (
+        <ReleaseTrayBanner
+          pendingLabel={pendingPlayerGrant?.label ?? 'the new signing'}
+          refund={pendingPlayerGrant?.refundOnCancel ?? 0}
+          onCancel={() => cancelPendingPlayerGrant()}
+        />
+      )}
       <FooterBand
       decks={decks}
       activeSide={activeSide}
@@ -778,9 +1002,25 @@ export function SznFooterDecks() {
       collapsed={footerCollapsed}
       focused={footerOwnsFocus}
       moveMode={moveMode}
+      sellMode={sellMode && canMove}
+      releaseMode={releaseMode}
+      releaseValidIds={releaseValidIds}
+      onSell={(instanceId) => sellItemForCash(instanceId)}
       onCardClick={(side, idx) => {
         const card = decks[side][idx];
         if (focusSurface !== 'footer') setFocusSurface('footer');
+        // Release mode: clicking a left-deck player commits the cull
+        // (or no-ops on an invalid target -- same gate the gamepad
+        // CROSS path uses via `activateCard`). Right-deck clicks are
+        // intentionally inert during release because the cull MUST
+        // come out of the roster, not the bag.
+        if (releaseMode) {
+          if (side !== 'left') return;
+          setActiveSide('left');
+          setFooterIndex(idx);
+          activateCard(card);
+          return;
+        }
         // Move mode: the focused card is the GRABBED card. Clicking
         // another card in the same deck swaps them and follows the
         // grabbed card to its new slot; clicking the grabbed card
@@ -807,6 +1047,10 @@ export function SznFooterDecks() {
         activateCard(card);
       }}
       onSideHover={(side) => {
+        // Release mode keeps the active side pinned to the roster --
+        // hovering the bag side would otherwise yank the focused card
+        // detail off-screen mid-pick.
+        if (releaseMode) return;
         if (side === activeSide) return;
         setActiveSide(side);
         setFooterIndex(0);
@@ -927,7 +1171,97 @@ function FocusedCardDetail({
             )}
           </div>
         )}
+        {/* Player abilities: passive (always) + potentials with rarity-
+            gated locks. Bag items / non-player cards skip the block via
+            the type/id guards inside PlayerAbilitiesSection. */}
+        <PlayerAbilitiesSection card={card} accent={ringColor} />
       </div>
+    </div>
+  );
+}
+
+/**
+ * Inline subcomponent: renders the focused player's passive + the
+ * full potential strip (locked slots greyed out as "???"). Bag /
+ * ability cards skip rendering by returning `null`.
+ */
+function PlayerAbilitiesSection({
+  card,
+  accent,
+}: {
+  card: FooterCardData;
+  accent: string;
+}) {
+  if (card.type !== 'batter' && card.type !== 'pitcher') return null;
+  const player = getSznPlayer(card.id);
+  if (!player) return null;
+  const rarity = card.rarity ?? 'common';
+  const revealed = revealedAbilities(player, rarity);
+  const totalSlots = totalPotentialSlots(player);
+  const revealedPotentialCount = revealed.length - 1; // first entry is passive
+  const lockedCount = Math.max(0, totalSlots - revealedPotentialCount);
+  return (
+    <div className="mt-2 flex flex-col gap-1.5 border-t border-white/10 pt-2">
+      <div
+        className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest"
+        style={{ color: accent }}
+      >
+        <span>Abilities</span>
+        <span className="text-[#a6adc8] font-normal">
+          ({revealedPotentialCount}/{totalSlots} potentials revealed)
+        </span>
+      </div>
+      {revealed.map((ab, idx) => (
+        <div
+          key={ab.id}
+          className="flex items-start gap-2 rounded bg-white/5 px-2 py-1"
+        >
+          <span aria-hidden className="mt-0.5 text-sm">
+            {triggerGlyph(ab.trigger)}
+          </span>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-baseline gap-2">
+              <span
+                className="text-[11px] font-black uppercase tracking-wide"
+                style={{ color: idx === 0 ? accent : '#f9e2af' }}
+              >
+                {ab.name}
+              </span>
+              <span className="text-[9px] font-bold uppercase tracking-widest text-[#a6adc8]">
+                {idx === 0 ? 'Passive' : `Potential ${idx}`} · {triggerLabel(ab.trigger)}
+              </span>
+            </div>
+            {ab.effect.flavor && (
+              <div className="text-[11px] leading-snug text-[#e6e6f0]">
+                {ab.effect.flavor}
+              </div>
+            )}
+          </div>
+        </div>
+      ))}
+      {Array.from({ length: lockedCount }).map((_, i) => (
+        <div
+          key={`locked-${i}`}
+          className="flex items-start gap-2 rounded border border-dashed border-white/10 bg-white/[0.02] px-2 py-1 opacity-60"
+        >
+          <span aria-hidden className="mt-0.5 text-sm text-[#6c7086]">
+            ?
+          </span>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-baseline gap-2">
+              <span className="text-[11px] font-black uppercase tracking-wide text-[#6c7086]">
+                ???
+              </span>
+              <span className="text-[9px] font-bold uppercase tracking-widest text-[#6c7086]">
+                Potential {revealedPotentialCount + i + 1} · Locked
+              </span>
+            </div>
+            <div className="text-[11px] leading-snug text-[#6c7086]">
+              Reveals at the next rarity tier.
+            </div>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -939,6 +1273,10 @@ function FooterBand({
   collapsed,
   focused,
   moveMode,
+  sellMode,
+  releaseMode,
+  releaseValidIds,
+  onSell,
   onCardClick,
   onSideHover,
 }: {
@@ -948,6 +1286,15 @@ function FooterBand({
   collapsed: boolean;
   focused: boolean;
   moveMode: boolean;
+  sellMode: boolean;
+  /** True while a free-agency overflow cull is pending. Paints the
+   *  left deck with the RELEASE overlay + locks the active side. */
+  releaseMode: boolean;
+  /** Player ids that survive the role-floor check (`sameRoleCount > 1
+   *  || incoming.role === slot.role`). Slots not in this set render
+   *  as disabled release targets so CROSS / click no-op gracefully. */
+  releaseValidIds: Set<string>;
+  onSell: (instanceId: string) => void;
   onCardClick: (side: ActiveSide, idx: number) => void;
   onSideHover: (side: ActiveSide) => void;
 }) {
@@ -970,6 +1317,10 @@ function FooterBand({
           focused && activeSide === 'left' ? footerIndex : -1
         }
         moveMode={moveMode}
+        sellMode={false}
+        releaseMode={releaseMode}
+        releaseValidIds={releaseValidIds}
+        onSell={onSell}
         onCardClick={(idx) => onCardClick('left', idx)}
         onHover={() => onSideHover('left')}
       />
@@ -982,12 +1333,23 @@ function FooterBand({
           focused && activeSide === 'right' ? footerIndex : -1
         }
         moveMode={moveMode}
+        sellMode={sellMode}
+        // Right deck is non-actionable during release -- no overlay
+        // paints there and no slot is a valid target.
+        releaseMode={false}
+        releaseValidIds={EMPTY_RELEASE_SET}
+        onSell={onSell}
         onCardClick={(idx) => onCardClick('right', idx)}
         onHover={() => onSideHover('right')}
       />
     </div>
   );
 }
+
+// Stable empty set so the right deck's release props don't churn the
+// memoization on every render (Set identity matters for the per-card
+// `releaseDisabled` derived bool).
+const EMPTY_RELEASE_SET: Set<string> = new Set();
 
 function RowContainer({
   label,
@@ -996,6 +1358,10 @@ function RowContainer({
   cards,
   focusedIndex,
   moveMode,
+  sellMode,
+  releaseMode,
+  releaseValidIds,
+  onSell,
   onCardClick,
   onHover,
 }: {
@@ -1005,6 +1371,12 @@ function RowContainer({
   cards: FooterCardData[];
   focusedIndex: number;
   moveMode: boolean;
+  sellMode: boolean;
+  /** True only on the left row while a free-agency cull is pending. */
+  releaseMode: boolean;
+  /** Player ids the cull picker considers valid release targets. */
+  releaseValidIds: Set<string>;
+  onSell: (instanceId: string) => void;
   onCardClick: (idx: number) => void;
   onHover: () => void;
 }) {
@@ -1081,6 +1453,12 @@ function RowContainer({
       </div>
       <div
         ref={wrapperRef}
+        // Stable id so encounter views (Merchant, Event) can measure
+        // the abilities-row rect and animate a purchased / claimed
+        // card into its final resting position. Side is encoded in the
+        // id so the same lookup pattern works for any future "fly
+        // into the player rail" affordance (e.g. Player Market signs).
+        id={`szn-footer-row-${side}`}
         className={[
           'w-full rounded-xl border-[3px] py-5 transition-[border-color,background-color] duration-300',
           '[overflow-x:clip] [overflow-y:visible]',
@@ -1108,12 +1486,23 @@ function RowContainer({
           >
             {cards.map((card, i) => {
               const focused = i === focusedIndex;
+              // Release target = a roster player chip on the left row
+              // while a cull is pending. Items on the right row never
+              // qualify -- the cull MUST come out of the roster.
+              const isReleaseTarget =
+                releaseMode && card.type !== 'ability';
+              const releaseDisabled =
+                isReleaseTarget && !releaseValidIds.has(card.id);
               return (
                 <Card
                   key={card.id}
                   card={card}
                   focused={focused}
                   moveMode={moveMode}
+                  sellMode={sellMode}
+                  releaseTarget={isReleaseTarget}
+                  releaseDisabled={releaseDisabled}
+                  onSell={() => onSell(card.id)}
                   onClick={() => onCardClick(i)}
                 />
               );
@@ -1125,36 +1514,117 @@ function RowContainer({
   );
 }
 
+/**
+ * Does this footer card share a connectable edge with the encounter
+ * card the user is currently focused on? Drives the "compat lift"
+ * visual treatment below so the user can see at a glance which roster
+ * / bag chips would chain off the encounter listing they're eyeing.
+ *
+ * Returns true when ANY directional snap check passes:
+ *   - focused card sits left of footer card  (focused.right ↔ footer.left)
+ *   - footer card sits left of focused card  (footer.right ↔ focused.left)
+ *
+ * `null` edges (legacy chips, blank slots) are treated as non-matching.
+ * The compat check skips cards that are already in a louder visual
+ * state (focused, grabbed, seated) so we never stack hints on top of
+ * affordances the user is actively working with.
+ */
+function isCompatibleWithEncounter(
+  card: FooterCardData,
+  focusEdges: { leftEdge: SznEdgeId | null; rightEdge: SznEdgeId | null } | null,
+): boolean {
+  if (!focusEdges) return false;
+  const fLeft = focusEdges.leftEdge;
+  const fRight = focusEdges.rightEdge;
+  const cLeft = card.leftEdge;
+  const cRight = card.rightEdge;
+  if (fRight && cLeft && canSznSnap(fRight, cLeft)) return true;
+  if (cRight && fLeft && canSznSnap(cRight, fLeft)) return true;
+  return false;
+}
+
 function Card({
   card,
   focused,
   moveMode,
+  sellMode,
+  releaseTarget,
+  releaseDisabled,
+  onSell,
   onClick,
 }: {
   card: FooterCardData;
   focused: boolean;
   moveMode: boolean;
+  sellMode: boolean;
+  /** True when a free-agency cull is pending AND this is a roster
+   *  chip on the left row. Paints the red "RELEASE" overlay and
+   *  routes clicks through to `confirmReleaseAndSignPlayer` upstream. */
+  releaseTarget: boolean;
+  /** True when releasing this slot would leave its role empty (and
+   *  the incoming player doesn't backfill it). Renders dimmed +
+   *  non-interactive so the user gets the same dead-click feedback
+   *  the store-side gate would silently produce. */
+  releaseDisabled: boolean;
+  /** Direct sell handler (fires when the user clicks the per-card $
+   *  chip OR taps the card while sell mode is on). */
+  onSell: () => void;
   onClick: () => void;
 }) {
-  // Player chips paint with the player's team palette so the footer
-  // rail matches the in-combat `PlayerCard` exactly -- the user reads
-  // "Yankees Aaron Judge" the same way in both places. Ability chips
-  // keep the neutral blue gradient. Falls back to the legacy red /
-  // green role tints if the team palette is unavailable (e.g., legacy
-  // quick-match rosters without an MLB team), and `roleTag` (below)
-  // carries the role distinction for player chips regardless of which
-  // gradient we land on.
+  // Encounter compatibility hint. Encounter views (Merchant, Player
+  // Market) push the edges of the focused listing to
+  // `encounterFocusEdges`; any footer card whose edge can SZN-snap to
+  // either side of that listing pops up a notch with an emerald glow
+  // so the user can immediately see "these chips chain off the thing
+  // I'm eyeing". Suppressed during move-mode / focus / seated so the
+  // hint never fights louder affordances the user is operating on.
+  const encounterFocusEdges = useGameStore((s) => s.encounterFocusEdges);
+  const compatible =
+    !moveMode &&
+    !releaseTarget &&
+    !focused &&
+    card.state !== 'seated' &&
+    card.state !== 'disabled' &&
+    isCompatibleWithEncounter(card, encounterFocusEdges);
+  // Player chips paint with a RARITY gradient (copper / silver /
+  // gold / cosmic) so the rail scans as tiering at a glance --
+  // matches the at-bat `PlayerCard` and `<SznCard>` now that the
+  // audit pulled team color off the card body. The team is still
+  // legible via the team-code chip painted in the top-left corner
+  // (see `card.teamCode` block further down). Ability chips paint
+  // per-`abilityType` via the shared `abilityCardGradient` helper
+  // (in `cardDisplay.ts`) -- previously this file kept its own
+  // inline `linear-gradient(135deg, #89b4fa, #74c7ec)` copy that
+  // made every Encounter Item / Signature / General Draw read as
+  // the same blue chip. The shared helper also layers a tier
+  // overlay (silver / gold) on top of the ability-type body.
+  // Falls back to the legacy red / green role tints only when
+  // neither rarity nor team is available (legacy quick-match
+  // rosters); `roleTag` carries the role distinction for player
+  // chips regardless of which gradient we land on.
   let gradient: string;
-  if (card.teamCode) {
+  if (card.type !== 'ability' && card.rarity) {
+    const { primary, secondary } = RARITY_GRADIENT[card.rarity];
+    gradient = `linear-gradient(135deg, ${primary}, ${secondary})`;
+  } else if (card.type === 'ability') {
+    const { primary, secondary, overlay } = abilityCardGradient(
+      card.abilityType,
+      card.itemTier ?? null,
+    );
+    gradient = overlay
+      ? [
+          `linear-gradient(135deg, ${overlay.primary}, ${overlay.secondary})`,
+          `linear-gradient(135deg, ${primary}, ${secondary})`,
+        ].join(', ')
+      : `linear-gradient(135deg, ${primary}, ${secondary})`;
+  } else if (card.teamCode) {
     const palette = teamPalette(card.teamCode);
     gradient = `linear-gradient(135deg, ${palette.primary}, ${palette.secondary})`;
   } else {
     gradient =
       card.type === 'batter'
         ? 'linear-gradient(135deg, #e53935, #ef5350)'
-        : card.type === 'pitcher'
-          ? 'linear-gradient(135deg, #15803d, #4ade80)'
-          : 'linear-gradient(135deg, #89b4fa, #74c7ec)';
+        : 'linear-gradient(135deg, #15803d, #4ade80)';
   }
 
   // Visual treatment is owned by `card.state` -- four buckets so the
@@ -1177,29 +1647,54 @@ function Card({
   // then walks the grabbed card through the row; the focus follows.)
   const isGrabbed = moveMode && focused;
 
-  const borderColor = isGrabbed
-    ? '#cba6f7' /* purple grab */
-    : focused
-      ? '#f9e2af' /* yellow focus */
-      : isSeated
-        ? '#fbbf24'
-        : isInventory
-          ? 'rgba(255,255,255,0.18)'
-          : isActionable
-            ? 'rgba(255,255,255,0.12)'
-            : 'transparent';
-  const shadow = isGrabbed
-    ? '0 15px 20px rgba(203,166,247,0.5)' /* purple drop shadow */
-    : focused
-      ? '0 10px 15px rgba(249,226,175,0.4)'
-      : isSeated
-        ? '0 6px 12px rgba(251,191,36,0.45)'
-        : '0 4px 6px rgba(0,0,0,0.3)';
+  // ItemTier is going to be needed for the corner glyph below — declared
+  // up here so the variable is in scope for both the style block and
+  // the corner-chip render. Same goes for the sell-target gate: it's
+  // computed once up top because the border/shadow/transform block
+  // and the JSX below both branch on it.
+  const itemTier: ItemTier | null = card.type === 'ability' ? (card.itemTier ?? 'bronze') : null;
+  const isSellTarget = sellMode && card.type === 'ability';
+  // Release-target chips get the same red treatment as sell targets
+  // (border / shadow / overlay) but with a "RELEASE" callout instead
+  // of a sell price, since the cost of a release is one roster slot,
+  // not cash. Invalid release targets (would leave a role empty) get
+  // the same red border but desaturated body + grey overlay so the
+  // user can see the slot exists but can't pick it.
+  const borderColor = isSellTarget || (releaseTarget && !releaseDisabled)
+    ? '#f87171' /* red sell- or release-target */
+    : releaseTarget && releaseDisabled
+      ? 'rgba(248,113,113,0.45)' /* dimmed red -- role-locked release */
+      : isGrabbed
+        ? '#cba6f7' /* purple grab */
+        : focused
+          ? '#f9e2af' /* yellow focus */
+          : isSeated
+            ? '#fbbf24'
+            : compatible
+              ? '#a6e3a1' /* emerald compat hint */
+              : isInventory
+                ? 'rgba(255,255,255,0.18)'
+                : isActionable
+                  ? 'rgba(255,255,255,0.12)'
+                  : 'transparent';
+  const shadow = isSellTarget || (releaseTarget && !releaseDisabled)
+    ? '0 10px 18px rgba(248,113,113,0.45)' /* red sell / release glow */
+    : isGrabbed
+      ? '0 15px 20px rgba(203,166,247,0.5)' /* purple drop shadow */
+      : focused
+        ? '0 10px 15px rgba(249,226,175,0.4)'
+        : isSeated
+          ? '0 6px 12px rgba(251,191,36,0.45)'
+          : compatible
+            ? '0 10px 18px rgba(166,227,161,0.45)' /* emerald compat glow */
+            : '0 4px 6px rgba(0,0,0,0.3)';
   const transform = isGrabbed
     ? 'translateY(-25px) scale(1.05)' /* extra lift + scale */
     : focused
       ? 'translateY(-15px)'
-      : 'none';
+      : compatible
+        ? 'translateY(-12px) scale(1.03)' /* compat lift -- between rest + focused */
+        : 'none';
 
   // Hover behavior also scoped to state. While move mode is on the
   // OTHER cards become "swap targets" -- pointer cursor + brighten
@@ -1232,30 +1727,59 @@ function Card({
           : 'AT PLATE'
         : null;
 
+  // Sell mode short-circuits the normal click semantics for item
+  // cards -- a click commits the sale instead of dealing. Player
+  // cards stay on their normal swap rail (sell mode is
+  // ability-only). The tray banner above tells the user CIRCLE /
+  // SQUARE exits.
   return (
     <button
       type="button"
       // Click semantics:
-      //   - In move mode: the parent handler swaps the grabbed
-      //     (focused) card with this card and re-focuses to follow
-      //     the swap. We forward the click unconditionally so
-      //     non-actionable cards (e.g., a seated player) can still
-      //     be swapped during move mode.
-      //   - Outside move mode: only actionable cards fire the
+      //   - Sell mode (ability cards): commit the sale and refund cash.
+      //   - Move mode: the parent handler swaps the grabbed (focused)
+      //     card with this card and re-focuses to follow the swap.
+      //     Forward unconditionally so non-actionable cards (a seated
+      //     player) can still be swapped during move mode.
+      //   - Outside both modes: only actionable cards fire the
       //     deal/swap call.
-      onClick={moveMode ? onClick : isActionable ? onClick : undefined}
+      onClick={
+        isSellTarget
+          ? onSell
+          : releaseTarget
+            ? releaseDisabled
+              ? undefined
+              : onClick
+            : moveMode
+              ? onClick
+              : isActionable
+                ? onClick
+                : undefined
+      }
       // Only hard-disable cards the user genuinely can't use right
-      // now (wrong role for the current seat). Inventory and seated
-      // cards stay focusable so the user can navigate to them and
-      // read their tooltip / inspect their edges. In move mode we
-      // never disable so every card stays a swap target.
-      disabled={!moveMode && isDisabled}
+      // now (wrong role for the current seat OR a role-locked
+      // release target). Inventory and seated cards stay focusable
+      // so the user can navigate to them and read their tooltip /
+      // inspect their edges. In move mode we never disable so every
+      // card stays a swap target. In sell mode every ability card is
+      // interactive (and players stay clickable for context / focus
+      // tracking).
+      disabled={
+        (!moveMode && !isSellTarget && !releaseTarget && isDisabled) ||
+        (releaseTarget && releaseDisabled)
+      }
       title={
-        moveMode
-          ? isGrabbed
-            ? `Grabbed: ${card.label ?? card.id} (SQUARE to drop, DPAD to shift)`
-            : `Swap into this slot: ${card.label ?? card.id}`
-          : card.title
+        isSellTarget
+          ? `Sell ${card.label ?? card.id} for $${card.sellValue ?? 0}`
+          : releaseTarget
+            ? releaseDisabled
+              ? `${card.label ?? card.id} — only ${card.type === 'pitcher' ? 'pitcher' : 'batter'} on roster; cancel or pick a different slot`
+              : `Release ${card.label ?? card.id} to free a roster slot`
+            : moveMode
+              ? isGrabbed
+                ? `Grabbed: ${card.label ?? card.id} (SQUARE to drop, DPAD to shift)`
+                : `Swap into this slot: ${card.label ?? card.id}`
+              : card.title
       }
       aria-label={card.title ?? card.label ?? card.id}
       aria-grabbed={isGrabbed || undefined}
@@ -1278,7 +1802,7 @@ function Card({
         textShadow: '1px 1px 4px rgba(0,0,0,0.5)',
         boxShadow: shadow,
         transform,
-        zIndex: isGrabbed ? 20 : focused ? 10 : isSeated ? 5 : 1,
+        zIndex: isGrabbed ? 20 : focused ? 10 : isSeated ? 5 : compatible ? 4 : 1,
       }}
     >
       {card.value}
@@ -1298,6 +1822,21 @@ function Card({
           {card.roleTag ? ` · ${card.roleTag}` : ''}
         </span>
       )}
+      {/* Bazaar tier glyph on ability cards. Bronze items still get a
+          chip so the system reads as "items have tiers" even before
+          the user upgrades anything; the tint shifts brown→silver→
+          gold so the upgrade story is legible at a glance. Suppressed
+          when sell mode paints the red overlay (the overlay needs the
+          whole face for the SELL/$X readout). */}
+      {itemTier && !isSellTarget && (
+        <span
+          aria-hidden
+          className="absolute top-1 left-1 inline-flex items-center justify-center w-5 h-5 rounded-full text-[10px] font-black uppercase tracking-widest text-slate-900 shadow-sm"
+          style={{ background: TIER_TINT[itemTier] }}
+        >
+          {TIER_GLYPH[itemTier]}
+        </span>
+      )}
       {card.label && <CardLabel label={card.label} />}
       {/* Physical edge connectors -- same `SznEdgeHalf` the in-combat
           `PlayerCard` and `CardItem` use. The half-shape pokes out
@@ -1310,7 +1849,7 @@ function Card({
       {card.rightEdge && (
         <SznEdgeHalf edge={card.rightEdge} side="right" isConnected={false} compact />
       )}
-      {pip && (
+      {pip && !isSellTarget && (
         <span
           aria-hidden
           className={[
@@ -1322,7 +1861,129 @@ function Card({
           {pip}
         </span>
       )}
+      {/* Sell-mode overlay: paints the whole card face with a red
+          translucent gradient + a giant "SELL $X" callout so the user
+          confirms the action visually. Only ability cards opt in --
+          player sells live in a different tray entirely. */}
+      {isSellTarget && (
+        <div
+          aria-hidden
+          className="absolute inset-0 flex flex-col items-center justify-center rounded-md pointer-events-none"
+          style={{
+            background: 'linear-gradient(180deg, rgba(248,113,113,0.55), rgba(127,29,29,0.85))',
+          }}
+        >
+          <span className="text-[10px] font-black uppercase tracking-widest text-white">
+            Sell
+          </span>
+          <span className="text-2xl font-black text-white drop-shadow">
+            ${card.sellValue ?? 0}
+          </span>
+        </div>
+      )}
+      {/* Release-mode overlay: same red treatment as sell, but the
+          callout reads "RELEASE" / "CUT" so the user understands the
+          cost is a roster slot (not cash). Disabled targets paint a
+          darker / grey overlay so the user can see why the slot
+          can't be picked (role floor). */}
+      {releaseTarget && (
+        <div
+          aria-hidden
+          className="absolute inset-0 flex flex-col items-center justify-center rounded-md pointer-events-none"
+          style={{
+            background: releaseDisabled
+              ? 'linear-gradient(180deg, rgba(71,85,105,0.55), rgba(15,23,42,0.85))'
+              : 'linear-gradient(180deg, rgba(248,113,113,0.55), rgba(127,29,29,0.85))',
+          }}
+        >
+          <span className="text-[9px] font-black uppercase tracking-[0.18em] text-white">
+            {releaseDisabled ? 'Locked' : 'Release'}
+          </span>
+          <span className="text-lg font-black uppercase tracking-widest text-white drop-shadow">
+            {releaseDisabled ? 'Last' : 'Cut'}
+          </span>
+          {releaseDisabled && (
+            <span className="text-[8px] font-bold uppercase tracking-widest text-slate-300">
+              {card.type === 'pitcher' ? 'Pitcher' : 'Batter'}
+            </span>
+          )}
+        </div>
+      )}
     </button>
+  );
+}
+
+/**
+ * Mini info banner that floats just above the footer band whenever
+ * the sell tray is open. Tells the user what's happening + offers a
+ * mouse-clickable exit (the gamepad path is SQUARE / CIRCLE). Painted
+ * red so it visually pairs with the SELL $X overlays on the rail.
+ *
+ * Anchored at `bottom: FOOTER_HEIGHT_PX + 12` to clear the focused-
+ * card detail (also above the footer); we drop a few z-indices lower
+ * than the detail so the description still wins when both render.
+ */
+function SellTrayBanner({ onClose }: { onClose: () => void }) {
+  return (
+    <div
+      className="pointer-events-none fixed left-1/2 z-[9999] -translate-x-1/2"
+      style={{ bottom: `${FOOTER_HEIGHT_PX + 92}px` }}
+    >
+      <div className="pointer-events-auto flex items-center gap-3 rounded-full border border-rose-400/40 bg-rose-950/85 px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-rose-100 shadow-[0_8px_24px_rgba(0,0,0,0.45)] backdrop-blur">
+        <span>Sell Tray Open · Click an item to sell</span>
+        <button
+          type="button"
+          onClick={onClose}
+          className="rounded-full border border-rose-300/40 px-2 py-0.5 text-[10px] uppercase tracking-widest text-rose-100 hover:bg-rose-800/60"
+        >
+          Done (L2)
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Release-tray callout that floats above the footer while a free-
+ * agency cull is pending. Tells the user which sign is queued + how
+ * much cash they'll get back if they bail. Cancel routes through
+ * `cancelPendingPlayerGrant` (refunds the listing price in full --
+ * pulling out of a sign is cost-neutral, mirroring the modal's old
+ * contract).
+ *
+ * Same anchor + z-index as the sell tray banner so the two overlays
+ * never stack visually (they're mutually exclusive at the gameStore
+ * level too: release pinning the focus to the left deck disables
+ * sell mode in the same effect).
+ */
+function ReleaseTrayBanner({
+  pendingLabel,
+  refund,
+  onCancel,
+}: {
+  pendingLabel: string;
+  refund: number;
+  onCancel: () => void;
+}) {
+  return (
+    <div
+      className="pointer-events-none fixed left-1/2 z-[9999] -translate-x-1/2"
+      style={{ bottom: `${FOOTER_HEIGHT_PX + 92}px` }}
+    >
+      <div className="pointer-events-auto flex items-center gap-3 rounded-full border border-rose-400/40 bg-rose-950/85 px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-rose-100 shadow-[0_8px_24px_rgba(0,0,0,0.45)] backdrop-blur">
+        <span>
+          Roster Full · Cut a player to sign{' '}
+          <span className="text-amber-200">{pendingLabel}</span>
+        </span>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded-full border border-rose-300/40 px-2 py-0.5 text-[10px] uppercase tracking-widest text-rose-100 hover:bg-rose-800/60"
+        >
+          Cancel · ${refund} (CIRCLE)
+        </button>
+      </div>
+    </div>
   );
 }
 

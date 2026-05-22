@@ -4,6 +4,12 @@ import { ShapeType } from "../components/cardShapes";
 import { canConnect, canConnectAny, seamKey } from "./connect";
 import { applyCardEffect, applyOpponentTotalAdjustments, EffectContext, EffectResult, highestValueCard } from "./cardEffects";
 import { canSznSnap, type SznEdgeId } from "./sznEdges";
+import {
+  applySznItemGroupEdgeMutations,
+  applySznItemGroupScoringEffects,
+  applySznItemSnapPairEffects,
+} from "./sznItemEffects";
+import { TIER_MULTIPLIER, type ItemTier } from "./itemTiers";
 
 /**
  * One semantic-edge snap event captured while scoring a chain. Emitted
@@ -140,6 +146,24 @@ export interface ScoringContext {
    * gameStore when `run.rallyFireWeeksLeft > 0`.
    */
   sznRallyFireActive?: boolean;
+
+  /**
+   * SZN player-ability speed multiplier override. When set, replaces the
+   * default 1.25x speed-edge multiplier with the larger value. Driven by
+   * abilities like Jazz Chisholm Jr.'s "Jazz" or Trea Turner's "Triple
+   * Threat" (both speedMultiplier: 1.5). Falls through to the default
+   * when undefined or smaller than 1.25.
+   */
+  sznSpeedMultiplierBonus?: number;
+
+  /**
+   * SZN player-ability chain-length forgiveness. Added to the group's
+   * length when scoring checks `requireChainLength` so a card that
+   * requires a 5-chain to fire considers the chain as longer than it
+   * actually is. Driven by Aaron Judge's "62" and Max Scherzer's
+   * "Future HOF" (both +1).
+   */
+  sznChainLengthForgiveness?: number;
 }
 
 /**
@@ -471,7 +495,20 @@ interface GroupResult {
 // the card belongs to.
 const DEBUFF_HIGHLIGHT = "bg-red-500";
 
-function scoreGroup(group: CardDefinition[], ctx: ScoringContext, hand: CardDefinition[]): GroupResult {
+function scoreGroup(rawGroup: CardDefinition[], ctx: ScoringContext, hand: CardDefinition[]): GroupResult {
+  // ---- SZN item edge mutations ----------------------------------------
+  // Edge-copy items (Classic Spikes, The Torch) rewrite their own
+  // sznLeftEdge/sznRightEdge to mirror an adjacent partner's edge.
+  // Doing this BEFORE the per-card scoring loop AND before
+  // `collectSnapEvents` (which runs on the resolved bestGroup later)
+  // means the downstream engine -- per-card effects that key off
+  // edges, snap-event emission, and the speed multiplier loop below
+  // -- all see the projected edges as if they were the card's
+  // printed edges. The mutation is a SHALLOW clone of the affected
+  // item cards; non-item cards are referenced verbatim so we don't
+  // bloat the per-group allocation.
+  const group = applySznItemGroupEdgeMutations(rawGroup);
+
   const cardModifiers: Record<string, CardModifier> = {};
   let opponentModifier = 0;
   let hitScaleBonus = 0;
@@ -524,10 +561,15 @@ function scoreGroup(group: CardDefinition[], ctx: ScoringContext, hand: CardDefi
     // chain shorter than its required length, both its baseValue and its
     // effect zero out for the round. Treated identically to `disabled` from
     // the engine's POV (NOOP effect, zero contribution to totalValue).
+    //
+    // SZN player abilities (Judge's "62", Scherzer's "Future HOF") can
+    // contribute a chain-length forgiveness bonus that makes the chain
+    // count as if it were N cards longer for THIS check only.
     const chainLengthRequirement = card.combineConstraint?.requireChainLength;
+    const effectiveChainLength = group.length + (ctx.sznChainLengthForgiveness ?? 0);
     const chainTooShort =
       typeof chainLengthRequirement === "number" &&
-      group.length < chainLengthRequirement;
+      effectiveChainLength < chainLengthRequirement;
     const isNullified =
       (ctx.nullifiedCardIds?.has(card.id) ?? false) ||
       card.disabled === true ||
@@ -547,7 +589,21 @@ function scoreGroup(group: CardDefinition[], ctx: ScoringContext, hand: CardDefi
         if (item?.hitScaleModifier) hitScaleBonus += item.hitScaleModifier;
       }
     }
-    const finalValue = chainTooShort ? 0 : card.baseValue + effect.selfValueDelta + itemValueBonus;
+    // Bazaar tier scaling: bag items dealt at silver / gold scale BOTH
+    // their printed baseValue and their per-card effect's selfValueDelta
+    // by TIER_MULTIPLIER. Items only -- non-item cards (player anchors,
+    // legacy ability cards) have no sznItemTier stamp and fall through
+    // to the bronze (1.0x) passthrough. Binary effects (Sticky Stuff's
+    // suspend chance, Platinum Glove's stack count) scale inside the
+    // hook itself in `sznItemEffects.ts` so the value scaling here
+    // doesn't double-dip.
+    const tier = (card.sznItemTier as ItemTier | undefined) ?? "bronze";
+    const tierMul = TIER_MULTIPLIER[tier];
+    const scaledBase = tier === "bronze" ? card.baseValue : Math.round(card.baseValue * tierMul);
+    const scaledDelta = tier === "bronze"
+      ? effect.selfValueDelta
+      : Math.round(effect.selfValueDelta * tierMul);
+    const finalValue = chainTooShort ? 0 : scaledBase + scaledDelta + itemValueBonus;
 
     let highlightColor: string | undefined;
     if (effect.selfValueDelta > 0) highlightColor = card.color;
@@ -602,7 +658,13 @@ function scoreGroup(group: CardDefinition[], ctx: ScoringContext, hand: CardDefi
   // 1.25x. We do this here instead of inline above so the multiplier
   // applies to the FINAL value (including item bonuses + effect deltas)
   // rather than just the printed baseValue.
+  //
+  // Player abilities (Jazz Chisholm Jr.'s "Jazz", Trea Turner's
+  // "Triple Threat") can declare a `speedMultiplier` effect that
+  // overrides the 1.25 default with a larger value. The gameStore
+  // plumbs the max into ctx.sznSpeedMultiplierBonus.
   if (group.length >= 2) {
+    const speedMul = Math.max(1.25, ctx.sznSpeedMultiplierBonus ?? 1.25);
     for (let i = 1; i < group.length; i++) {
       const left = group[i - 1];
       const right = group[i];
@@ -613,7 +675,7 @@ function scoreGroup(group: CardDefinition[], ctx: ScoringContext, hand: CardDefi
       if (!canSznSnap(lEdge, rEdge)) continue;
       const mod = cardModifiers[right.id];
       if (!mod) continue;
-      const boosted = Math.round(mod.value * 1.25);
+      const boosted = Math.round(mod.value * speedMul);
       cardModifiers[right.id] = { ...mod, value: boosted };
     }
   }
@@ -668,6 +730,23 @@ function scoreGroup(group: CardDefinition[], ctx: ScoringContext, hand: CardDefi
     cardModifiers[left.id] = { ...(cardModifiers[left.id] ?? { value: 0 }), value: 250 };
     cardModifiers[right.id] = { ...(cardModifiers[right.id] ?? { value: 0 }), value: 250 };
   }
+
+  // ---- SZN item snap-pair score modifiers ------------------------------
+  // Runs AFTER per-card effects, Speed multiplier, Rally Fire aura,
+  // and the Mega-Card merge so this layer always sees the "final"
+  // per-card value before totaling. Currently used by Duct Tape's
+  // -50% to both halves of its snap pair; new items that need to
+  // adjust both cards in a snap (e.g. an item that buffs the player
+  // it snaps onto) drop in here without touching scoring.ts again.
+  applySznItemSnapPairEffects(group, cardModifiers);
+
+  // ---- SZN item group-context gates ------------------------------------
+  // Runs LAST so any-neighbor-matches gating (Legal Rosin requires a
+  // Pitcher neighbor for its +15 to land; Corked Bat requires a
+  // Batter) reads the post-pair-effects values. Items can suppress
+  // their own contribution back to zero here when the description's
+  // target-type requirement isn't satisfied.
+  applySznItemGroupScoringEffects(group, cardModifiers);
 
   const totalValue = Object.values(cardModifiers).reduce((acc, m) => acc + m.value, 0);
 

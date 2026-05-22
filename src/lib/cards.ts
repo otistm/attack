@@ -77,6 +77,16 @@ export interface CardDefinition {
    */
   sznInstanceId?: string;
   /**
+   * SZN-only: Bazaar-style item tier (`bronze` | `silver` | `gold`).
+   * Stamped onto the dealt clone in `sznDealItem` from the source
+   * bag {@link Item.tier} so the scoring engine + per-card hooks can
+   * scale this item's contribution at scoring time. Treated as
+   * `"bronze"` when absent (every legacy / non-item card path).
+   * Imported as `string` to avoid a cyclic type dep with
+   * `itemTiers.ts`; runtime callers cast to `ItemTier`.
+   */
+  sznItemTier?: string;
+  /**
    * SZN-only: semantic left/right edge ids carried by player-as-card
    * adapters for SZN players (see `playerAsCard` in `connect.ts`).
    * When present, the SZN combat path consults these via `canSznConnect`
@@ -563,7 +573,7 @@ export const ALL_CARDS: CardDefinition[] = [
     "baseValue": 5,
     "leftShape": "circle",
     "rightShape": "star",
-    "description": "If the Batter wins, subtract 3 from the Batter's score.",
+    "description": "Shrinks the Batter's hit by 3 — pushes the Batter one rung down the Hit Scale ladder.",
     "color": "bg-blue-500",
     "tags": ["rookie", "starter"]
   },
@@ -2366,7 +2376,7 @@ export const SZN_ENCOUNTER_ITEM_CARDS: CardDefinition[] = [
     leftShape: "wildcard",
     rightShape: "wildcard",
     description:
-      "Snap two cards together that don't normally match. 15% chance to destroy the targeted player at lock-in.",
+      "Wildcard snap — joins any two cards. 15% chance the umpire ejects the snapped batter (suspended next series).",
     sznLeftEdge: "wildcard",
     sznRightEdge: "wildcard",
   },
@@ -2430,7 +2440,7 @@ export const SZN_ENCOUNTER_ITEM_CARDS: CardDefinition[] = [
     baseValue: 0,
     leftShape: "wildcard",
     rightShape: "wildcard",
-    description: "Snap to your team logo. Adjacent cards get +10% score for the rest of the week.",
+    description: "Lights up the dugout the moment it lands in your bag: cards adjacent to your team-logo edge get +10% score for the rest of the week.",
     sznLeftEdge: "team-logo",
     sznRightEdge: "team-logo",
   },
@@ -2442,7 +2452,7 @@ export const SZN_ENCOUNTER_ITEM_CARDS: CardDefinition[] = [
     baseValue: 0,
     leftShape: "wildcard",
     rightShape: "wildcard",
-    description: "Snap into your pitching chain. Nullifies the opponent's next pitching score.",
+    description: "Banks +1 Defense Shield the moment it lands in your bag. Snap it into a pitching chain to bank another shield. (A shield nullifies the opponent's next pitching score.)",
     sznLeftEdge: "wildcard",
     sznRightEdge: "defense-shield",
   },
@@ -2454,7 +2464,13 @@ export const SZN_ENCOUNTER_ITEM_CARDS: CardDefinition[] = [
     baseValue: 40,
     leftShape: "wildcard",
     rightShape: "wildcard",
-    description: "Snap to any Batter for +40 Batting Score. Forces the next card to be a Pitcher.",
+    // Description rewrite (vs. original "Forces the next card to be a
+    // Pitcher"): the right edge is `blank`, which structurally caps the
+    // chain at this card -- nothing can snap onto Drip Cleats' right
+    // side. That IS the "force next" promise, expressed in mechanics
+    // the user can see at a glance.  +40 is the upside; chain
+    // termination is the cost.
+    description: "Snap to any Batter for +40 Batting Score. Ends the chain — nothing snaps to its right.",
     sznLeftEdge: "speed",
     sznRightEdge: "blank",
   },
@@ -2466,7 +2482,7 @@ export const SZN_ENCOUNTER_ITEM_CARDS: CardDefinition[] = [
     baseValue: 0,
     leftShape: "wildcard",
     rightShape: "wildcard",
-    description: "Snap to any card. Copies the other card's edge onto its own.",
+    description: "Wildcard snap. On snap, mirrors the partner's facing edge onto Spikes — so the chain can keep going AND any badges that fire on that edge still trigger.",
     sznLeftEdge: "wildcard",
     sznRightEdge: "wildcard",
   },
@@ -2478,7 +2494,7 @@ export const SZN_ENCOUNTER_ITEM_CARDS: CardDefinition[] = [
     baseValue: 0,
     leftShape: "wildcard",
     rightShape: "wildcard",
-    description: "Snap onto any player. Duplicates their left edge onto its right side.",
+    description: "Wildcard snap onto a player. Carries the player's left edge through to the next card in the chain.",
     sznLeftEdge: "wildcard",
     sznRightEdge: "wildcard",
   },

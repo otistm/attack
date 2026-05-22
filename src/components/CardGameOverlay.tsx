@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { Reorder, motion, AnimatePresence } from 'motion/react';
 import { CardDefinition } from '../lib/cards';
 import { canConnect, canConnectAny, shapeModeForSide, seamKey } from '../lib/connect';
-import { useGameStore, getUiUserSide, isLowLeverageAtBat, ResolutionBeat, Phase } from '../lib/gameStore';
+import { useGameStore, getUiUserSide, isLowLeverageAtBat, ResolutionBeat, RevealBeatAnimation, Phase } from '../lib/gameStore';
 import { HitOutcome } from '../lib/scoring';
 import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
 import { SznEdgeHalf } from './SznEdgeHalf';
@@ -13,6 +13,7 @@ import { ManagerHand } from './ManagerHand';
 import { QuestStrip } from './QuestStrip';
 import { teamPalette } from '../lib/teamColors';
 import { RARITY_BASE_VALUE } from '../lib/run';
+import { displayValueFor, rarityLabel, RARITY_GRADIENT } from '../lib/cardDisplay';
 import { activeSynergies, teamBatterBonus, teamPitcherBonus } from '../lib/synergies';
 import { PLAYERS } from '../lib/players';
 import { ALL_SZN_PLAYERS, isSznPlayer } from '../lib/sznPlayers';
@@ -387,17 +388,37 @@ const CardItem = ({
   const playerRoleCode: 'Batter' | 'Pitcher' | null = playerForCard
     ? playerForCard.role
     : null;
-  const playerPalette = playerTeamCode ? teamPalette(playerTeamCode) : null;
+  // Player card body now reads as RARITY first (mirrors `PlayerCard.tsx`
+  // and `SznCard` so every player-shaped surface in SZN paints with the
+  // same dominant signal). Team is still painted in the top-left team-
+  // code chip below. Falls back to the team gradient only when no
+  // rarity is resolvable -- defensive against external callers that
+  // haven't wired rarity through (legacy MlbPlayer code paths).
+  const rarityPalette = isPlayerCard
+    ? (RARITY_GRADIENT[playerRarity] ?? null)
+    : null;
+  const teamPalette_ = playerTeamCode ? teamPalette(playerTeamCode) : null;
+  const playerPalette = rarityPalette ?? teamPalette_;
   const playerBaseValue = isPlayerCard ? RARITY_BASE_VALUE[playerRarity] : null;
   // Player cards: `modifier.value` comes from scoring (includes rarity via
   // `baseValue` on the SZN player-as-card). When a modifier exists,
   // `playerBaseValue + playerDelta` equals `modifier.value`.
   const playerDelta =
     isPlayerCard && modifier ? modifier.value - card.baseValue : 0;
-  const displayValue = valueOverride ?? (
+  // Combat display value. Player cards build their value from the
+  // rarity floor + scoring delta. Item cards use the scored modifier
+  // when present; when absent (no snap math contributed) we fall
+  // through to `displayValueFor`, which prints the encounter
+  // utility tag (SNAP / AURA / DEF / etc.) for zero-base encounter
+  // items instead of a literal "0". This is the same helper the
+  // footer rail, the merchant preview, and the bag picker use, so
+  // a utility item reads the same way in every surface of the game.
+  const displayValue: number | string = valueOverride ?? (
     isPlayerCard && playerBaseValue != null
       ? playerBaseValue + playerDelta
-      : modifier?.value ?? card.baseValue
+      : modifier?.value !== undefined && modifier.value !== 0
+        ? modifier.value
+        : displayValueFor(card)
   );
   // General Draw cards take on their label color as their card body so they
   // stand out from signature cards (which stay white) on a busy field view.
@@ -604,11 +625,17 @@ const CardItem = ({
           <div className="truncate text-[11px] font-black uppercase tracking-tight leading-none text-white">
             {card.name}
           </div>
-          <div
-            className={`shrink-0 rounded px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider text-white ${card.color || 'bg-slate-700'}`}
-          >
-            {card.abilityType}
-          </div>
+          {/* Hide the "EncounterItem" pill -- it's tagged on every SZN
+              item and adds no signal next to the card name. Other
+              ability types (General Draw, Player, signature roles)
+              still render their tag for context. */}
+          {card.abilityType !== 'EncounterItem' && (
+            <div
+              className={`shrink-0 rounded px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider text-white ${card.color || 'bg-slate-700'}`}
+            >
+              {card.abilityType}
+            </div>
+          )}
         </div>
         {!hideCardPlayer && card.player && (
           <div className="mb-1.5 text-[9px] font-semibold uppercase tracking-widest text-slate-400">
@@ -626,6 +653,7 @@ const CardItem = ({
       <motion.div
         ref={cardSurfaceRef}
         data-tutorial={tutorialRegions ? 'card-shapes' : undefined}
+        data-card-id={card.id}
         className={`
         relative ${sz.card} ${cardBgClass} border-2 overflow-hidden
         flex flex-col items-center justify-center
@@ -712,7 +740,7 @@ const CardItem = ({
             <span
               className={`${sz.playerText} font-black uppercase tracking-widest bg-black/40 rounded px-1 text-amber-200`}
             >
-              {playerRarity}
+              {rarityLabel(playerRarity)}
             </span>
           </div>
           <div className="absolute left-0 right-0 z-30 flex justify-center" style={{ top: '36%' }}>
@@ -831,6 +859,8 @@ export const CardGameOverlay = () => {
   // chain stops and the player gets the normal Lock In UX back.
   const quickResolveEnabled = useGameStore((s) => s.quickResolveEnabled);
   const setQuickResolveEnabled = useGameStore((s) => s.setQuickResolveEnabled);
+  const resolveInningTarget = useGameStore((s) => s.resolveInningTarget);
+  const requestResolveInning = useGameStore((s) => s.requestResolveInning);
   const tutorialActive = useGameStore((s) => s.tutorialActive);
   const totalInnings = useGameStore((s) => s.totalInnings);
   const outs = useGameStore((s) => s.outs);
@@ -895,6 +925,15 @@ export const CardGameOverlay = () => {
   // refreshes against the new layout.
   const affirmedSeams = useGameStore((s) => s.affirmedSeams);
   const affirmDraggedCard = useGameStore((s) => s.affirmDraggedCard);
+  // Bag <-> hand recall. The footer rail's CROSS / mouse-click already
+  // wires the deal direction (bag -> hand); the in-hand controller
+  // CIRCLE handler below wires the recall direction (hand -> bag) so
+  // a player who dealt the wrong ability can back out without leaving
+  // the hand surface. Player cards (`id` starts with "player:") are
+  // never recallable -- the store's `sznRecallItem` guards against
+  // emptying the seat, but we also gate the binding here so CIRCLE on
+  // the anchor still pops back to the screen surface (Lock In).
+  const sznRecallItem = useGameStore((s) => s.sznRecallItem);
   // Pending player-choice prompts (e.g. b-12 Switch Hitter). The user has
   // to actively trigger these via the per-card "USE" pill -- the modal
   // doesn't auto-open anymore. We only forward user-side prompts to the
@@ -1265,6 +1304,18 @@ export const CardGameOverlay = () => {
       // Mirrors the footer's move-mode lockdown so a held card can't
       // be stranded by an accidental DPAD_UP into another surface.
       if (grabbing) {
+        // Helper: clear the grab AND fire affirmDraggedCard on the
+        // card we just released, mirroring mouse drag-end's
+        // "drop = affirm" contract. Every shift already affirmed on
+        // its own, so this is redundant when the user moved at least
+        // once, but it matters when the user grabs and drops in place
+        // without shifting (mouse equivalent: pick up + drop = affirm
+        // current adjacencies).
+        const dropGrabbed = () => {
+          const id = gamepadGrabbedHandCardId;
+          setGamepadGrabbedHandCardId(null);
+          if (id) affirmDraggedCard(id);
+        };
         switch (btn) {
           case 'DPAD_LEFT':
             shiftGrabbedHandCard(-1);
@@ -1274,25 +1325,23 @@ export const CardGameOverlay = () => {
             return true;
           case 'SQUARE':
           case 'CROSS':
-            // Drop in place. The grabbed card already affirmed its
-            // seams on every shift, so dropping just clears grab
-            // state.
-            setGamepadGrabbedHandCardId(null);
+            dropGrabbed();
             return true;
           case 'CIRCLE':
             // Cancel: same drop semantics. We don't unwind the moves
-            // because each shift was already a real reorder under the
-            // hood; reverting would surprise the user more than it'd
-            // help. The grabbed-state clears so DPAD goes back to
-            // nav.
-            setGamepadGrabbedHandCardId(null);
+            // because each shift was already a real reorder under
+            // the hood; reverting would surprise the user more than
+            // it'd help. The grabbed-state clears + we still affirm
+            // so the user gets a final "snap" on the position they
+            // settled on.
+            dropGrabbed();
             return true;
           case 'DPAD_UP':
           case 'DPAD_DOWN':
             // Drop + exit the hand surface back to 'screen'. Escape
-            // hatch when a user grabs and then realizes they want to
-            // lock in or deal another card.
-            setGamepadGrabbedHandCardId(null);
+            // hatch when a user grabs and then realizes they want
+            // to lock in or deal another card.
+            dropGrabbed();
             setSznGamepadFocus('screen');
             return true;
           default:
@@ -1353,8 +1402,31 @@ export const CardGameOverlay = () => {
           return true;
         }
         case 'CIRCLE': {
-          // Back out to the 'screen' surface (Lock In / CTA default
-          // focus).
+          // CIRCLE on the focused hand card:
+          //   - Ability card (anything that isn't the player anchor and
+          //     is recallable while the hand is still reorderable):
+          //     send it BACK TO THE BAG. This is the mouse-equivalent
+          //     of dragging the ability chip off the strip, which the
+          //     gamepad path was missing -- previously CIRCLE jumped
+          //     focus down to Lock In, which felt like the controller
+          //     "swallowed" the press because nothing happened to the
+          //     ability the user was clearly trying to undo.
+          //   - Player anchor (or no focused card / read-only hand):
+          //     fall back to the legacy behaviour and pop focus down
+          //     to the 'screen' surface (Lock In / next CTA). The
+          //     anchor can't be recalled (would empty the seat) and
+          //     during reveal/result the hand is read-only so recall
+          //     would be ignored anyway.
+          const focusId = ids[safeIdx];
+          const focusedCard = focusId
+            ? userHand.find((c) => c.id === focusId) ?? null
+            : null;
+          const isPlayerAnchor =
+            !focusedCard || focusedCard.id.startsWith('player:');
+          if (handReorderable && focusedCard && !isPlayerAnchor) {
+            sznRecallItem(focusedCard.id);
+            return true;
+          }
           setSznGamepadFocus('screen');
           return true;
         }
@@ -1424,11 +1496,20 @@ export const CardGameOverlay = () => {
     activeChoiceCardId,
     tutorialActive,
   });
+  // "Resolve Inning" one-shot burst: when the player clicked the
+  // Resolve Inning button this inning, treat every at-bat as low-
+  // leverage until the inning ticks. Pairs with `quickResolveEnabled`
+  // -- the burst doesn't require Quick Resolve to be ON, it acts as
+  // its own one-inning override of the leverage gate.
+  const resolveInningArmed =
+    resolveInningTarget !== null && resolveInningTarget === inning;
+  const effectiveLowLeverage = isLowLeverage || resolveInningArmed;
   // Surface the auto-pilot state to the toggle UI so the player can see
   // at a glance whether the toggle is "armed and waiting" (on but the
   // current spot is high-leverage) vs "actively driving" (on AND
   // currently auto-running the chain).
-  const quickResolveActive = quickResolveEnabled && isLowLeverage;
+  const quickResolveActive =
+    (quickResolveEnabled && isLowLeverage) || resolveInningArmed;
   // Latch the toggle-on moment so we ONLY auto-resolve at-bats that the
   // player explicitly opted into via the toggle. Without this, flipping
   // the toggle ON during a between-at-bats pause would immediately fire
@@ -1438,14 +1519,14 @@ export const CardGameOverlay = () => {
   // disarms whenever the toggle goes off.
   const autoChainArmedRef = useRef(false);
   useEffect(() => {
-    if (!quickResolveEnabled) {
+    if (!quickResolveEnabled && !resolveInningArmed) {
       autoChainArmedRef.current = false;
       return;
     }
-    if (phase === 'selecting' && isLowLeverage) {
+    if (phase === 'selecting' && effectiveLowLeverage) {
       autoChainArmedRef.current = true;
     }
-  }, [quickResolveEnabled, phase, isLowLeverage]);
+  }, [quickResolveEnabled, resolveInningArmed, phase, effectiveLowLeverage]);
   // The actual auto-advance driver. Fires whenever phase / leverage
   // changes; each transition along the chain re-triggers the effect
   // with fresh state, so the chain "walks itself" through the
@@ -1453,18 +1534,20 @@ export const CardGameOverlay = () => {
   // sequencing. completeReveal/startNextAtBat are both idempotent
   // outside their valid phase, so a stale fire is a safe no-op.
   useEffect(() => {
-    if (!quickResolveEnabled) return;
+    if (!quickResolveEnabled && !resolveInningArmed) return;
     if (tutorialActive) return;
     if (!autoChainArmedRef.current) return;
     if (phase === 'selecting') {
-      if (!isLowLeverage) return; // leverage spiked; hand control back
+      if (!effectiveLowLeverage) return; // leverage spiked; hand control back
       // Defer one tick so any in-flight render (USE prompt, dealing
       // animation) commits first, and so React's strict-mode double
       // invoke can't drive two simultaneous lockIns.
       const t = setTimeout(() => {
         const s = useGameStore.getState();
         if (s.phase !== 'selecting') return;
-        if (!s.quickResolveEnabled) return;
+        const burstArmed =
+          s.resolveInningTarget !== null && s.resolveInningTarget === s.inning;
+        if (!s.quickResolveEnabled && !burstArmed) return;
         if (s.activeChoiceCardId !== null) return;
         if (s.pendingChoices.length > 0) return;
         s.lockIn();
@@ -1478,7 +1561,9 @@ export const CardGameOverlay = () => {
       const t = setTimeout(() => {
         const s = useGameStore.getState();
         if (s.phase !== 'revealing') return;
-        if (!s.quickResolveEnabled) return;
+        const burstArmed =
+          s.resolveInningTarget !== null && s.resolveInningTarget === s.inning;
+        if (!s.quickResolveEnabled && !burstArmed) return;
         s.completeReveal();
       }, 80);
       return () => clearTimeout(t);
@@ -1490,7 +1575,9 @@ export const CardGameOverlay = () => {
       const t = setTimeout(() => {
         const s = useGameStore.getState();
         if (s.phase !== 'between-at-bats') return;
-        if (!s.quickResolveEnabled) return;
+        const burstArmed =
+          s.resolveInningTarget !== null && s.resolveInningTarget === s.inning;
+        if (!s.quickResolveEnabled && !burstArmed) return;
         s.startNextAtBat();
       }, 320);
       return () => clearTimeout(t);
@@ -1502,7 +1589,8 @@ export const CardGameOverlay = () => {
     }
   }, [
     quickResolveEnabled,
-    isLowLeverage,
+    resolveInningArmed,
+    effectiveLowLeverage,
     phase,
     tutorialActive,
     // Re-running the effect when these change is safe (idempotent
@@ -1545,6 +1633,13 @@ export const CardGameOverlay = () => {
         batterOverrides={reveal.batterValueOverrides}
         pitcherOverrides={reveal.pitcherValueOverrides}
       />
+
+      {/* Card-vs-card attack & floating-counter overlay. Lives beside the
+          spotlight so the spotlight's stage-center caption + the attack
+          layer's lane-anchored animations coexist without fighting for
+          the same DOM rect. The overlay self-gates on `isRevealing`, so
+          it's a true no-op during selection / between-at-bats. */}
+      <RevealAttackOverlay active={isRevealing} currentAnimation={reveal.currentAnimation} />
 
       {/* Player hero rail: top slot = opponent (fog `?` only during selection),
           bottom = you (live total once that side has a committed layout). Pairs
@@ -1785,11 +1880,45 @@ export const CardGameOverlay = () => {
                   Lock In
                 </CtaButton>
                 {sznRunActive && !tutorialActive && (
-                  <QuickResolveToggle
-                    enabled={quickResolveEnabled}
-                    active={quickResolveActive}
-                    onChange={setQuickResolveEnabled}
-                  />
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    <QuickResolveToggle
+                      enabled={quickResolveEnabled}
+                      active={quickResolveActive}
+                      onChange={setQuickResolveEnabled}
+                    />
+                    {/* One-shot "Resolve Inning" burst -- bypasses the
+                        leverage gate for this inning only. Useful in
+                        blowouts where Quick Resolve's leverage check
+                        is being too conservative (e.g. RISP with a
+                        12-run lead). Highlights when armed so the
+                        user knows the burst is active. */}
+                    <button
+                      type="button"
+                      onClick={requestResolveInning}
+                      disabled={resolveInningArmed}
+                      title={
+                        resolveInningArmed
+                          ? 'Resolve Inning is armed — auto-resolving every at-bat this inning.'
+                          : 'Burn through the rest of THIS inning with no leverage check.'
+                      }
+                      className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-[0.18em] ring-1 transition-all shadow ${
+                        resolveInningArmed
+                          ? 'bg-emerald-500/90 text-emerald-950 ring-emerald-300 shadow-emerald-900/40 cursor-default'
+                          : 'bg-slate-700/60 text-slate-300 ring-slate-500/40 hover:bg-slate-700/80 hover:text-slate-100'
+                      }`}
+                    >
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full ${
+                          resolveInningArmed
+                            ? 'bg-emerald-900 animate-pulse'
+                            : 'bg-slate-400'
+                        }`}
+                      />
+                      {resolveInningArmed
+                        ? `Bursting Inning ${inning}`
+                        : 'Resolve Inning'}
+                    </button>
+                  </div>
                 )}
                 {/* Discoverability nudge: the QuickResolveToggle pill is
                     small enough that first-time SZN players were missing
@@ -1930,7 +2059,14 @@ const QuickResolveToggle = ({
             ? 'Quick Resolve is on, but this spot is high-leverage. The chain will resume on the next boring at-bat.'
             : 'Auto-resolve obvious blowouts and garbage-time at-bats.'
       }
-      className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-[0.18em] ring-1 transition-all shadow ${palette}`}
+      className={`relative flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-[0.18em] ring-1 transition-all shadow ${palette} ${
+        // "Armed but waiting" used to read as just a faint amber pill --
+        // playtest reports flagged the state as easy to miss, so we now
+        // add a wider amber ring + a soft pulsing border so the user
+        // sees at a glance that auto-pilot is active and paused on a
+        // high-leverage spot.
+        state === 'armed' ? 'ring-2 ring-amber-300/70 animate-pulse' : ''
+      }`}
     >
       <span className={`w-1.5 h-1.5 rounded-full ${dotClass}`} />
       {label}
@@ -2013,24 +2149,17 @@ const HitResultBanner = ({
   const cfg = HIT_BANNER_CONFIG[outcome ?? 'out'];
   if (!cfg) return null;
 
-  // Build the "why this happened" scoreline. Only renders when both
-  // totals exist (every at-bat after the first lock-in) and we can
-  // compute the winning margin. Reads polarity from the actual
-  // matchup (batter wins iff batter > pitcher under the chain math)
-  // and then frames the margin from the USER's perspective so a
-  // pitching seat doesn't read "you won by 18" when their pitcher
-  // shut down the batter -- we say "Shutdown by 18" instead.
+  // The banner now only shows the final scoreline -- the per-beat math
+  // (per-card buffs, debuffs, carryovers) is conveyed visually during the
+  // reveal phase by `RevealAttackOverlay` (cards lunging at each other +
+  // floating damage / buff counters). Adding a "Pitcher held you off by 18"
+  // verb chip on top of those counters duplicates information the player
+  // already watched land, so the verb line has been removed. The totals
+  // chip stays because it summarizes the matchup at a glance after the
+  // animations have finished.
+  // Suppress these flags as unused so the prop signature stays stable.
+  void userIsBatting;
   const hasMath = batterTotal !== null && pitcherTotal !== null;
-  const batterWon = hasMath && batterTotal! > pitcherTotal!;
-  const margin = hasMath ? Math.abs(batterTotal! - pitcherTotal!) : 0;
-  const userWonMatchup = userIsBatting ? batterWon : !batterWon;
-  const verb = batterWon
-    ? userIsBatting
-      ? `You out-hit by ${margin}`
-      : `Hit through you by ${margin}`
-    : userIsBatting
-      ? `Pitcher held you off by ${margin}`
-      : `You shut it down by ${margin}`;
 
   return (
     <AnimatePresence>
@@ -2059,33 +2188,33 @@ const HitResultBanner = ({
                 {cfg.sub}
               </span>
             )}
-            {/* Scoreline chip -- the "why" line for the result. Shows
-                the locked-in batter / pitcher totals and the matchup
-                margin so the user can connect a base hit / strikeout
-                back to the chain math they just resolved. The user
-                used to be told ONLY the outcome name ("SINGLE") with
-                no on-screen reason; this row says "Batter 58 vs
-                Pitcher 40 · You out-hit by 18" so the math reads
-                like baseball commentary. */}
+            {/* Broadcaster bark -- italic single-line PA-system
+                quote that adds in-stadium texture without crowding
+                the score breakdown below. Deterministic per
+                atBatId so the line is stable across the banner's
+                3.6s visibility window. */}
+            {outcome && (
+              <span
+                className="mt-0.5 text-xs italic opacity-80 font-medium tracking-normal normal-case"
+                style={{ textShadow: '0 1px 4px rgba(0,0,0,0.6)' }}
+              >
+                &ldquo;{pickBark(outcome, atBatId)}&rdquo;
+              </span>
+            )}
+            {/* Scoreline chip -- the final totals after every per-card
+                effect has resolved. The matchup margin / "you out-hit
+                by X" verb chip used to live below this row, but it
+                duplicates what the in-flight attack/buff counters
+                already showed the player; the totals stay as a
+                post-reveal "scoreboard" anchor. */}
             {hasMath && (
-              <div className="mt-2 flex flex-col items-center gap-0.5">
-                <div className="flex items-center gap-2 text-[11px] font-black uppercase tracking-[0.2em] opacity-95">
-                  <span className="rounded-md bg-slate-900/40 px-2 py-0.5 border border-white/25">
-                    {batterName ?? 'Batter'} {batterTotal}
-                  </span>
-                  <span className="opacity-70">vs</span>
-                  <span className="rounded-md bg-slate-900/40 px-2 py-0.5 border border-white/25">
-                    {pitcherName ?? 'Pitcher'} {pitcherTotal}
-                  </span>
-                </div>
-                <span
-                  className={`mt-0.5 rounded-full px-2.5 py-0.5 text-[10px] font-black uppercase tracking-[0.2em] border ${
-                    userWonMatchup
-                      ? 'bg-emerald-500/30 border-emerald-200/60'
-                      : 'bg-rose-500/30 border-rose-200/60'
-                  }`}
-                >
-                  {verb}
+              <div className="mt-2 flex items-center justify-center gap-2 text-[11px] font-black uppercase tracking-[0.2em] opacity-95">
+                <span className="rounded-md bg-slate-900/40 px-2 py-0.5 border border-white/25">
+                  {batterName ?? 'Batter'} {batterTotal}
+                </span>
+                <span className="opacity-70">vs</span>
+                <span className="rounded-md bg-slate-900/40 px-2 py-0.5 border border-white/25">
+                  {pitcherName ?? 'Pitcher'} {pitcherTotal}
                 </span>
               </div>
             )}
@@ -2149,6 +2278,66 @@ const HIT_BANNER_CONFIG: Record<
       'bg-gradient-to-br from-rose-600 to-rose-800 text-white border-rose-200',
   },
 };
+
+/**
+ * Per-outcome broadcaster barks. Picked deterministically by
+ * `atBatId` so the same at-bat keeps the same call across the
+ * banner's 3.6s visibility window (no mid-banner reshuffle) but
+ * each new at-bat rolls a fresh line. Pure flavor — adds the
+ * "in-stadium PA system" texture the playtest report asked for
+ * without touching any gameplay state.
+ *
+ * Lines stay short (≤8 words, no punctuation that wraps) so the
+ * pill stays a single readable line under the result label.
+ */
+const HIT_BANNER_BARKS: Record<HitOutcome, string[]> = {
+  homerun: [
+    "Going, going, GONE.",
+    "Crowd's on their feet!",
+    "See ya later, baseball.",
+    "Touch 'em all.",
+    "That ball is OUTTA HERE.",
+    "Bomb to the bleachers.",
+  ],
+  triple: [
+    "Wheels for days.",
+    "He's gonna stretch this!",
+    "Slides in safe at third.",
+    "Gap shot, all the way.",
+    "Race against the throw — SAFE.",
+  ],
+  double: [
+    "Stand-up double.",
+    "Splits the gap.",
+    "Off the wall, in play.",
+    "Coast into second.",
+    "Two bags, no problem.",
+  ],
+  single: [
+    "Base knock.",
+    "Found the hole.",
+    "Bloop hit drops in.",
+    "Hard contact, base knock.",
+    "On the board.",
+  ],
+  out: [
+    "Sat him down.",
+    "Caught looking.",
+    "Routine play.",
+    "Inning over.",
+    "Strike three — he's gone.",
+    "Webbed it.",
+  ],
+};
+
+function pickBark(outcome: HitOutcome, atBatId: number): string {
+  const pool = HIT_BANNER_BARKS[outcome];
+  if (!pool || pool.length === 0) return "";
+  // Mix the atBatId so different at-bats roll different barks but
+  // a re-render of the same at-bat keeps the same line.
+  const idx = Math.abs((atBatId * 2654435761) >>> 0) % pool.length;
+  return pool[idx];
+}
 
 /**
  * Anonymous status chips surfaced above the batter's hand whenever a pitcher
@@ -2418,7 +2607,7 @@ const ScorePill = ({
     // transforms create their own stacking contexts -- paint over it. The
     // banner only renders during reveal beats, so this z-index is moot
     // during selection / between-at-bats.
-    <div className="relative z-30 flex flex-col items-center">
+    <div className="relative z-30 flex flex-col items-center" data-score-pill={tone}>
       <motion.div
         layout
         className={`bg-white/95 backdrop-blur rounded-full font-bold text-slate-900 shadow-xl border-2 border-white/50 flex flex-wrap items-center justify-center gap-1 ${containerSize} ${pillBgHiddenAtMd ? 'md:hidden' : ''}`}
@@ -2762,6 +2951,422 @@ const RevealBeatSpotlight = ({
     </div>
   );
 };
+
+/**
+ * Card-vs-card attack & floating-counter overlay that rides on top of the
+ * existing reveal pipeline. Reads {@link RevealBeatAnimation} hints
+ * attached to each beat by `buildRevealScript` and renders:
+ *  - `attack`: a tinted "projectile" + impact flash from source to target,
+ *    plus a red `-N` damage counter that arcs off the impact point.
+ *  - `buff`: a soft glow ring + green/amber `+N` counter that rises off
+ *    the source card.
+ *  - `flash` (carryover): a small `-N`/`+N` counter near the affected
+ *    side's score pill.
+ *  - `snap` (reserved): no-op for now; edge-snap value effects already
+ *    flow through `selfModifier` beats, so emitting a second snap beat
+ *    would double-count.
+ *
+ * Card positions are looked up by `data-card-id` on the outermost
+ * `CardItem` motion.div (and `data-score-pill` for side-anchored
+ * targets), so the overlay never needs ref plumbing or layout effects --
+ * it just measures the live DOM at fire time.
+ *
+ * Honors `prefers-reduced-motion`: counters still pop (instantly, no
+ * arc) so the player always sees the damage attribution, but the lunge
+ * tween + projectile streak are collapsed to a brief flash.
+ *
+ * Z-index sits at `z-[31]`, just above {@link RevealBeatSpotlight}'s
+ * `z-[32]`-anchored caption card. The overlay is `pointer-events-none`
+ * end-to-end so it never steals clicks from the hand strip.
+ */
+const ATTACK_FX_LIFETIME_MS = 900;
+const ATTACK_FX_LUNGE_MS = 320;
+const ATTACK_FX_COUNTER_MS = 760;
+
+type AttackFxItem =
+  | {
+      id: number;
+      kind: 'attack';
+      sourceRect: DOMRect;
+      targetRect: DOMRect;
+      magnitude: number;
+      reducedMotion: boolean;
+    }
+  | {
+      id: number;
+      kind: 'buff';
+      sourceRect: DOMRect;
+      magnitude: number;
+      flavor: 'value' | 'hitScale';
+      reducedMotion: boolean;
+    }
+  | {
+      id: number;
+      kind: 'flash';
+      pillRect: DOMRect;
+      magnitude: number;
+      tone: 'debuff' | 'buff';
+      reducedMotion: boolean;
+    };
+
+function rectForCardId(cardId: string): DOMRect | null {
+  if (typeof document === 'undefined') return null;
+  // Prefer the user's hand strip over face-down clones. Multiple elements
+  // can share a card id (face-down preview + face-up CardItem on reveal),
+  // so iterate and pick the first VISIBLE one (non-zero size).
+  const candidates = document.querySelectorAll<HTMLElement>(
+    `[data-card-id="${CSS.escape(cardId)}"]`,
+  );
+  for (const el of Array.from(candidates)) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) return rect;
+  }
+  return null;
+}
+
+function rectForScorePill(side: 'Batting' | 'Pitching'): DOMRect | null {
+  if (typeof document === 'undefined') return null;
+  const tone = side === 'Batting' ? 'batter' : 'pitcher';
+  const el = document.querySelector<HTMLElement>(`[data-score-pill="${tone}"]`);
+  if (!el) return null;
+  const rect = el.getBoundingClientRect();
+  if (rect.width === 0 && rect.height === 0) return null;
+  return rect;
+}
+
+function resolveFxItem(
+  id: number,
+  animation: RevealBeatAnimation,
+  reducedMotion: boolean,
+): AttackFxItem | null {
+  switch (animation.kind) {
+    case 'attack': {
+      const sourceRect = rectForCardId(animation.sourceCardId);
+      if (!sourceRect) return null;
+      const targetRect = animation.targetCardId
+        ? rectForCardId(animation.targetCardId)
+        : rectForScorePill(animation.targetSide);
+      if (!targetRect) return null;
+      return {
+        id,
+        kind: 'attack',
+        sourceRect,
+        targetRect,
+        magnitude: animation.magnitude,
+        reducedMotion,
+      };
+    }
+    case 'buff': {
+      const sourceRect = rectForCardId(animation.sourceCardId);
+      if (!sourceRect) return null;
+      return {
+        id,
+        kind: 'buff',
+        sourceRect,
+        magnitude: animation.magnitude,
+        flavor: animation.flavor ?? 'value',
+        reducedMotion,
+      };
+    }
+    case 'flash': {
+      const pillRect = rectForScorePill(animation.affectedSide);
+      if (!pillRect) return null;
+      return {
+        id,
+        kind: 'flash',
+        pillRect,
+        magnitude: animation.magnitude,
+        tone: animation.tone,
+        reducedMotion,
+      };
+    }
+    case 'snap':
+      // Snap effects already surface through selfModifier beats; emitting
+      // a second visual would double-attribute the bonus. Reserved for a
+      // future "chain seam pulse" pass that doesn't move the score.
+      return null;
+  }
+}
+
+const RevealAttackOverlay = ({
+  active,
+  currentAnimation,
+}: {
+  active: boolean;
+  currentAnimation: { tick: number; animation: RevealBeatAnimation } | null;
+}) => {
+  const [items, setItems] = useState<AttackFxItem[]>([]);
+  const reducedMotion = useReducedMotionPref();
+
+  useEffect(() => {
+    if (!active || !currentAnimation) return;
+    const item = resolveFxItem(
+      currentAnimation.tick,
+      currentAnimation.animation,
+      reducedMotion,
+    );
+    if (!item) return;
+    setItems((prev) => [...prev, item]);
+    const t = setTimeout(() => {
+      setItems((prev) => prev.filter((entry) => entry.id !== item.id));
+    }, ATTACK_FX_LIFETIME_MS);
+    return () => clearTimeout(t);
+    // tick changes every emission; we explicitly only want to fire on
+    // currentAnimation transitions, not on `active` flipping.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentAnimation]);
+
+  useEffect(() => {
+    if (!active) setItems([]);
+  }, [active]);
+
+  if (!active || items.length === 0) return null;
+
+  return (
+    <div className="fixed inset-0 z-[31] pointer-events-none overflow-hidden">
+      <AnimatePresence>
+        {items.map((item) => {
+          switch (item.kind) {
+            case 'attack':
+              return <AttackBeat key={item.id} item={item} />;
+            case 'buff':
+              return <BuffBeat key={item.id} item={item} />;
+            case 'flash':
+              return <FlashBeat key={item.id} item={item} />;
+          }
+        })}
+      </AnimatePresence>
+    </div>
+  );
+};
+
+function rectCenter(rect: DOMRect): { x: number; y: number } {
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
+const AttackBeat = ({ item }: { item: Extract<AttackFxItem, { kind: 'attack' }> }) => {
+  const src = rectCenter(item.sourceRect);
+  const tgt = rectCenter(item.targetRect);
+  const magnitudeLabel = `${item.magnitude > 0 ? '+' : ''}${item.magnitude}`;
+  const counterColor = item.magnitude < 0 ? 'text-rose-400' : 'text-emerald-300';
+  const counterFontSize = Math.min(48, 22 + Math.abs(item.magnitude) * 1.5);
+
+  return (
+    <>
+      {/* Projectile streak from source center -> target center. Tinted by
+          attack direction (red lance for damage, emerald for rare positive
+          aggregate effects). Skipped under reduced-motion -- the impact
+          flash + counter still tells the story. */}
+      {!item.reducedMotion && (
+        <motion.div
+          className="absolute"
+          initial={{ x: src.x, y: src.y, opacity: 0, scale: 0.4 }}
+          animate={{ x: tgt.x, y: tgt.y, opacity: [0, 1, 1, 0], scale: [0.4, 1, 1, 0.7] }}
+          transition={{ duration: ATTACK_FX_LUNGE_MS / 1000, ease: [0.5, 0, 0.5, 1], times: [0, 0.2, 0.85, 1] }}
+          style={{
+            translateX: '-50%',
+            translateY: '-50%',
+            width: 28,
+            height: 28,
+            borderRadius: 9999,
+            background:
+              item.magnitude < 0
+                ? 'radial-gradient(circle, rgba(239,68,68,0.95) 0%, rgba(190,18,60,0.55) 60%, rgba(190,18,60,0) 100%)'
+                : 'radial-gradient(circle, rgba(52,211,153,0.95) 0%, rgba(5,150,105,0.55) 60%, rgba(5,150,105,0) 100%)',
+            filter: 'blur(2px)',
+            boxShadow:
+              item.magnitude < 0
+                ? '0 0 24px rgba(244,63,94,0.6)'
+                : '0 0 24px rgba(16,185,129,0.6)',
+          }}
+        />
+      )}
+      {/* Impact flash centered on the target card. Brief pulse with a
+          ring so the target reads as "just got hit". */}
+      <motion.div
+        className="absolute rounded-2xl"
+        initial={{ x: tgt.x, y: tgt.y, opacity: 0, scale: 0.7 }}
+        animate={{ opacity: [0, 0.85, 0], scale: [0.7, 1.25, 1.45] }}
+        transition={{
+          duration: 0.45,
+          delay: item.reducedMotion ? 0 : ATTACK_FX_LUNGE_MS / 1000,
+          ease: 'easeOut',
+        }}
+        style={{
+          translateX: '-50%',
+          translateY: '-50%',
+          width: Math.max(item.targetRect.width, 96),
+          height: Math.max(item.targetRect.height, 96),
+          border:
+            item.magnitude < 0
+              ? '3px solid rgba(244,63,94,0.85)'
+              : '3px solid rgba(16,185,129,0.85)',
+          boxShadow:
+            item.magnitude < 0
+              ? '0 0 28px rgba(244,63,94,0.55)'
+              : '0 0 28px rgba(16,185,129,0.55)',
+        }}
+      />
+      {/* Floating damage counter. Arc upward off the impact point. Under
+          reduced motion it just fades in place. */}
+      <motion.div
+        className={`absolute font-black ${counterColor} drop-shadow-lg select-none`}
+        initial={{
+          x: tgt.x,
+          y: tgt.y,
+          opacity: 0,
+          scale: 0.6,
+        }}
+        animate={
+          item.reducedMotion
+            ? { opacity: [0, 1, 1, 0], scale: [0.6, 1, 1, 1] }
+            : { y: tgt.y - 60, opacity: [0, 1, 1, 0], scale: [0.6, 1.1, 1, 0.95] }
+        }
+        transition={{
+          duration: ATTACK_FX_COUNTER_MS / 1000,
+          delay: item.reducedMotion ? 0 : ATTACK_FX_LUNGE_MS / 1000,
+          ease: 'easeOut',
+          times: [0, 0.15, 0.7, 1],
+        }}
+        style={{
+          translateX: '-50%',
+          translateY: '-50%',
+          fontSize: counterFontSize,
+          textShadow: '0 2px 8px rgba(0,0,0,0.7)',
+          letterSpacing: '-0.02em',
+        }}
+      >
+        {magnitudeLabel}
+      </motion.div>
+    </>
+  );
+};
+
+const BuffBeat = ({ item }: { item: Extract<AttackFxItem, { kind: 'buff' }> }) => {
+  const src = rectCenter(item.sourceRect);
+  const magnitudeLabel = `${item.magnitude > 0 ? '+' : ''}${item.magnitude}`;
+  // Hit-scale boosts read as amber to match the ScorePill's hit-scale chip;
+  // regular value buffs stay green. Negative buffs (self-debuffs) tinted red.
+  const counterColor =
+    item.magnitude < 0
+      ? 'text-rose-400'
+      : item.flavor === 'hitScale'
+        ? 'text-amber-300'
+        : 'text-emerald-300';
+  const glowColor =
+    item.magnitude < 0
+      ? 'rgba(244,63,94,0.55)'
+      : item.flavor === 'hitScale'
+        ? 'rgba(251,191,36,0.6)'
+        : 'rgba(52,211,153,0.6)';
+  const counterFontSize = Math.min(46, 22 + Math.abs(item.magnitude) * 1.5);
+
+  return (
+    <>
+      {/* Soft pulse ring on the source card. */}
+      <motion.div
+        className="absolute rounded-2xl"
+        initial={{ x: src.x, y: src.y, opacity: 0, scale: 0.85 }}
+        animate={{ opacity: [0, 0.75, 0], scale: [0.85, 1.2, 1.35] }}
+        transition={{ duration: 0.6, ease: 'easeOut' }}
+        style={{
+          translateX: '-50%',
+          translateY: '-50%',
+          width: Math.max(item.sourceRect.width, 96),
+          height: Math.max(item.sourceRect.height, 96),
+          border: `2px solid ${glowColor}`,
+          boxShadow: `0 0 24px ${glowColor}`,
+        }}
+      />
+      {/* Floating buff counter. */}
+      <motion.div
+        className={`absolute font-black ${counterColor} drop-shadow-lg select-none`}
+        initial={{ x: src.x, y: src.y, opacity: 0, scale: 0.6 }}
+        animate={
+          item.reducedMotion
+            ? { opacity: [0, 1, 1, 0], scale: [0.6, 1, 1, 1] }
+            : { y: src.y - 70, opacity: [0, 1, 1, 0], scale: [0.6, 1.1, 1, 0.95] }
+        }
+        transition={{
+          duration: ATTACK_FX_COUNTER_MS / 1000,
+          ease: 'easeOut',
+          times: [0, 0.15, 0.7, 1],
+        }}
+        style={{
+          translateX: '-50%',
+          translateY: '-50%',
+          fontSize: counterFontSize,
+          textShadow: '0 2px 8px rgba(0,0,0,0.7)',
+          letterSpacing: '-0.02em',
+        }}
+      >
+        {magnitudeLabel}
+      </motion.div>
+    </>
+  );
+};
+
+const FlashBeat = ({ item }: { item: Extract<AttackFxItem, { kind: 'flash' }> }) => {
+  const center = rectCenter(item.pillRect);
+  const magnitudeLabel = `${item.magnitude > 0 ? '+' : ''}${item.magnitude}`;
+  const counterColor = item.tone === 'debuff' ? 'text-rose-400' : 'text-emerald-300';
+  const counterFontSize = Math.min(38, 20 + Math.abs(item.magnitude) * 1.5);
+
+  return (
+    <motion.div
+      className={`absolute font-black ${counterColor} drop-shadow-lg select-none`}
+      initial={{ x: center.x, y: center.y, opacity: 0, scale: 0.6 }}
+      animate={
+        item.reducedMotion
+          ? { opacity: [0, 1, 1, 0], scale: [0.6, 1, 1, 1] }
+          : { y: center.y - 50, opacity: [0, 1, 1, 0], scale: [0.6, 1.1, 1, 0.95] }
+      }
+      transition={{
+        duration: ATTACK_FX_COUNTER_MS / 1000,
+        ease: 'easeOut',
+        times: [0, 0.15, 0.7, 1],
+      }}
+      style={{
+        translateX: '-50%',
+        translateY: '-50%',
+        fontSize: counterFontSize,
+        textShadow: '0 2px 8px rgba(0,0,0,0.7)',
+        letterSpacing: '-0.02em',
+      }}
+    >
+      {magnitudeLabel}
+    </motion.div>
+  );
+};
+
+/**
+ * Lightweight `prefers-reduced-motion` watcher. The reveal layer uses this
+ * to collapse lunge / arc tweens into in-place pops while still firing
+ * counters so screen-reader-equivalent users see the magnitude.
+ */
+function useReducedMotionPref(): boolean {
+  const [reduced, setReduced] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  });
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const handler = (e: MediaQueryListEvent) => setReduced(e.matches);
+    // Safari < 14 only supports addListener; modern Chromium/Firefox use
+    // addEventListener. Try both for max compatibility.
+    if (typeof mq.addEventListener === 'function') {
+      mq.addEventListener('change', handler);
+      return () => mq.removeEventListener('change', handler);
+    }
+    // Legacy fallback for old Safari builds.
+    mq.addListener(handler);
+    return () => {
+      mq.removeListener(handler);
+    };
+  }, []);
+  return reduced;
+}
 
 /**
  * Face-down card art shared by the pitcher hand (and any future face-down
@@ -3447,11 +4052,22 @@ const HandStrip = ({
     if (id && onAffirmConnections) onAffirmConnections(id);
   }, [onAffirmConnections]);
 
-  // Pre-compute hint state for each card index when a drag is in progress.
-  // Each entry is `{ left, right }` ConnectHints for the card at that index.
+  // Treat the controller "grabbed" card as a synthetic drag for hint /
+  // dragActive / dragging-id purposes. Mouse drag and gamepad grab are
+  // the same gesture semantically (pick up -> shift -> drop), so the
+  // strip's visual feedback (connect-allow/block chips on the touching
+  // seams, dragActive silencing celebration animations, the lift in
+  // HandCard) should fire from both. We never have both at once -- mouse
+  // drag and controller grab require different input devices to start --
+  // so `??` is safe.
+  const effectiveDraggingId = draggingId ?? gamepadGrabbedCardId ?? null;
+
+  // Pre-compute hint state for each card index when a drag (mouse or
+  // gamepad grab) is in progress. Each entry is `{ left, right }`
+  // ConnectHints for the card at that index.
   const hints: Array<{ left?: ConnectHint; right?: ConnectHint }> = useMemo(() => {
-    if (!draggingId) return hand.map(() => ({}));
-    const dragIdx = hand.findIndex((c) => c.id === draggingId);
+    if (!effectiveDraggingId) return hand.map(() => ({}));
+    const dragIdx = hand.findIndex((c) => c.id === effectiveDraggingId);
     if (dragIdx === -1) return hand.map(() => ({}));
 
     const out = hand.map(() => ({} as { left?: ConnectHint; right?: ConnectHint }));
@@ -3471,7 +4087,7 @@ const HandStrip = ({
       out[dragIdx + 1].left = tag;
     }
     return out;
-  }, [draggingId, hand]);
+  }, [effectiveDraggingId, hand]);
 
   // Track which cards have already played their entry animation in this at-bat.
   // We need this because Framer Motion's `Reorder.Item` internally unmounts +
@@ -3559,7 +4175,7 @@ const HandStrip = ({
               onEntryPlayed={markEntryPlayed}
               valueOverride={valueOverrides?.[card.id]}
               highlightTone={highlightTones?.[card.id]}
-              dragActive={draggingId !== null}
+              dragActive={effectiveDraggingId !== null}
               lockReorder={disabled}
               hasPendingChoice={hasPendingChoice}
               isChoiceActive={
@@ -3737,29 +4353,48 @@ const HandCard = ({
       onDragStart={handleDragStart}
       onDragEnd={onDragEnd}
     >
-      <CardItem
-        card={card}
-        isConnectedLeft={isConnectedLeft}
-        isConnectedRight={isConnectedRight}
-        modifier={modifier}
-        compact={compact}
-        leftHint={leftHint}
-        rightHint={rightHint}
-        valueOverride={valueOverride}
-        highlightTone={highlightTone}
-        dragActive={dragActive}
-        tutorialRegions={tutorialRegions}
-        readOnly={lockReorder}
-      />
-      {hasPendingChoice && onTriggerChoice && (
-        <UseAbilityPill
-          active={isChoiceActive}
-          onClick={onTriggerChoice}
+      {/* Gamepad-grab lift wrapper. Mirrors the visual rise the user
+          gets from Framer's pointer-drag (Reorder.Item only lifts on a
+          real pointer drag, so for controller grab we synthesize the
+          same affordance here: a small y-translate + scale-up under a
+          gentle spring). Wrapping the CardItem instead of animating the
+          Reorder.Item itself keeps the layout / entry animations on the
+          parent untouched, and we tag the wrapper with z-50 so the
+          lifted card visually crosses over its neighbors the same way
+          the dragged card does. */}
+      <motion.div
+        animate={
+          gamepadGrabbed
+            ? { y: -14, scale: 1.06 }
+            : { y: 0, scale: 1 }
+        }
+        transition={{ type: 'spring', stiffness: 380, damping: 26 }}
+        className={`relative ${gamepadGrabbed ? 'z-50' : ''}`}
+      >
+        <CardItem
+          card={card}
+          isConnectedLeft={isConnectedLeft}
+          isConnectedRight={isConnectedRight}
+          modifier={modifier}
+          compact={compact}
+          leftHint={leftHint}
+          rightHint={rightHint}
+          valueOverride={valueOverride}
+          highlightTone={highlightTone}
+          dragActive={dragActive}
+          tutorialRegions={tutorialRegions}
+          readOnly={lockReorder}
         />
-      )}
-      {(gamepadFocused || gamepadGrabbed) && (
-        <GamepadFocusRing grabbed={gamepadGrabbed} />
-      )}
+        {hasPendingChoice && onTriggerChoice && (
+          <UseAbilityPill
+            active={isChoiceActive}
+            onClick={onTriggerChoice}
+          />
+        )}
+        {(gamepadFocused || gamepadGrabbed) && (
+          <GamepadFocusRing grabbed={gamepadGrabbed} />
+        )}
+      </motion.div>
     </Reorder.Item>
   );
 };
@@ -4019,6 +4654,13 @@ interface RevealOrchestratorOutput {
   batterBanner: ScoreBanner | null;
   pitcherBanner: ScoreBanner | null;
   revealSpotlight: RevealSpotlight | null;
+  /**
+   * Most-recent reveal beat's animation hint. `tick` increments on every
+   * emission so the attack overlay can re-mount a fresh element even when
+   * two consecutive beats reuse the same `animation` shape (e.g. two
+   * targetedDebuff beats from the same source). Null while not revealing.
+   */
+  currentAnimation: { tick: number; animation: RevealBeatAnimation } | null;
 }
 
 /**
@@ -4046,6 +4688,11 @@ function useRevealOrchestrator({
   const [batterBanner, setBatterBanner] = useState<ScoreBanner | null>(null);
   const [pitcherBanner, setPitcherBanner] = useState<ScoreBanner | null>(null);
   const [revealSpotlight, setRevealSpotlight] = useState<RevealSpotlight | null>(null);
+  const [currentAnimation, setCurrentAnimation] = useState<{
+    tick: number;
+    animation: RevealBeatAnimation;
+  } | null>(null);
+  const animationTickRef = useRef(0);
 
   // Stash latest props in refs so the orchestrator effect can read them
   // without re-running every time React re-renders the parent.
@@ -4068,6 +4715,7 @@ function useRevealOrchestrator({
       setBatterBanner(null);
       setPitcherBanner(null);
       setRevealSpotlight(null);
+      setCurrentAnimation(null);
       // Snap displayed scores to current finals (even outside revealing the
       // pills should track the source of truth).
       setDisplayedBatter(finalRef.current.b);
@@ -4140,6 +4788,13 @@ function useRevealOrchestrator({
             tweens,
           });
           setRevealSpotlight(spotlightForBeat(beat, cardLookup));
+          if (beat.animation) {
+            animationTickRef.current += 1;
+            setCurrentAnimation({
+              tick: animationTickRef.current,
+              animation: beat.animation,
+            });
+          }
         });
 
         runningBatter = nextTotals.batter;
@@ -4188,6 +4843,7 @@ function useRevealOrchestrator({
     batterBanner,
     pitcherBanner,
     revealSpotlight,
+    currentAnimation,
   };
 }
 

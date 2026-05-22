@@ -21,6 +21,7 @@ import type {
   Rarity,
 } from "./run";
 import { makeRunId, nextRarity, MAX_PICKS_PER_DAY } from "./run";
+import { TIER_PRICE_MULTIPLIER, type ItemTier } from "./itemTiers";
 import { PLAYERS } from "./players";
 import { ALL_SZN_PLAYERS } from "./sznPlayers";
 import { rollSznEncounterSlate } from "./sznEncounters";
@@ -48,7 +49,7 @@ function sample<T>(arr: T[], n: number): T[] {
  *
  * Pricing curve targets:
  *   - Week 1: **every** listing (items, dupes, free agents) is capped at
- *     $2 so $10 starter cash can always clear the shop.
+ *     $2 so the $14 starter cash always clears the early shop.
  *   - `weekFactor(week)` ramps from 1.0 at week 1 to ~2.5 at week 12
  *     (applied from week 2 onward for scaling).
  *
@@ -78,13 +79,80 @@ function weekFactor(week: number): number {
   return 1 + ((w - 1) / 11) * 1.5;
 }
 
-function priceFor(card: CardDefinition, week: number): number {
+/**
+ * Bronze-tier base price for a card at the given week (the listing
+ * price the merchant prints on a fresh acquire). Higher-tier upgrade
+ * costs are derived via {@link priceForTier} so the silver / gold
+ * curve mirrors the strength gain (Bazaar parity: a 1.5x stronger
+ * item costs 1.5x to upgrade into).
+ *
+ * Exported so the gameStore's upgrade dispatcher can compute the
+ * cash cost of "buying a duplicate of an owned card" without having
+ * to clone the units/weekFactor curve.
+ */
+export function priceFor(card: CardDefinition, week: number): number {
   const raw = Math.round(units(card) * weekFactor(week));
   // Week 1 caps every listing at $2 so the $14 starter cash always
   // clears the early shop. Floor drops to $1 (was $2) so genuinely
   // low-impact role cards can actually be cheap impulse buys.
   if (week === 1) return Math.min(2, Math.max(1, raw));
   return Math.max(1, raw);
+}
+
+/**
+ * Tier-aware listing price. Bronze is the printed listing
+ * ({@link priceFor}); silver/gold scale by {@link TIER_PRICE_MULTIPLIER}
+ * and round up so the upgrade cost never silently drops below the
+ * fresh bronze price.
+ *
+ * Used by `gameStore.purchaseFromMerchant` when the user is buying
+ * an upgrade duplicate: the listing's `targetTier` reads the owned
+ * copy's NEXT tier (bronze→silver, silver→gold), and the listing
+ * price is `priceForTier(card, week, targetTier)`.
+ */
+export function priceForTier(
+  card: CardDefinition,
+  week: number,
+  tier: ItemTier,
+): number {
+  const base = priceFor(card, week);
+  if (tier === "bronze") return base;
+  return Math.max(1, Math.ceil(base * TIER_PRICE_MULTIPLIER[tier]));
+}
+
+/**
+ * Sell-back value for a bag item. Mirrors the Bazaar's "you always get
+ * roughly half of what you paid" rule -- the user is free to dump items
+ * for cash any time without the sell loop becoming a money fountain.
+ *
+ * Computed from the live listing price at the current week so an item
+ * the user grabbed for $1 in Week 1 doesn't sell for $5 in Week 8 when
+ * the curve has moved -- the sell line tracks the live market.
+ */
+export function sellValueFor(
+  card: CardDefinition,
+  week: number,
+  tier: ItemTier,
+): number {
+  const buyPrice = priceForTier(card, week, tier);
+  return Math.max(1, Math.ceil(buyPrice * 0.5));
+}
+
+/**
+ * Cash cost to reroll a merchant's listings during a single visit.
+ * Cheap in early weeks so the user can experiment with stock; pricier
+ * mid/late so a reroll-spam strategy still costs real budget. Capped
+ * at one of three rungs (1 / 3 / 5) so the cost is legible without a
+ * tuning slider.
+ *
+ * Used by `gameStore.rerollMerchant` and the Reroll CTA in
+ * `MerchantView`. The per-visit reroll cap lives in
+ * {@link MERCHANT_REROLLS_PER_VISIT} (run.ts).
+ */
+export function rerollCost(week: number): number {
+  if (week <= 2) return 1;
+  if (week <= 5) return 3;
+  return 5;
 }
 
 function listingForCard(
@@ -406,15 +474,23 @@ function applyWeekDiscountToOffers(
  * encounter twice across a single Monday→Thursday Front Office stretch.
  * When the eligible pool is exhausted the slate quietly allows repeats
  * so the day still surfaces `slotCount` offers.
+ *
+ * `recentEncounterRing` is the optional cross-week "recently seen"
+ * ring (capped at {@link RECENT_ENCOUNTER_RING_SIZE} elsewhere). The
+ * SZN tier sampler honors it only when the tier pool can still
+ * satisfy the union; legacy merchant + free-agency injections honor
+ * it identically so a Concessions cart that just ran on Thursday-of-
+ * last-week can't immediately re-appear Monday-of-this-week.
  */
 export function rollDailyOffers(
   roster: RosterPlayer[],
   week: number,
   slotCount: number = MAX_PICKS_PER_DAY,
   excludeEncounterIds?: ReadonlySet<string>,
+  recentEncounterRing?: ReadonlySet<string>,
 ): EncounterOffer[] {
   const n = Math.max(1, Math.min(MAX_PICKS_PER_DAY, Math.floor(slotCount)));
-  const slate = rollSznEncounterSlate(week, n, excludeEncounterIds);
+  const slate = rollSznEncounterSlate(week, n, excludeEncounterIds, recentEncounterRing);
 
   // Sprinkle in legacy front-office offers so roster upgrades, the
   // free-agency lane, and the legacy event flavors still appear:
@@ -432,13 +508,23 @@ export function rollDailyOffers(
   // only knows about SZN encounter ids.
   const offers: EncounterOffer[] = [...slate];
   if (offers.length > 0 && Math.random() < 0.35) {
-    const merchantCandidates = ALL_MERCHANTS.filter(
-      (id) => !excludeEncounterIds?.has(`merchant:${id}`),
-    );
-    if (merchantCandidates.length > 0) {
+    const merchantCandidates = ALL_MERCHANTS.filter((id) => {
+      const key = `merchant:${id}`;
+      if (excludeEncounterIds?.has(key)) return false;
+      // Only consult the cross-week ring when AT LEAST ONE candidate
+      // would still pass; otherwise we silently fall back to the
+      // week-only filter so the legacy merchant injection still has
+      // something to pick. Mirrors `rollSznEncounterSlate`'s behavior.
+      return true;
+    });
+    const ringFiltered = recentEncounterRing
+      ? merchantCandidates.filter((id) => !recentEncounterRing.has(`merchant:${id}`))
+      : merchantCandidates;
+    const pool = ringFiltered.length > 0 ? ringFiltered : merchantCandidates;
+    if (pool.length > 0) {
       const idx = Math.floor(Math.random() * offers.length);
       offers[idx] = buildMerchantOffer(
-        sample(merchantCandidates, 1)[0],
+        sample(pool, 1)[0],
         roster,
         week,
       );
@@ -446,7 +532,10 @@ export function rollDailyOffers(
   }
   if (offers.length > 0 && Math.random() < 0.2) {
     const market = freeAgencyOffer(roster, week);
-    if (!excludeEncounterIds?.has(`market:${market.label}`)) {
+    const marketKey = `market:${market.label}`;
+    const blockedByWeek = excludeEncounterIds?.has(marketKey) ?? false;
+    const blockedByRing = recentEncounterRing?.has(marketKey) ?? false;
+    if (!blockedByWeek && !blockedByRing) {
       const idx = Math.floor(Math.random() * offers.length);
       offers[idx] = market;
     }

@@ -37,41 +37,25 @@
  * attribution back.
  */
 
-import {
-  useCallback,
-  useEffect,
-  useId,
-  useRef,
-  useState,
-  type CSSProperties,
-} from "react";
-import { createPortal } from "react-dom";
+import { useId, type CSSProperties } from "react";
 import { motion } from "motion/react";
 import type { CardDefinition } from "../lib/cards";
 import { ShapeHalf } from "./CardGameOverlay";
 import { shapeModeForSide } from "../lib/connect";
 import { useGameStore } from "../lib/gameStore";
-import { SZN_EDGES, type SznEdgeId } from "../lib/sznEdges";
+import type { SznEdgeId } from "../lib/sznEdges";
 import { SznEdgeHalf } from "./SznEdgeHalf";
+import { useAbilityHover } from "./useAbilityHover";
+import {
+  ENCOUNTER_UTILITY_TAGS,
+  resolveCardEdges,
+} from "../lib/cardDisplay";
 
-const HOVER_LAYER_Z_CLASS = "z-[10000]";
-
-/**
- * Mini-tag rendered in the big-number slot for `baseValue: 0`
- * EncounterItems so utility cards don't read as "this does nothing."
- * Indexed by cardId; anything missing falls back to an em-dash.
- */
-const UTILITY_TAGS: Record<string, string> = {
-  "enc-sticky-stuff": "SNAP",
-  "enc-rally-fire": "AURA",
-  "enc-platinum-glove": "SHIELD",
-  "enc-classic-spikes": "COPY",
-  "enc-the-torch": "COPY",
-  "enc-duct-tape": "SNAP",
-  "enc-faded-scouting-report": "INTEL",
-  "enc-mega-left": "MEGA",
-  "enc-mega-right": "MEGA",
-};
+// Utility-tag table now lives in `cardDisplay.ts` as
+// `ENCOUNTER_UTILITY_TAGS` so the footer rail, the merchant
+// preview, the bag picker, and combat all agree on the short-form
+// label for a zero-base utility item. Imported above and used in
+// the `utilityTag` derivation below.
 
 export interface ItemCardPreviewProps {
   card: CardDefinition;
@@ -101,121 +85,6 @@ export interface ItemCardPreviewProps {
    * Defaults `false` (auto-hide in SZN mode).
    */
   forceShowPlayer?: boolean;
-}
-
-/* ---------------------------------------------------------------------------
- * Internal: ability hover tooltip portal
- *
- * Lifted out of HandCard so we don't import a 3000-line file's internals.
- * Controlled by the parent via the returned handlers + tooltip element so
- * the parent can pick where on its surface the pointer events bind to.
- * --------------------------------------------------------------------------- */
-
-function useAbilityHover(card: CardDefinition, hidePlayerName: boolean) {
-  const surfaceRef = useRef<HTMLDivElement>(null);
-  const hoverRef = useRef(false);
-  const leaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [open, setOpen] = useState(false);
-  const [anchor, setAnchor] = useState<{ cx: number; top: number } | null>(
-    null,
-  );
-
-  const clearLeaveTimer = useCallback(() => {
-    if (leaveTimerRef.current != null) {
-      clearTimeout(leaveTimerRef.current);
-      leaveTimerRef.current = null;
-    }
-  }, []);
-
-  const measureAnchor = useCallback(() => {
-    const el = surfaceRef.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    setAnchor({ cx: r.left + r.width / 2, top: r.top });
-  }, []);
-
-  const openHover = useCallback(() => {
-    clearLeaveTimer();
-    hoverRef.current = true;
-    measureAnchor();
-    setOpen(true);
-  }, [clearLeaveTimer, measureAnchor]);
-
-  const scheduleClose = useCallback(() => {
-    clearLeaveTimer();
-    leaveTimerRef.current = setTimeout(() => {
-      hoverRef.current = false;
-      setOpen(false);
-      setAnchor(null);
-      leaveTimerRef.current = null;
-    }, 120);
-  }, [clearLeaveTimer]);
-
-  useEffect(() => () => clearLeaveTimer(), [clearLeaveTimer]);
-
-  // Re-anchor on viewport scroll/resize so a flick or pinch-zoom
-  // doesn't leave the tooltip stranded over the wrong card. `true`
-  // capture-phase scroll catches scrolling containers too -- the
-  // dugout drawer's overflow scroll, the merchant grid, etc.
-  useEffect(() => {
-    if (!open) return;
-    const onScrollOrResize = () => measureAnchor();
-    window.addEventListener("scroll", onScrollOrResize, true);
-    window.addEventListener("resize", onScrollOrResize);
-    return () => {
-      window.removeEventListener("scroll", onScrollOrResize, true);
-      window.removeEventListener("resize", onScrollOrResize);
-    };
-  }, [open, measureAnchor]);
-
-  const tooltip =
-    open &&
-    anchor &&
-    typeof document !== "undefined" &&
-    createPortal(
-      <div
-        className={`pointer-events-auto fixed ${HOVER_LAYER_Z_CLASS} w-64 max-w-[calc(100vw-1.25rem)] max-h-[min(85vh,32rem)] overflow-y-auto rounded-lg border border-slate-600 bg-slate-800 p-3 shadow-2xl sm:w-72`}
-        style={{
-          left: anchor.cx,
-          top: anchor.top,
-          transform: "translate(-50%, calc(-100% - 8px))",
-        }}
-        role="tooltip"
-        onPointerEnter={openHover}
-        onPointerLeave={scheduleClose}
-      >
-        <div className="mb-1.5 border-b border-slate-700 pb-1 text-[10px] font-black uppercase tracking-widest text-slate-500">
-          Ability
-        </div>
-        <div className="mb-1.5 flex items-center justify-between gap-2">
-          <div className="truncate text-[11px] font-black uppercase tracking-tight leading-none text-white">
-            {card.name}
-          </div>
-          <div
-            className={`shrink-0 rounded px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider text-white ${
-              card.color || "bg-slate-700"
-            }`}
-          >
-            {card.abilityType}
-          </div>
-        </div>
-        {!hidePlayerName && card.player && (
-          <div className="mb-1.5 text-[9px] font-semibold uppercase tracking-widest text-slate-400">
-            {card.player}
-          </div>
-        )}
-        <div className="text-xs font-medium leading-snug text-slate-300">
-          {card.description}
-        </div>
-      </div>,
-      document.body,
-    );
-
-  const onPointerMove = useCallback(() => {
-    if (hoverRef.current) measureAnchor();
-  }, [measureAnchor]);
-
-  return { surfaceRef, openHover, scheduleClose, onPointerMove, tooltip };
 }
 
 export function ItemCardPreview({
@@ -273,21 +142,15 @@ export function ItemCardPreview({
   const leftMode = shapeModeForSide(card, "left");
   const rightMode = shapeModeForSide(card, "right");
 
-  // SZN mode: every card that carries semantic edges should advertise
-  // them so encounter items read the same in the merchant, reward
-  // reveal, and bag drawer as they do in combat. We only flip when
-  // BOTH sides are registered SznEdgeIds -- otherwise we keep the
-  // shape connectors so the legacy quick-match item set still snaps
-  // correctly. Items don't carry the `team-logo` synthetic so no
-  // resolver pass is needed here (that's the player-card concern).
-  const sznLeftEdge: SznEdgeId | null =
-    card.sznLeftEdge && card.sznLeftEdge in SZN_EDGES
-      ? (card.sznLeftEdge as SznEdgeId)
-      : null;
-  const sznRightEdge: SznEdgeId | null =
-    card.sznRightEdge && card.sznRightEdge in SZN_EDGES
-      ? (card.sznRightEdge as SznEdgeId)
-      : null;
+  // SZN edge resolution flows through the shared `resolveCardEdges`
+  // helper so the merchant preview, the bag picker, the focused
+  // detail panel, and combat all paint the same left/right halves
+  // for a given card. Same registry gate (drops unregistered ids)
+  // applied in every consumer.
+  const { leftEdge: sznLeftEdge, rightEdge: sznRightEdge }: {
+    leftEdge: SznEdgeId | null;
+    rightEdge: SznEdgeId | null;
+  } = resolveCardEdges(card);
 
   const displayValue = valueOverride ?? card.baseValue;
   // Encounter "utility" items intentionally have baseValue 0 -- their
@@ -298,7 +161,7 @@ export function ItemCardPreview({
   // back to an em-dash for any unmapped 0-value encounter card.
   const utilityTag: string | null =
     valueOverride == null && card.baseValue === 0 && card.abilityType === "EncounterItem"
-      ? UTILITY_TAGS[card.id] ?? "—"
+      ? ENCOUNTER_UTILITY_TAGS[card.id] ?? "—"
       : null;
 
   // SZN-mode strips the legacy real-world player attribution from item
@@ -311,22 +174,17 @@ export function ItemCardPreview({
   const hasAbility =
     interactiveTooltip && !isPlayerCard && !!card.description;
 
-  const { surfaceRef, openHover, scheduleClose, onPointerMove, tooltip } =
-    useAbilityHover(card, hidePlayerName);
+  // The hook is always called (React rules-of-hooks); when this
+  // surface has decided NOT to show the tooltip (player card / no
+  // description / explicit opt-out) we just drop the handlers + the
+  // portal stays inert because card.description is missing.
+  const { surfaceRef, pointerHandlers, tooltip } = useAbilityHover(card, {
+    hidePlayerName,
+  });
 
   const tooltipId = useId();
 
-  // Keep React happy: the tooltip element only exists when hasAbility
-  // is true (otherwise the hook is still called -- React rules-of-hooks
-  // forbid conditional invocation -- but we just don't bind handlers
-  // or render the portal node).
-  const pointerHandlers = hasAbility
-    ? {
-        onPointerEnter: openHover,
-        onPointerLeave: scheduleClose,
-        onPointerMove,
-      }
-    : undefined;
+  const boundPointerHandlers = hasAbility ? pointerHandlers : undefined;
 
   return (
     <>
@@ -345,7 +203,7 @@ export function ItemCardPreview({
           } as CSSProperties
         }
         aria-describedby={hasAbility ? tooltipId : undefined}
-        {...pointerHandlers}
+        {...boundPointerHandlers}
       >
         {/* Edge / shape connectors. SZN-mode cards that declare
             `sznLeftEdge` / `sznRightEdge` render the physical

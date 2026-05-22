@@ -300,7 +300,7 @@ function enc7_SuspiciousGrandpa(): EventOffer {
       {
         choiceId: "rally-fire",
         label: "Rally Fire Torch ($4)",
-        resultBlurb: "Bag +1: aura that boosts adjacent cards while held.",
+        resultBlurb: "Bag +1 AND fires the +10% adjacent-card aura for the rest of the week.",
         effect: { kind: "grantItem", cardId: "enc-rally-fire" },
         costPreview: 4,
       },
@@ -353,8 +353,13 @@ function enc9_DefenseCharity(): EventOffer {
       {
         choiceId: "platinum-glove",
         label: "Platinum Glove ($6)",
-        resultBlurb: "Bag +1 AND +1 Defense Shield charge.",
-        effect: { kind: "queueDefenseShields", count: 1 },
+        // Grant the actual item card. The SZN item registry's
+        // `onAcquire` hook for `enc-platinum-glove` queues +1
+        // Defense Shield the moment the card lands in the bag, so
+        // the user gets the shield AND a reusable pitching-chain
+        // chip in one effect dispatch.
+        resultBlurb: "Bag +1 AND +1 Defense Shield charge. Snap it into a pitching chain to bank another.",
+        effect: { kind: "grantItem", cardId: "enc-platinum-glove" },
         costPreview: 6,
       },
       {
@@ -567,9 +572,14 @@ function enc15_Museum(): EventOffer {
 
 function enc16_HobbyShop(): MerchantOffer {
   // Hobby Shop -- general-purpose encounter items, mid-tier prices.
+  // Stamped with `sznEncounterId` so the cross-week dedupe ring treats
+  // Hobby Shop and the legacy Equipment Manager as DISTINCT encounters
+  // even though both flatten to `merchantId: "equipment_manager"` for
+  // pricing purposes.
   return {
     kind: "merchant",
     merchantId: "equipment_manager",
+    sznEncounterId: "enc-hobby-shop",
     displayLabel: "Hobby Shop",
     displayBlurb: "Mid-tier gear and the season's collectibles.",
     displayGlyph: "🃏",
@@ -684,9 +694,13 @@ function enc19_CinderellaCamp(): EventOffer {
 }
 
 function enc20_ClearanceBin(): MerchantOffer {
+  // Stamped with `sznEncounterId` so the dedupe ring treats Clearance
+  // Bin and the legacy Concessions cart as DISTINCT encounters even
+  // though both ride the `concessions` merchantId for pricing.
   return {
     kind: "merchant",
     merchantId: "concessions",
+    sznEncounterId: "enc-clearance-bin",
     displayLabel: "Clearance Bin",
     displayBlurb: "Picked-over leftovers. Deep discounts.",
     displayGlyph: "🏷️",
@@ -748,11 +762,24 @@ export const SZN_ENCOUNTER_TABLE: EncounterEntry[] = [
  * and `rollDailyOffers` filter against the same vocabulary.
  */
 export function encounterOfferId(offer: EncounterOffer): string {
-  return offer.kind === "event"
-    ? offer.eventId
-    : offer.kind === "merchant"
-      ? `merchant:${offer.merchantId}`
-      : `market:${offer.label}`;
+  if (offer.kind === "event") return offer.eventId;
+  if (offer.kind === "merchant") {
+    // SZN-themed merchants (Hobby Shop, Clearance Bin) carry their
+    // originating SZN encounter id so the dedupe namespace stays
+    // disambiguated from the legacy `merchant:<merchantId>` namespace
+    // -- otherwise seeing Hobby Shop would silently block the legacy
+    // Equipment Manager (both flatten to the same merchantId for
+    // pricing, but they're different encounters with different stock
+    // and flavor). The SZN encounter id is identical to the
+    // SZN_ENCOUNTER_TABLE entry's `id`, which is what
+    // `rollSznEncounter` filters its exclude set against -- so this
+    // also fixes the prior bug where rolling Hobby Shop didn't
+    // actually prevent Hobby Shop from rolling again later in the
+    // same week.
+    if (offer.sznEncounterId) return offer.sznEncounterId;
+    return `merchant:${offer.merchantId}`;
+  }
+  return `market:${offer.label}`;
 }
 
 /**
@@ -787,16 +814,28 @@ export function rollSznEncounter(
 /**
  * Pull N unique encounters for one Front Office day. Dedupes WITHIN the
  * slate so the same encounter never appears twice in one day, AND
- * filters against the optional `excludeIds` set so the caller can
- * enforce "no encounter twice in a week" by passing the union of every
- * encounter that has already been rendered this week. If the eligible
- * pool is exhausted (every encounter excluded), the tail allows
- * repeats so the slate always fills the requested length.
+ * filters against the optional `excludeIds` set (week-level dedupe) so
+ * the caller can enforce "no encounter twice in a week" by passing the
+ * union of every encounter that has already been rendered this week.
+ *
+ * `recentRing` is an OPTIONAL cross-week "recently seen" ring. The
+ * rule: if applying `recentRing` would still leave at least one
+ * eligible entry in the current tier, we apply it (so last week's
+ * Thursday slate can't bleed into this week's Monday Front Office).
+ * If applying it would drain the tier dry the ring is ignored for
+ * THIS slate (better to show a recent encounter than an empty slot)
+ * and a dev-only `console.debug` is emitted so playtest can spot
+ * pool exhaustion.
+ *
+ * If the eligible pool is exhausted even after dropping the recent
+ * ring, the tail allows repeats so the slate always fills the
+ * requested length.
  */
 export function rollSznEncounterSlate(
   week: number,
   n: number,
   excludeIds?: ReadonlySet<string>,
+  recentRing?: ReadonlySet<string>,
 ): EncounterOffer[] {
   const tier = weekTier(week);
   const baseTier = SZN_ENCOUNTER_TABLE.filter((e) => e.tiers.includes(tier));
@@ -807,24 +846,53 @@ export function rollSznEncounterSlate(
   const remainingAfterExcludes = excludeIds
     ? baseTier.filter((e) => !excludeIds.has(e.id)).length
     : baseTier.length;
+  // Only honor the cross-week recent ring when applying it would still
+  // leave the tier with enough headroom to fill the slate. Otherwise
+  // the ring "wins" and we'd loop the safety counter trying to find a
+  // candidate that doesn't exist.
+  let effectiveRing: ReadonlySet<string> | undefined;
+  if (recentRing && recentRing.size > 0) {
+    const remainingAfterRing = baseTier.filter(
+      (e) => !excludeIds?.has(e.id) && !recentRing.has(e.id),
+    ).length;
+    if (remainingAfterRing >= 1) {
+      effectiveRing = recentRing;
+    } else if (process.env.NODE_ENV !== "production") {
+      // Dev-only telemetry so playtest can spot pool exhaustion: the
+      // cross-week ring would drain this tier dry, so we're falling
+      // back to "anything not seen this week" for this slate.
+      console.debug(
+        `[sznEncounters] tier="${tier}" week=${week} recent ring drained pool; skipping cross-week filter for this slate`,
+      );
+    }
+  }
 
   const offers: EncounterOffer[] = [];
   const seenInSlate = new Set<string>();
+  let fellBackToRepeat = false;
   let safety = 0;
   while (offers.length < n && safety < 64) {
     safety += 1;
-    // Combine week-level excludes with the in-slate dedupe; the union
-    // is what we hand to `rollSznEncounter` so it filters before
-    // sampling instead of looping us up to the safety cap.
+    // Combine week-level excludes with the optional cross-week ring
+    // and the in-slate dedupe; the union is what we hand to
+    // `rollSznEncounter` so it filters before sampling instead of
+    // looping us up to the safety cap.
     const combined = new Set<string>(excludeIds ?? []);
+    if (effectiveRing) for (const id of effectiveRing) combined.add(id);
     for (const id of seenInSlate) combined.add(id);
     const next = rollSznEncounter(week, combined);
     const id = encounterOfferId(next);
     // If we've genuinely exhausted unique candidates (week-level dedupe
     // drained the tier), allow repeats to fill the slot.
     if (seenInSlate.has(id) && offers.length < remainingAfterExcludes) continue;
+    if (seenInSlate.has(id)) fellBackToRepeat = true;
     seenInSlate.add(id);
     offers.push(next);
+  }
+  if (fellBackToRepeat && process.env.NODE_ENV !== "production") {
+    console.debug(
+      `[sznEncounters] tier="${tier}" week=${week} allowed repeats to fill slate (pool exhausted)`,
+    );
   }
   return offers;
 }

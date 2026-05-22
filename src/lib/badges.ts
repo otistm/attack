@@ -18,7 +18,11 @@ import type { SznEdgeId } from "./sznEdges";
 export type BadgeId =
   /** Yankees starting passive (+10 score / +$1 next-week cash per Power snap). */
   | "bronx-bombers"
-  /** Placeholder badge for the 29 stub teams until each team's passive is designed. */
+  /** Phillies starting passive (+5 score / +$1 next-week cash per Power snap). */
+  | "liberty-bell"
+  /** Blue Jays starting passive (+5 score / +1 Hit Scale per Contact snap). */
+  | "north-of-the-border"
+  /** Placeholder badge for the 27 stub teams until each team's passive is designed. */
   | "tbd-passive";
 
 /**
@@ -37,6 +41,13 @@ export type BadgeTrigger =
       scoreBonus: number;
       /** Queued into RunState.nextWeekCashBonus per occurrence. */
       nextWeekCashBonus: number;
+      /**
+       * Added to the snap's side Hit Scale bonus per occurrence. Optional
+       * because the original Bronx Bombers badge only declared score +
+       * cash; teams designed around Contact / Patience identity (e.g.
+       * north-of-the-border) lean on Hit Scale instead.
+       */
+      hitScaleBonus?: number;
     }
   | {
       kind: "onClassTagAdjacency";
@@ -74,6 +85,35 @@ export const BADGES: Record<BadgeId, BadgeDefinition> = {
       edge: "power",
       scoreBonus: 10,
       nextWeekCashBonus: 1,
+    },
+  },
+  "liberty-bell": {
+    id: "liberty-bell",
+    name: "Liberty Bell",
+    flavor:
+      "Whenever a Power edge successfully snaps, gain +5 Bonus Match Score and receive +$1 Budget for the following week.",
+    icon: "🔔",
+    tint: "#e81828",
+    trigger: {
+      kind: "onSznSnap",
+      edge: "power",
+      scoreBonus: 5,
+      nextWeekCashBonus: 1,
+    },
+  },
+  "north-of-the-border": {
+    id: "north-of-the-border",
+    name: "North of the Border",
+    flavor:
+      "Whenever a Contact edge successfully snaps, gain +5 Bonus Match Score and +1 Hit Scale.",
+    icon: "🍁",
+    tint: "#134a8e",
+    trigger: {
+      kind: "onSznSnap",
+      edge: "contact",
+      scoreBonus: 5,
+      nextWeekCashBonus: 0,
+      hitScaleBonus: 1,
     },
   },
   "tbd-passive": {

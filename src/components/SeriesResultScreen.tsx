@@ -66,6 +66,12 @@ export function SeriesResultScreen() {
     cashBefore,
     cashAfter,
     weeklyRefill,
+    payoutBase,
+    payoutWinBonus,
+    payoutStreakBonus,
+    payoutComebackBonus,
+    newWinStreak,
+    newLossStreak,
     triggerBonus,
     ghostLabel,
     bangingSchemeBefore,
@@ -257,20 +263,71 @@ export function SeriesResultScreen() {
           <span className="text-rose-300 font-bold tabular-nums">{newLosses}L</span>
         </div>
 
-        {/* Cash delta + buff changes */}
+        {/* Cash delta + Bazaar-style payout breakdown. The single
+            flat "+$X weekly" line was replaced with a structured
+            ledger that itemizes the appearance fee, win bonus,
+            streak bonus (when active), and comeback bonus (when
+            triggered). Trigger bonus rides underneath so the
+            Bronx Bombers / Karma 2x flow is still legible. */}
         {showCashDelta && (
-          <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-950/30 p-3 flex items-center gap-3">
-            <Coins className="w-5 h-5 text-amber-300" aria-hidden />
-            <div className="flex-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-              <span className="text-xs uppercase tracking-widest text-amber-200/80">Cash</span>
-              <span className="text-amber-200 tabular-nums font-bold">${cashBefore}</span>
-              <ArrowRight className="w-3.5 h-3.5 text-amber-300/70" aria-hidden />
-              <span className="text-amber-100 tabular-nums font-black text-lg">${cashAfter}</span>
-              <span className="text-[10px] uppercase tracking-widest text-amber-300/70 ml-1">
-                +${weeklyRefill} weekly
-                {triggerBonus > 0 ? ` +$${triggerBonus} triggers` : ""}
-              </span>
+          <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-950/30 p-3">
+            <div className="flex items-center gap-3">
+              <Coins className="w-5 h-5 text-amber-300" aria-hidden />
+              <div className="flex-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                <span className="text-xs uppercase tracking-widest text-amber-200/80">Cash</span>
+                <span className="text-amber-200 tabular-nums font-bold">${cashBefore}</span>
+                <ArrowRight className="w-3.5 h-3.5 text-amber-300/70" aria-hidden />
+                <span className="text-amber-100 tabular-nums font-black text-lg">${cashAfter}</span>
+                <span className="text-[10px] uppercase tracking-widest text-amber-300/70 ml-1">
+                  +${weeklyRefill} payout
+                  {triggerBonus > 0 ? ` +$${triggerBonus} triggers` : ""}
+                </span>
+              </div>
             </div>
+            <ul className="mt-2 pl-8 pr-1 space-y-0.5 text-[11px] uppercase tracking-widest">
+              <li className="flex items-center justify-between text-amber-200/80">
+                <span>Appearance Fee</span>
+                <span className="tabular-nums">+${payoutBase}</span>
+              </li>
+              {payoutWinBonus > 0 && (
+                <li className="flex items-center justify-between text-emerald-200">
+                  <span>Win Bonus</span>
+                  <span className="tabular-nums">+${payoutWinBonus}</span>
+                </li>
+              )}
+              {payoutStreakBonus > 0 && (
+                <li className="flex items-center justify-between text-yellow-200">
+                  <span>Streak ×{newWinStreak}</span>
+                  <span className="tabular-nums">+${payoutStreakBonus}</span>
+                </li>
+              )}
+              {payoutComebackBonus > 0 && (
+                <li className="flex items-center justify-between text-cyan-200">
+                  <span>Comeback</span>
+                  <span className="tabular-nums">+${payoutComebackBonus}</span>
+                </li>
+              )}
+              {triggerBonus > 0 && (
+                <li className="flex items-center justify-between text-purple-200">
+                  <span>Per-Snap Triggers</span>
+                  <span className="tabular-nums">+${triggerBonus}</span>
+                </li>
+              )}
+            </ul>
+            {(newWinStreak >= 2 || newLossStreak >= 2) && (
+              <div className="mt-2 flex items-center justify-center gap-2 text-[10px] uppercase tracking-widest">
+                {newWinStreak >= 2 && (
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-emerald-500/20 border border-emerald-300/40 text-emerald-200 font-bold">
+                    Hot Streak · {newWinStreak} in a row
+                  </span>
+                )}
+                {newLossStreak >= 2 && (
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-rose-500/20 border border-rose-300/40 text-rose-200 font-bold">
+                    Cold Streak · {newLossStreak} losses
+                  </span>
+                )}
+              </div>
+            )}
           </div>
         )}
 

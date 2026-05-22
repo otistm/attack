@@ -123,10 +123,21 @@ export interface RosterPlayer {
  * Purchased item instance that lives in the manager's bag. References the
  * existing CardDefinition catalog by id; the card's `baseValue`, shapes, and
  * (later) ability fields are the items's combat data.
+ *
+ * Tier: Bazaar-inspired progression. Items always enter the bag at
+ * `bronze` (the printed values). Buying a duplicate at a merchant
+ * upgrades the owned copy one rung — bronze → silver → gold — instead
+ * of failing the buy with a "DUPLICATE" early-return. Silver / gold
+ * scale BOTH the printed `baseValue` and the numeric outputs of the
+ * card's effect hooks (see {@link applyTierMultiplier} in
+ * `itemTiers.ts`). Optional on persisted save loads — readers default
+ * absent tiers to `"bronze"` to keep legacy bag entries valid.
  */
 export interface Item {
   instanceId: string;
   cardId: string;
+  /** Defaults to `"bronze"` when absent on legacy saves. */
+  tier?: import("./itemTiers").ItemTier;
 }
 
 export type DayOfWeek = "mon" | "tue" | "wed" | "thu";
@@ -296,6 +307,30 @@ export interface MerchantOffer {
   displayLabel?: string;
   displayBlurb?: string;
   displayGlyph?: string;
+  /**
+   * SZN-themed merchants (Hobby Shop -> equipment_manager, Clearance
+   * Bin -> concessions, etc.) carry the originating SZN encounter id
+   * here so the dedupe namespace stays disambiguated from the legacy
+   * Front Office merchant injection. Without this field, two distinct
+   * encounters that happen to reuse the same `merchantId` would
+   * silently collapse into the same dedupe key -- seeing Hobby Shop
+   * on Monday would block the legacy Equipment Manager from rolling
+   * on Tuesday, even though they're different encounters with
+   * different stock.
+   *
+   * Optional: legacy merchant injections (Scouting Director, plain
+   * Equipment Manager, plain Concessions, Shady Trainer) leave this
+   * undefined so they share the original `merchant:<merchantId>`
+   * dedupe namespace as before.
+   */
+  sznEncounterId?: string;
+  /**
+   * How many times the user has rerolled this merchant's stock
+   * during the current visit. The Reroll Stock CTA in `MerchantView`
+   * disables once this hits {@link MERCHANT_REROLLS_PER_VISIT}.
+   * Optional on persisted saves — undefined treated as 0.
+   */
+  rerollsUsed?: number;
 }
 
 /** Outcome branches the user can pick on a narrative event. */
@@ -313,7 +348,10 @@ export interface EventChoice {
    *   - `"batter"`    : roster picker filtered to Batters.
    *   - `"pitcher"`   : roster picker filtered to Pitchers.
    *   - `"edgeSwap"`  : two-step EdgeSwapPicker.
-   *   - `"release"`   : RosterReleasePicker (player-grant overflow).
+   *   - `"release"`   : (legacy) full-screen release picker. Replaced
+   *                     by the SZN footer rail's release mode; kept
+   *                     in the type for back-compat with any future
+   *                     event encounter that needs a modal cull.
    * Omit for choices that resolve immediately.
    */
   requiresPicker?: "player" | "batter" | "pitcher" | "edgeSwap" | "release";
@@ -426,7 +464,7 @@ export type EncounterOffer = MerchantOffer | EventOffer | PlayerMarketOffer;
 /**
  * Encounter slots for one Front Office day. The slate refreshes after every
  * pick; {@link pickBudget} controls how many slots (and picks) the day has
- * (1–3, rolled per week).
+ * (1–2, rolled per week).
  */
 export interface DayEncounters {
   day: DayOfWeek;
@@ -435,8 +473,9 @@ export interface DayEncounters {
   /** 0..pickBudget; auto-advances the day at the cap. */
   picksUsed: number;
   /**
-   * 1 to 3 encounter slots for this day. Rolled once per week via
-   * {@link rollWeekPickBudgets}. Omit on older persisted runs → treated as 3.
+   * 1 to 2 encounter slots for this day. Rolled once per week via
+   * {@link rollWeekPickBudgets}. Omit on older persisted runs → clamped
+   * to {@link MAX_PICKS_PER_DAY}.
    */
   pickBudget?: number;
 }
@@ -491,11 +530,48 @@ export const STARTER_PACK_TOTAL = STARTER_PACK_BATTERS + STARTER_PACK_PITCHERS;
 // floor drop in `items.ts` (min $1) to widen the early-week shopping
 // surface without making any single item feel disposable.
 export const STARTER_CASH = 14;
-// Bumped from $12 → $16 so the per-week refill keeps pace with the
-// curve once mid-tier listings start hitting $3-5 in Weeks 3+. Without
-// this the user could only afford one purchase per week from Week 5 on.
+/**
+ * Legacy flat weekly stipend, retained as a fallback constant for any
+ * caller that still wants a "what's the base weekly cash flow?" number
+ * (UI tooltips, balance docs). The live `reportSeriesGameResult`
+ * payout has been split into the per-result components below
+ * ({@link SERIES_BASE_PAYOUT} + {@link SERIES_WIN_BONUS} +
+ * streak/comeback bonuses). A typical winning week with a streak still
+ * pays out in the same ~$16-20 neighborhood the old flat number sat
+ * at; losses now pay only the appearance fee.
+ */
 export const WEEKLY_CASH = 16;
+
+/**
+ * Series-payout components (Bazaar-style "appearance fee + win bonus
+ * + streak bonus + comeback bonus"). Replaces the old flat
+ * {@link WEEKLY_CASH} payout in `reportSeriesGameResult`.
+ *
+ * Curve goals:
+ *   - Losses always pay $8 (the user keeps building, no death-spiral).
+ *   - Single wins pay the same $16 the old flat curve did.
+ *   - Hot streaks reward sustained play (+$2 per consecutive win,
+ *     capped so a perfect run can't snowball the price curve into
+ *     irrelevance).
+ *   - Comeback bonus (after a 2+ loss skid) gives a one-time spike
+ *     so the recovery week feels rewarding instead of "back to baseline".
+ */
+export const SERIES_BASE_PAYOUT = 8;
+export const SERIES_WIN_BONUS = 8;
+export const STREAK_BONUS_STEP = 2;
+export const STREAK_BONUS_CAP = 10;
+export const COMEBACK_BONUS = 3;
+export const COMEBACK_LOSS_THRESHOLD = 2;
 export const ENCOUNTERS_PER_DAY = 2;
+/**
+ * Hard cap on merchant rerolls per visit. Per the Bazaar-inspired
+ * economy redesign, every merchant overlay exposes a "Reroll Stock
+ * ($X)" CTA that re-rolls `offer.listings` for a cash cost. This cap
+ * prevents an infinite-spam exploit — once the user has rerolled this
+ * many times during a single visit, the CTA greys out until the next
+ * encounter pick.
+ */
+export const MERCHANT_REROLLS_PER_VISIT = 2;
 /**
  * Hard cap on items the player can carry in the run bag. Caps merchant
  * purchases and event rewards so the chain math (and the always-visible
@@ -517,6 +593,21 @@ export const MAX_BAG_SIZE = 6;
  * the calendar instead of refreshing the slate yet again.
  */
 export const MAX_PICKS_PER_DAY = ENCOUNTERS_PER_DAY;
+
+/**
+ * FIFO size of the cross-week "recently seen" encounter ring stored on
+ * {@link RunState.recentEncounterRing}. Tuned so the union of last
+ * week's Thursday slate and this week's Monday slate never accidentally
+ * repeats: a single week can surface up to ~10 unique encounter ids
+ * (4 days * up to 2 picks * the day's slate count, capped by the
+ * encounter table), so 12 covers "everything from last week + a small
+ * buffer" without locking the entire tier table out for two weeks.
+ *
+ * The ring is consulted by `rollSznEncounterSlate` only when the tier
+ * pool can still satisfy the union; if the cross-week excludes would
+ * drain a tier dry the ring is skipped so a slate still fills.
+ */
+export const RECENT_ENCOUNTER_RING_SIZE = 12;
 
 /**
  * Roll Mon..Thu pick budgets (1–2 each). Avoids “four identical days” so the
@@ -675,6 +766,125 @@ export interface RunState {
    * absent.
    */
   seenEncountersThisWeek?: string[];
+  /**
+   * Rolling ring of encounter ids the user has recently SEEN across
+   * multiple weeks. Persists past week rollover (where
+   * {@link seenEncountersThisWeek} resets) so a Yard Sale that just
+   * appeared on Thursday-week-1 can't show up again on Monday-week-2.
+   *
+   * FIFO ring capped at {@link RECENT_ENCOUNTER_RING_SIZE}: appended
+   * to whenever an encounter is rendered into a Front Office slate.
+   * Roll callers union this ring with `seenEncountersThisWeek` when
+   * building their exclude set, BUT only when the tier pool can still
+   * satisfy the request -- if the cross-week ring would drain the
+   * tier dry, the ring is skipped so a slate still fills. Optional on
+   * older saves; treated as empty when absent.
+   */
+  recentEncounterRing?: string[];
+  /**
+   * Bazaar-style "no silent drops" routing surface. When an item grant
+   * (merchant buy, encounter `grantItem`, encounter `addItemRandom`)
+   * lands while the bag is already at {@link MAX_BAG_SIZE}, the
+   * dispatcher parks the would-be acquisition here and the
+   * `ItemBagReplacePicker` modal mounts above the Front Office. The
+   * user picks an existing bag item to sell for cash (clearing one
+   * slot) and the pending grant lands. Cancelling the picker refunds
+   * `refundOnCancel` cash as consolation so the encounter pick is
+   * never wasted. `null` when nothing is pending. Optional on older
+   * saves; treated as null.
+   */
+  pendingItemGrant?: PendingItemGrant | null;
+  /**
+   * Bazaar-style "no silent drops" routing surface for free-agency
+   * signings. When `buyPlayerFromMarket` lands while the roster is
+   * already at {@link STARTER_PACK_TOTAL} (10), the dispatcher
+   * charges the listing price, parks the would-be signing here, and
+   * the persistent SZN footer rail flips into "release" mode -- the
+   * left deck paints each roster chip with a red RELEASE overlay so
+   * the user picks the cut directly from the same card row they use
+   * for the rest of FO (no separate modal mounts). The user picks an
+   * existing roster slot to release (no cash refund — the cull is
+   * what frees the slot), and the queued player lands in their
+   * place. Cancelling refunds the listing price as full undo. `null`
+   * when nothing is pending. Optional on older saves; treated as
+   * null.
+   */
+  pendingPlayerGrant?: PendingPlayerGrant | null;
+  /**
+   * Series-result streak counters used by the new payout formula in
+   * `reportSeriesGameResult`. `seriesWinStreak` = consecutive series
+   * wins ending with the most recent series; `seriesLossStreak` =
+   * consecutive losses. Exactly one of them is non-zero at any time
+   * (a win zeroes the loss streak and vice versa). Drives both the
+   * +$2/win streak bonus (capped at {@link STREAK_BONUS_CAP}) and the
+   * +$3 comeback bonus when the user breaks a 2+ loss skid by winning.
+   * Optional on older saves; treated as 0.
+   */
+  seriesWinStreak?: number;
+  seriesLossStreak?: number;
+}
+
+/**
+ * Pending player grant queued when a signing lands while the roster
+ * is already at {@link STARTER_PACK_TOTAL}. Surfaced via the SZN
+ * footer rail's "release" mode (see `SznFooterDecks`) -- the user
+ * picks one current roster slot to release directly from the
+ * persistent card row, the released player drops off the roster,
+ * and the queued player takes their spot.
+ *
+ * Mirrors {@link PendingItemGrant} for the bag-full flow so the
+ * "no silent drops" invariant holds for both items AND players.
+ * Cash is charged at queue time (so the listing price is locked in
+ * the moment the user committed to the sign); cancelling the
+ * pending release refunds it in full.
+ */
+export interface PendingPlayerGrant {
+  /** SZN / legacy player id being signed (matches `RosterPlayer.player.id`). */
+  playerId: string;
+  /** Rarity the signing lands at. Mirrors the listing's rarity. */
+  rarity: Rarity;
+  /** Originating subsystem — drives the banner copy. v1 only emits "freeAgency". */
+  source: "freeAgency";
+  /**
+   * Cash refund handed back on cancel. Equal to the price the user
+   * paid at queue time so cancelling fully undoes the transaction
+   * (no consolation discount, unlike `PendingItemGrant.refundOnCancel`
+   * — pulling out of a sign should be cost-neutral, not punitive).
+   */
+  refundOnCancel: number;
+  /**
+   * Optional human-readable label (e.g. "Aaron Judge") so the
+   * footer banner can render `Cut a player to sign Aaron Judge`.
+   * Falls back to the playerId when omitted.
+   */
+  label?: string;
+}
+
+/**
+ * Pending item grant queued when an acquisition lands at a full bag.
+ * Mounted by the `ItemBagReplacePicker` modal in `FrontOfficeScreen`
+ * -- items still use a modal flow because they don't have a card-row
+ * equivalent to the player release surface in `SznFooterDecks`.
+ */
+export interface PendingItemGrant {
+  /** CardDefinition id of the item that wants into the bag. */
+  cardId: string;
+  /** Originating subsystem — drives the modal copy. */
+  source: "merchant" | "event";
+  /**
+   * Cash refund handed back if the user cancels the picker without
+   * picking a replacement. Computed at queue time from the item's
+   * sell value so newer / more expensive grants pay a bigger
+   * consolation if dismissed. Already in cash units; the dispatcher
+   * adds this to `run.cash` on cancel.
+   */
+  refundOnCancel: number;
+  /**
+   * Optional human-readable label (e.g. "Sticky Stuff") so the
+   * picker can render `Pick a slot to sell for Sticky Stuff` instead
+   * of a card id. Falls back to the cardId when omitted.
+   */
+  label?: string;
 }
 
 /**
@@ -700,10 +910,29 @@ export interface SeriesSummary {
   cashBefore: number;
   /** Cash held AFTER the rollover refill (cashBefore + weeklyRefill + triggerBonus). */
   cashAfter: number;
-  /** Flat weekly stipend applied at rollover. */
+  /**
+   * Total cash paid out by the new payout formula at rollover. Equal
+   * to {@link payoutBase} + {@link payoutWinBonus} +
+   * {@link payoutStreakBonus} + {@link payoutComebackBonus}. Kept
+   * alongside the legacy `weeklyRefill` field so older readers (the
+   * SeriesResultScreen used to render a single number) stay valid
+   * while new readers can break the line item out.
+   */
   weeklyRefill: number;
+  /** Appearance fee component (always paid; equals {@link SERIES_BASE_PAYOUT}). */
+  payoutBase: number;
+  /** Win-bonus component ($0 on a loss; {@link SERIES_WIN_BONUS} on a win). */
+  payoutWinBonus: number;
+  /** Streak bonus component (+$2 per consecutive win, capped at {@link STREAK_BONUS_CAP}). */
+  payoutStreakBonus: number;
+  /** Comeback bonus ($3 when this win broke a 2+ loss streak; $0 otherwise). */
+  payoutComebackBonus: number;
   /** Karma-multiplied trigger bonus that was queued via nextWeekCashBonus. */
   triggerBonus: number;
+  /** Win streak AFTER this series result is folded in. */
+  newWinStreak: number;
+  /** Loss streak AFTER this series result is folded in. */
+  newLossStreak: number;
   /** Ghost franchise label of the team the user just faced. */
   ghostLabel: string | null;
   /** Buff-timer deltas for the chip strip. */
@@ -757,7 +986,12 @@ export function emptyRunState(): RunState {
     mlbScoutingIntel: null,
     lastSeriesSummary: null,
     lastSeriesScoreline: null,
+    pendingItemGrant: null,
+    pendingPlayerGrant: null,
+    seriesWinStreak: 0,
+    seriesLossStreak: 0,
     seenEncountersThisWeek: [],
+    recentEncounterRing: [],
   };
 }
 
