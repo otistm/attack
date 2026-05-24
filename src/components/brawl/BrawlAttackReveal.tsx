@@ -770,6 +770,14 @@ export function BrawlAttackOverlay({
 // ---------------------------------------------------------------------------
 
 function BrawlPhaseBanner({ phase }: { phase: BrawlAttackPhase }) {
+  // The mid-attack pills ("Your Cards Attack", "Opponent's Cards
+  // Attack", "Switching Sides") all duplicated information the
+  // animation itself was already shouting via the amber/rose tints
+  // on flying cards + HP pill impacts. The screen-center pill kept
+  // competing with the actual attack visuals, so they're suppressed
+  // here. Only the pre-attack "Locked In" intro pill survives -- it
+  // bridges the dead air between lockIn and the first card launch
+  // when there's nothing else animating.
   const config =
     phase === "intro"
       ? {
@@ -778,28 +786,7 @@ function BrawlPhaseBanner({ phase }: { phase: BrawlAttackPhase }) {
             "bg-slate-700/85 text-slate-100 border-slate-400/60 shadow-slate-500/25",
           glow: "0 0 18px rgba(148,163,184,0.35)",
         }
-      : phase === "mid"
-        ? {
-            label: "Switching Sides",
-            chip:
-              "bg-violet-600/80 text-violet-50 border-violet-300/70 shadow-violet-400/30",
-            glow: "0 0 18px rgba(167,139,250,0.4)",
-          }
-        : phase === "user"
-          ? {
-              label: "Your Cards Attack",
-              chip:
-                "bg-amber-500/85 text-amber-50 border-amber-200/80 shadow-amber-400/35",
-              glow: "0 0 24px rgba(251,191,36,0.45)",
-            }
-          : phase === "opponent"
-            ? {
-                label: "Opponent's Cards Attack",
-                chip:
-                  "bg-rose-500/85 text-rose-50 border-rose-200/80 shadow-rose-400/35",
-                glow: "0 0 24px rgba(244,63,94,0.45)",
-              }
-            : null;
+      : null;
 
   return (
     <div

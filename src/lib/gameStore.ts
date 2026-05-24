@@ -811,6 +811,72 @@ export interface GameState {
   brawlOpponentPlanHand: CardDefinition[];
 
   /**
+   * Brawl-only: wall-clock timestamp the current `selecting` phase began
+   * for THIS at-bat. lockIn reads `Date.now() - brawlSnapStartedAt` to
+   * compute the "snap-speed" HP bonus on the user side -- locking with
+   * >10s left grants +4 HP, >5s left grants +2 HP, otherwise nothing.
+   * Null between at-bats and outside of brawl.
+   */
+  brawlSnapStartedAt: number | null;
+
+  /**
+   * Brawl-only: most-recent snap bonuses + streak deltas the engine
+   * applied at the last lock-in, surfaced so the result-phase UI can
+   * caption "Hot Streak +3" / "Snap! +4" / "Chain x3 +5" badges next
+   * to the HP pills. Cleared at `startNextAtBat` and `reset`.
+   */
+  lastBrawlBonusBreakdown: {
+    batterSnapBonus: number;
+    pitcherSnapBonus: number;
+    batterChainBonus: number;
+    pitcherChainBonus: number;
+    batterStreakBonus: number;
+    pitcherStreakBonus: number;
+  } | null;
+
+  /**
+   * Brawl-only: consecutive same-side wins within the CURRENT half-inning.
+   * Reset to 0 at every half flip. Incremented after each at-bat for the
+   * winning side; the loser's counter resets to 0 the same tick. Going
+   * into the next at-bat, a side at 2+ collects +3 selfStartingHP as a
+   * "Hot Streak" rally bonus. Mirrors the comeback-feel rule the audit
+   * called out.
+   */
+  brawlStreakBatter: number;
+  brawlStreakPitcher: number;
+
+  /**
+   * Brawl-only: rolling per-inning highlights surfaced in the
+   * end-of-inning summary overlay (longest chain forged, peak hit
+   * outcome, head-to-head W/L). Reset at half flip.
+   */
+  brawlInningHighlights: {
+    half: "top" | "bottom";
+    inning: number;
+    userWins: number;
+    userLosses: number;
+    longestUserChain: number;
+    peakUserOutcome: HitOutcome | null;
+  } | null;
+
+  /**
+   * Brawl-only: SNAPSHOT of the just-ended half's highlights, stamped
+   * the instant the half flips at lockIn. Painted as a flashcard
+   * overlay during the side-switch window (the ~2.1s `between-at-bats`
+   * pause before `startNextAtBat` fires). Cleared at `startNextAtBat`
+   * so the overlay never bleeds into the next half's selecting phase.
+   */
+  brawlInningSummary: {
+    half: "top" | "bottom";
+    inning: number;
+    userWins: number;
+    userLosses: number;
+    longestUserChain: number;
+    peakUserOutcome: HitOutcome | null;
+    isGameEnd: boolean;
+  } | null;
+
+  /**
    * Coin flips resolved at lock-in time for cards whose effect tosses (e.g.
    * b-22 Power/Speed Threat). Keyed by cardId; absent during the selecting
    * phase so previews fall back to deterministic averages. Cleared on
@@ -1542,6 +1608,27 @@ function pickRandom<T>(arr: T[]): T {
 const RECENT_BATTER_LIMIT = 6;
 const RECENT_PITCHER_LIMIT = 5;
 
+/**
+ * Brawl Mode snap-timer duration (ms). Shared with the
+ * `BrawlSnapTimer` UI component -- exporting from the store keeps the
+ * gameplay layer (snap-speed bonus computation) and the presentation
+ * layer (countdown bar) on the exact same wall-clock budget.
+ */
+export const BRAWL_SNAP_DURATION_MS = 15_000;
+
+/**
+ * Brawl Mode chain-length HP bonus ladder. Tuned so a 3-chain is the
+ * sweet spot (matches the median brawl hand size of 5 → 3 chained, 2
+ * solo), a 4-chain is a serious commitment, and a 5-chain "all-in"
+ * delivers a match-shaping spike.
+ */
+function chainBonusFor(chainLen: number): number {
+  if (chainLen >= 5) return 12;
+  if (chainLen >= 4) return 8;
+  if (chainLen >= 3) return 5;
+  return 0;
+}
+
 function pickAvoidingRecent<T extends { id: string }>(pool: T[], recent: string[]): T {
   const fresh = pool.filter((p) => !recent.includes(p.id));
   const candidates = fresh.length > 0 ? fresh : pool;
@@ -1798,6 +1885,13 @@ interface FreshAtBatOptions {
    * buff bought from a Front Office encounter).
    */
   sznUserNextGameBoost?: number;
+  /**
+   * Brawl Mode: route both seats' `dealHand` calls through the curated
+   * brawl general pool so every dealt general carries a readable
+   * `brawlTagline`. Signatures are unaffected (they're always dealt,
+   * and their brawl simplifications live in the tagline map).
+   */
+  brawlMode?: boolean;
 }
 
 function freshAtBat(opts: FreshAtBatOptions = {}): FreshAtBat {
@@ -1908,18 +2002,19 @@ function freshAtBat(opts: FreshAtBatOptions = {}): FreshAtBat {
   }
   // Hand overrides take precedence over SZN seeds (non-SZN-mode lanes
   // still send full bag hands the legacy way).
+  const dealOpts = opts.brawlMode ? { brawlMode: true } : undefined;
   const rawBatter =
     opts.userBatterHandOverride && opts.userBatterHandOverride.length > 0
       ? opts.userBatterHandOverride.slice(0, 5)
       : sznBatterHand
         ? sznBatterHand
-        : dealHand(batter);
+        : dealHand(batter, undefined, dealOpts);
   const rawPitcher =
     opts.userPitcherHandOverride && opts.userPitcherHandOverride.length > 0
       ? opts.userPitcherHandOverride.slice(0, 5)
       : sznPitcherHand
         ? sznPitcherHand
-        : dealHand(pitcher);
+        : dealHand(pitcher, undefined, dealOpts);
 
   // Phase 2 ordering: roster mods (add/remove/swap) run BEFORE shape/value
   // transforms, so b-21 / p-31 / p-47 etc. see the final hand composition.
@@ -1928,13 +2023,22 @@ function freshAtBat(opts: FreshAtBatOptions = {}): FreshAtBat {
   // documented ~10% flaky test in `__effects_check`). Threading a single
   // mulberry seed in lets bug reports / tests pin a specific outcome.
   const dealSeed = Math.floor(Math.random() * 0x7fffffff);
-  const dealResult = applyDealEffects(rawBatter, rawPitcher, dealSeed);
+  const dealResult = applyDealEffects(
+    rawBatter,
+    rawPitcher,
+    dealSeed,
+    opts.brawlMode ? { brawlMode: true } : undefined,
+  );
   const transformed = applyHandTransforms(dealResult.batterHand, dealResult.pitcherHand);
 
   // Choices & reveals key off the post-deal hands (e.g. b-67 may have
   // dropped itself, in which case there is no "guess" to ask about).
-  const pendingChoices = derivePendingChoices(transformed.batterHand, transformed.pitcherHand);
-  const pendingReveals = derivePendingReveals(transformed.batterHand, transformed.pitcherHand);
+  // Brawl Mode suppresses all modals/reveals so the 15s snap timer stays
+  // uninterrupted -- the affected cards have brawl branches in
+  // cardEffects that pay out a flat selfValueDelta instead.
+  const gameMode = opts.brawlMode ? "brawl" : null;
+  const pendingChoices = derivePendingChoices(transformed.batterHand, transformed.pitcherHand, { gameMode });
+  const pendingReveals = derivePendingReveals(transformed.batterHand, transformed.pitcherHand, { gameMode });
 
   return {
     batter,
@@ -1950,9 +2054,15 @@ function freshAtBat(opts: FreshAtBatOptions = {}): FreshAtBat {
 function derivePendingChoices(
   batterHand: CardDefinition[],
   pitcherHand: CardDefinition[],
+  opts?: { gameMode?: GameMode | null },
 ): PendingChoice[] {
   const SHAPE_OPTIONS: ShapeType[] = ["circle", "diamond", "square", "star"];
   const out: PendingChoice[] = [];
+  // Brawl Mode: every choice card (pickShape modal, guessShape pre-pick)
+  // would interrupt the 15s snap timer with a popover. Suppress them
+  // entirely; the affected effects (b-12, b-65, p-56) have brawl branches
+  // in cardEffects that either no-op or grant a flat bonus.
+  if (opts?.gameMode === "brawl") return out;
 
   // b-12 Switch Hitter: change the shape of one of YOUR General cards.
   // Eligible targets are batting generals only -- skip the prompt entirely if
@@ -2042,8 +2152,9 @@ function reconcileSznHandState(
     }
   }
 
-  const pendingChoices = derivePendingChoices(bh, ph);
-  const pendingReveals = derivePendingReveals(bh, ph);
+  const gameMode = s.gameMode === "brawl" ? "brawl" : null;
+  const pendingChoices = derivePendingChoices(bh, ph, { gameMode });
+  const pendingReveals = derivePendingReveals(bh, ph, { gameMode });
 
   let activeChoiceCardId = s.activeChoiceCardId;
   if (activeChoiceCardId) {
@@ -2066,8 +2177,14 @@ function reconcileSznHandState(
 export function derivePendingReveals(
   batterHand: CardDefinition[],
   pitcherHand: CardDefinition[],
+  opts?: { gameMode?: GameMode | null },
 ): PendingReveal[] {
   const out: PendingReveal[] = [];
+  // Brawl Mode: reveal animations (Soto Shuffle, Catcher's Eye, Veteran
+  // Savvy, Nasty Slider) would pop overlays mid-snap. Suppress them; the
+  // owning cards (b-7, b-121, p-51, p-59) have brawl branches that grant
+  // a flat +3 if chained instead of the info reveal.
+  if (opts?.gameMode === "brawl") return out;
   if (batterHand.some((c) => c.id === "b-7")) {
     out.push({ forSide: "Batting", reveal: "opponentUncombined", source: "Soto Shuffle" });
   }
@@ -2134,6 +2251,12 @@ function resetEphemeralGameplay(): Partial<GameState> {
     affirmedSeams: new Set<string>(),
     brawlOpponentSeams: new Set<string>(),
     brawlOpponentPlanHand: [],
+    brawlSnapStartedAt: null,
+    lastBrawlBonusBreakdown: null,
+    brawlStreakBatter: 0,
+    brawlStreakPitcher: 0,
+    brawlInningHighlights: null,
+    brawlInningSummary: null,
     revealScript: [],
     pendingResolvedPhase: null,
     revealUiUserSide: null,
@@ -2260,6 +2383,12 @@ export const useGameStore = create<GameState>((set, get) => ({
   affirmedSeams: new Set<string>(),
   brawlOpponentSeams: new Set<string>(),
   brawlOpponentPlanHand: [],
+  brawlSnapStartedAt: null,
+  lastBrawlBonusBreakdown: null,
+  brawlStreakBatter: 0,
+  brawlStreakPitcher: 0,
+  brawlInningHighlights: null,
+  brawlInningSummary: null,
   recentBatterIds: [INITIAL_AT_BAT.batter.id],
   recentPitcherIds: [INITIAL_AT_BAT.pitcher.id],
 
@@ -2440,6 +2569,7 @@ export const useGameStore = create<GameState>((set, get) => ({
         (s.run?.rallyFireWeeksLeft ?? 0) > 0,
       sznSpeedMultiplierBonus: sznSpeedMultiplierForSide(s, "Batting"),
       sznChainLengthForgiveness: sznChainLengthForgivenessForSide(s, "Batting"),
+      gameMode: s.gameMode ?? undefined,
     };
     return scoreHand(s.batterHand, ctx);
   },
@@ -2511,6 +2641,7 @@ export const useGameStore = create<GameState>((set, get) => ({
         (s.run?.rallyFireWeeksLeft ?? 0) > 0,
       sznSpeedMultiplierBonus: sznSpeedMultiplierForSide(s, "Pitching"),
       sznChainLengthForgiveness: sznChainLengthForgivenessForSide(s, "Pitching"),
+      gameMode: s.gameMode ?? undefined,
     };
     return scoreHand(s.pitcherHand, ctx);
   },
@@ -2611,15 +2742,27 @@ export const useGameStore = create<GameState>((set, get) => ({
 
     let lockInState: GameState = { ...s, batterHand: workingBatterHand };
     if (s.gameMode === "brawl") {
-      const brawlPrep = computeBrawlOpponentPrep(lockInState, { applyHand: true });
-      if (brawlPrep) {
-        lockInState = { ...lockInState, ...brawlPrep };
-        set({
-          ...(brawlPrep.pitcherHand ? { pitcherHand: brawlPrep.pitcherHand } : {}),
-          ...(brawlPrep.batterHand ? { batterHand: brawlPrep.batterHand } : {}),
-          brawlOpponentPlanHand: brawlPrep.brawlOpponentPlanHand ?? s.brawlOpponentPlanHand,
-          brawlOpponentSeams: brawlPrep.brawlOpponentSeams ?? s.brawlOpponentSeams,
-        });
+      // Phase-fairness fix: the AI USED to re-run its exhaustive
+      // optimizer right here, AFTER the user had locked in. That gave
+      // the AI perfect knowledge of the user's final card order and
+      // turned every brawl into a Stackelberg game the AI always won.
+      //
+      // Now the AI commits to whatever layout `prepareBrawlOpponent`
+      // last computed during the snap phase (re-optimized every
+      // BRAWL_AI_REEVAL_MS ≈ 2.5s, last refresh ≤ 2.5s before lockIn).
+      // The user can READ the AI's plan during snap and counter it.
+      // The AI can NO LONGER react to the user's final commit.
+      //
+      // We still need to APPLY the planned layout into the actual
+      // pitcher/batter hand the moment lockIn fires (the plan lives
+      // in `brawlOpponentPlanHand` / `brawlOpponentSeams` until now).
+      const opponentSideKey: "pitcherHand" | "batterHand" =
+        getUserSide(s) === "Batting" ? "pitcherHand" : "batterHand";
+      const planned = s.brawlOpponentPlanHand;
+      if (planned && planned.length === s[opponentSideKey].length) {
+        const patch: Partial<GameState> = { [opponentSideKey]: planned } as Partial<GameState>;
+        lockInState = { ...lockInState, ...patch };
+        set(patch);
       }
     }
     s = get();
@@ -2663,8 +2806,74 @@ export const useGameStore = create<GameState>((set, get) => ({
     // surfaced via `lastBrawlResolution` and used below to pre-load
     // the bases so the swing actually clears 4 runs.
     const isBrawl = s.gameMode === "brawl";
+
+    // ============ Brawl Mode bonus stack ============
+    //
+    // Brawl HP totals get three additive layers ON TOP of the raw chain
+    // math from `computeMatchup`, all surfaced via `lastBrawlBonusBreakdown`
+    // so the result-phase UI can caption each bump next to the HP pill:
+    //
+    //   1. Snap-speed bonus (user side only). Locking with ≥10s left on
+    //      the snap timer grants +3 HP; ≥5s left grants +1 HP. Rewards
+    //      confident, fast play and makes the timer feel like an
+    //      opportunity instead of a tax. Only the human side gets this
+    //      kick — the AI commits at a fixed cadence and would otherwise
+    //      bank a free +3 every at-bat.
+    //
+    //      Tuned: a free +4 against ~15 HP base totals swung the win
+    //      rate from 48% (no bonus) to 78% in the headless sim. +3/+1
+    //      pulls the snap-locker win rate back to roughly 60%, which is
+    //      still a clear "you played well, keep going" signal without
+    //      dominating the match.
+    //
+    //   2. Chain bonus (both sides, symmetric). A chain of length ≥3
+    //      grants +5 HP, ≥4 grants +8 HP, ≥5 grants +12 HP. Bigger
+    //      chains were previously rewarded ONLY through the per-card
+    //      tagline buffs (e.g. b-1 +4 if chained), which capped a long
+    //      chain's marginal value the moment you crossed 2 cards. The
+    //      flat bump makes 3+ chains the puzzle's actual peak.
+    //
+    //   3. Hot-streak bonus (winning side, persistent within half). After
+    //      a side wins 2+ at-bats in a row in the same half, they bank
+    //      +3 HP on the NEXT at-bat. Reset when the OTHER side wins or
+    //      the half flips. Tied at-bats (out-zero-out) snap the streak
+    //      for both sides.
+    let batterSnapBonus = 0;
+    let pitcherSnapBonus = 0;
+    let batterChainBonus = 0;
+    let pitcherChainBonus = 0;
+    let batterStreakBonus = 0;
+    let pitcherStreakBonus = 0;
+    let batterDisplay = m.batterDisplay;
+    let pitcherDisplay = m.pitcherDisplay;
+    if (isBrawl) {
+      const humanSide = getUserSide(s);
+      // Snap-speed bonus (user-side only).
+      if (s.brawlSnapStartedAt != null) {
+        const elapsedMs = Date.now() - s.brawlSnapStartedAt;
+        const remainingMs = Math.max(0, BRAWL_SNAP_DURATION_MS - elapsedMs);
+        const speedBonus = remainingMs >= 10_000 ? 3 : remainingMs >= 5_000 ? 1 : 0;
+        if (humanSide === "Batting") batterSnapBonus = speedBonus;
+        else pitcherSnapBonus = speedBonus;
+      }
+      // Chain bonus (both sides). Chain length = longest contiguous
+      // group of >=2 cards from the side's `bestGroup` (computed by
+      // scoreHand). We read it off batterResult / pitcherResult.
+      const batterChain = (batterResult.bestGroup?.length ?? 0);
+      const pitcherChain = (pitcherResult.bestGroup?.length ?? 0);
+      batterChainBonus = chainBonusFor(batterChain);
+      pitcherChainBonus = chainBonusFor(pitcherChain);
+      // Hot-streak bonus (carried from prior at-bat).
+      const batterAtStreak = s.brawlStreakBatter >= 2;
+      const pitcherAtStreak = s.brawlStreakPitcher >= 2;
+      if (batterAtStreak) batterStreakBonus = 3;
+      if (pitcherAtStreak) pitcherStreakBonus = 3;
+      batterDisplay = m.batterDisplay + batterSnapBonus + batterChainBonus + batterStreakBonus;
+      pitcherDisplay = m.pitcherDisplay + pitcherSnapBonus + pitcherChainBonus + pitcherStreakBonus;
+    }
+
     const brawlResolution: BrawlOutcomeResolution | null = isBrawl
-      ? resolveBrawlOutcome(m.batterDisplay, m.pitcherDisplay)
+      ? resolveBrawlOutcome(batterDisplay, pitcherDisplay)
       : null;
 
     let outcome: HitOutcome;
@@ -2839,6 +3048,102 @@ export const useGameStore = create<GameState>((set, get) => ({
         }
       : null;
 
+    // ============ Brawl streak + per-inning highlight bookkeeping ============
+    //
+    // Update consecutive-win counters AFTER the outcome is known. We need
+    // these to seed the NEXT at-bat's hot-streak bonus + power the
+    // end-of-inning summary overlay.
+    let nextStreakBatter = s.brawlStreakBatter;
+    let nextStreakPitcher = s.brawlStreakPitcher;
+    let nextHighlights = s.brawlInningHighlights;
+    let nextInningSummary = s.brawlInningSummary;
+    if (isBrawl && brawlResolution) {
+      const inningTransitioned = next.half !== s.half || next.inning !== s.inning;
+      if (brawlResolution.batterWon) {
+        nextStreakBatter += 1;
+        nextStreakPitcher = 0;
+      } else {
+        // Includes ties (both 0 HP) which `resolveBrawlOutcome` flags as
+        // a batter single -- so we never reach the else branch on a true
+        // tie. Pitcher win path.
+        nextStreakPitcher += 1;
+        nextStreakBatter = 0;
+      }
+      // Per-inning highlights from the USER's POV. Reset whenever the
+      // half flips so the next inning gets a clean slate.
+      const humanSide = getUserSide(s);
+      const humanWonHere =
+        humanSide === "Batting" ? brawlResolution.batterWon : !brawlResolution.batterWon;
+      const humanChainLen =
+        humanSide === "Batting"
+          ? batterResult.bestGroup.length
+          : pitcherResult.bestGroup.length;
+      const startedNewHalf =
+        !nextHighlights ||
+        nextHighlights.inning !== s.inning ||
+        nextHighlights.half !== s.half;
+      const baseHighlights = startedNewHalf
+        ? {
+            half: s.half,
+            inning: s.inning,
+            userWins: 0,
+            userLosses: 0,
+            longestUserChain: 0,
+            peakUserOutcome: null as HitOutcome | null,
+          }
+        : nextHighlights!;
+      const hitOutcomeRank: Record<HitOutcome, number> = {
+        out: 0,
+        single: 1,
+        double: 2,
+        triple: 3,
+        homerun: 4,
+      };
+      const incoming = humanWonHere ? outcome : "out";
+      const peakOutcome =
+        baseHighlights.peakUserOutcome == null ||
+        hitOutcomeRank[incoming] > hitOutcomeRank[baseHighlights.peakUserOutcome]
+          ? incoming
+          : baseHighlights.peakUserOutcome;
+      nextHighlights = {
+        ...baseHighlights,
+        userWins: baseHighlights.userWins + (humanWonHere ? 1 : 0),
+        userLosses: baseHighlights.userLosses + (humanWonHere ? 0 : 1),
+        longestUserChain: Math.max(baseHighlights.longestUserChain, humanChainLen),
+        peakUserOutcome: peakOutcome,
+      };
+      // On a half-flip in brawl, reset streak counters too (they're
+      // half-scoped). The CURRENT at-bat already booked into the prior
+      // half's highlights above; the next at-bat will see the cleared
+      // counters and start fresh.
+      if (inningTransitioned) {
+        nextStreakBatter = 0;
+        nextStreakPitcher = 0;
+        // Snapshot the just-completed half's highlights into the
+        // summary slot so the overlay reads stable data even after
+        // `nextHighlights` resets for the new half on the very next
+        // at-bat. `isGameEnd` lets the overlay swap to "Game Over"
+        // copy when the just-flipped inning was the last one.
+        const justEndedGame =
+          next.phase === "game-over" ||
+          (s.half === "bottom" && next.inning > s.totalInnings);
+        nextInningSummary = nextHighlights
+          ? { ...nextHighlights, isGameEnd: justEndedGame }
+          : null;
+      }
+    }
+
+    const brawlBonusBreakdown = isBrawl
+      ? {
+          batterSnapBonus,
+          pitcherSnapBonus,
+          batterChainBonus,
+          pitcherChainBonus,
+          batterStreakBonus,
+          pitcherStreakBonus,
+        }
+      : null;
+
     set({
       ...(isBrawl
         ? {
@@ -2856,10 +3161,20 @@ export const useGameStore = create<GameState>((set, get) => ({
       // brawl) so a quick-match lockIn after a brawl can't read stale
       // grand-slam cues into the result banner.
       lastBrawlResolution: brawlResolution,
-      // Persist the COMPREHENSIVE display values (not the raw head-to-head
-      // totals) so the resolved view matches the live preview pill.
-      lastBatterScore: m.batterDisplay,
-      lastPitcherScore: m.pitcherDisplay,
+      // Brawl-only carry-overs: bonus breakdown + streak counters that
+      // feed the NEXT at-bat's "Hot Streak +3" badge + the inning
+      // summary overlay's highlight stats.
+      lastBrawlBonusBreakdown: brawlBonusBreakdown,
+      brawlStreakBatter: nextStreakBatter,
+      brawlStreakPitcher: nextStreakPitcher,
+      brawlInningHighlights: nextHighlights,
+      brawlInningSummary: nextInningSummary,
+      // Persist the BRAWL-ADJUSTED display values (chain bonus, snap
+      // bonus, streak bonus all baked in) so the resolved view pill
+      // matches the HP-ladder math `resolveBrawlOutcome` actually used.
+      // Non-brawl modes fall back to the raw chain totals.
+      lastBatterScore: isBrawl ? batterDisplay : m.batterDisplay,
+      lastPitcherScore: isBrawl ? pitcherDisplay : m.pitcherDisplay,
       // Snapshot the per-card modifier values at lock-in so the result phase
       // displays exactly what the player committed to. Otherwise state-trigger
       // cards (b-91 RBI Threat, b-93 Comeback Kid, b-96 Home Cookin', etc.)
@@ -2965,6 +3280,9 @@ export const useGameStore = create<GameState>((set, get) => ({
         ? { inning: s.inning, ghostScore, userScore }
         : undefined,
       sznUserNextGameBoost: sznMode ? s.run!.nextGameRosterBoost ?? 0 : 0,
+      // Brawl filters the general pool to the curated tagline set so
+      // every dealt general is readable inside the 15s snap timer.
+      brawlMode: s.gameMode === "brawl",
     });
     const userNext = getUserSide(s);
     let batterHand = ab.batterHand;
@@ -2999,6 +3317,20 @@ export const useGameStore = create<GameState>((set, get) => ({
       affirmedSeams: new Set<string>(),
       brawlOpponentSeams: new Set<string>(),
     brawlOpponentPlanHand: [],
+      // Brawl: stamp a fresh wall-clock anchor every time we re-enter
+      // selecting so the snap-bonus reads the same window the user
+      // actually had to think. Null outside brawl so the field never
+      // leaks into other lanes.
+      brawlSnapStartedAt: get().gameMode === "brawl" ? Date.now() : null,
+      // Clear the inning-summary overlay snapshot when the next at-bat
+      // begins so the flashcard doesn't bleed into the new half. The
+      // 2.1s `between-at-bats` window before `startNextAtBat` fires is
+      // the overlay's full lifetime.
+      brawlInningSummary: null,
+      // `lastBrawlBonusBreakdown` is kept ALIVE across the next at-bat
+      // intentionally -- the user sees their previous snap-bonus / hot
+      // streak / chain badge until the new at-bat resolves. It's
+      // cleared at `reset` and at brawl entry, not on every deal.
       recentBatterIds: pushRecent(s.recentBatterIds, ab.batter.id, RECENT_BATTER_LIMIT),
       recentPitcherIds: pushRecent(s.recentPitcherIds, ab.pitcher.id, RECENT_PITCHER_LIMIT),
       revealScript: [],
@@ -3055,6 +3387,12 @@ export const useGameStore = create<GameState>((set, get) => ({
       affirmedSeams: new Set<string>(),
       brawlOpponentSeams: new Set<string>(),
     brawlOpponentPlanHand: [],
+      brawlSnapStartedAt: null,
+      lastBrawlBonusBreakdown: null,
+      brawlStreakBatter: 0,
+      brawlStreakPitcher: 0,
+      brawlInningHighlights: null,
+      brawlInningSummary: null,
       recentBatterIds: [ab.batter.id],
       recentPitcherIds: [ab.pitcher.id],
       revealScript: [],
@@ -3327,17 +3665,57 @@ export const useGameStore = create<GameState>((set, get) => ({
     //   1. `gameMode: "brawl"` for HUD / scoring / snap-timer branches.
     //   2. `phase: "selecting"` — skip the pre-game Shop entirely.
     //   3. `totalInnings: 3` — short arena fights, not a full 9.
+    //   4. Re-deal both hands via the brawl-only general pool so every
+    //      dealt general carries a `brawlTagline` (the Quick Match call
+    //      above dealt from the FULL pool because `gameMode` was still
+    //      "quick-match" at that point).
     //   4. `showBrawlRules: false` — rules primer dismisses on commit.
     //
     // `startQuickMatch` already nulls `run` and clears inventory /
     // equipped items, so brawl can never inherit a stale SZN Front
     // Office surface or a previous quick match's inventory.
     get().startQuickMatch(team);
+    const s = get();
+    // Re-deal hands using the brawl-only general pool so the curated
+    // tagline cards are the only generals that can appear. Without
+    // this, the player would see the full-game generals (Hit Scale
+    // cards, modal triggers, base-running effects) that the brawl
+    // pool was explicitly designed to exclude.
+    const brawlAb = freshAtBat({
+      battersPool: [s.batter],
+      pitchersPool: [s.pitcher],
+      brawlMode: true,
+    });
     set({
       gameMode: "brawl",
       phase: "selecting",
       totalInnings: 3,
       showBrawlRules: false,
+      batterHand: brawlAb.batterHand,
+      pitcherHand: brawlAb.pitcherHand,
+      // Stamp the snap-timer anchor exactly when we drop into selecting
+      // so the snap-speed bonus reads from the actual moment the
+      // player can act, not from gameplay-store boot.
+      brawlSnapStartedAt: Date.now(),
+      // Clear all brawl-only rolling state when starting a brand new
+      // brawl. Streak counters / inning-summary slots persisted from a
+      // prior game would otherwise paint a "Hot Streak" banner on the
+      // very first at-bat of a fresh fight.
+      brawlStreakBatter: 0,
+      brawlStreakPitcher: 0,
+      brawlInningHighlights: null,
+      brawlInningSummary: null,
+      lastBrawlBonusBreakdown: null,
+      // freshAtBat under brawlMode returns empty pendingChoices/Reveals
+      // (the modal cards' triggers are suppressed). Copy them in
+      // explicitly so the leftover choices from the prior Quick Match
+      // scaffold (which dealt under gameMode="quick-match") don't
+      // survive into the brawl. Without this, b-12 / b-65 / p-56
+      // would still surface their "USE" pill during the 15s snap
+      // even though the brawl branch has neutered the underlying
+      // effect.
+      pendingChoices: brawlAb.pendingChoices,
+      pendingReveals: brawlAb.pendingReveals,
       // Brawl is a stripped arena fight — no quest strip, POW overlays,
       // or reward side-effects from the quick-match quest slate.
       activeQuests: [],
@@ -5296,6 +5674,7 @@ function scoreHandForExplicit(
       (s.run?.rallyFireWeeksLeft ?? 0) > 0,
     sznSpeedMultiplierBonus: sznSpeedMultiplierForSide(s, side),
     sznChainLengthForgiveness: sznChainLengthForgivenessForSide(s, side),
+    gameMode: s.gameMode ?? undefined,
   };
   return scoreHand(hand, ctx);
 }
@@ -5432,6 +5811,7 @@ function scoreHandFor(
       (s.run?.rallyFireWeeksLeft ?? 0) > 0,
     sznSpeedMultiplierBonus: sznSpeedMultiplierForSide(s, side),
     sznChainLengthForgiveness: sznChainLengthForgivenessForSide(s, side),
+    gameMode: s.gameMode ?? undefined,
   };
   return scoreHand(hand, ctx);
 }

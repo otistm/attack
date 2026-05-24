@@ -2,6 +2,20 @@ import { CardDefinition, Handedness, SESSION_CARDS } from "./cards";
 import type { ShapeType } from "../components/cardShapes";
 import type { ClassTag } from "./run";
 
+/**
+ * Brawl Mode playstyle flavor. Drives the curated 2-card general
+ * subset each player draws from during brawl dealHand so the SAME
+ * player always feels "powery" / "speedy" / "tricky" between brawls.
+ *
+ * Coverage:
+ *  - power   : sluggers, big chain rewards, raw HP swings
+ *  - speed   : speedsters, low-chain bonuses, comeback/state cards
+ *  - guile   : vets, situational/conditional, wild-edge tricks
+ *  - heat    : fastball pitchers, raw debuffs, "blank their card" cuts
+ *  - control : command pitchers, ties/blanks, anti-chain tools
+ */
+export type BrawlFlavor = "power" | "speed" | "guile" | "heat" | "control";
+
 export interface MlbPlayer {
   id: string;
   name: string;
@@ -19,6 +33,12 @@ export interface MlbPlayer {
   rightShape: ShapeType;
   /** SZN Mode class tag. */
   tag: ClassTag;
+  /**
+   * Brawl Mode playstyle flavor. Selects the curated brawl-only general
+   * pool the player drafts 2 cards from on a brawl deal. Outside brawl
+   * the field is ignored; the full general pools still apply.
+   */
+  brawlFlavor: BrawlFlavor;
 }
 
 /**
@@ -59,6 +79,78 @@ const PLAYER_TAGS: Record<string, ClassTag> = {
   "ohtani-pit": "Strikeout",
   yamamoto: "Control",
   cease: "Strikeout",
+};
+
+/**
+ * Brawl Mode playstyle per player. Curated so the same player always
+ * feels the same in brawl while still rotating in fresh cards each
+ * deal (the curated subset is ~10 cards per flavor, larger than the
+ * 2 we actually draw). See `BrawlFlavor` for the design intent.
+ */
+const PLAYER_BRAWL_FLAVORS: Record<string, BrawlFlavor> = {
+  judge: "power",
+  "ohtani-bat": "power",
+  soto: "guile",
+  delacruz: "speed",
+  betts: "guile",
+  witt: "speed",
+  harper: "power",
+  acuna: "speed",
+  henderson: "guile",
+  vlad: "power",
+  trout: "guile",
+  freeman: "guile",
+  alvarez: "power",
+  seager: "guile",
+  jramirez: "guile",
+  alonso: "power",
+  tturner: "speed",
+  rutschman: "guile",
+  devers: "power",
+  lindor: "guile",
+  altuve: "speed",
+  chisholm: "speed",
+  skenes: "heat",
+  cole: "heat",
+  skubal: "heat",
+  wheeler: "heat",
+  clase: "control",
+  miller: "control",
+  sale: "heat",
+  "ohtani-pit": "heat",
+  yamamoto: "control",
+  cease: "control",
+};
+
+/**
+ * Curated brawl-only general pools per flavor. Each list contains
+ * 8-12 brawl-eligible general cards that thematically pair with the
+ * flavor; dealHand draws ONE of the 2 generals from this pool (or
+ * skips to the universal pool if the curated list is exhausted for
+ * the role). Cards intentionally overlap across flavors so the
+ * sub-pools don't collapse to "5 unique cards per player". A card
+ * listed here MUST exist in the broader BRAWL_GENERAL_{BATTING,
+ * PITCHING} pool -- the module-load assert below enforces this so a
+ * typo can't silently fall through.
+ */
+const BRAWL_FLAVOR_BATTING_POOL: Record<BrawlFlavor, string[]> = {
+  power: ["b-62", "b-76", "b-79", "b-80", "b-81", "b-83", "b-84", "b-86", "b-87"],
+  speed: ["b-71", "b-72", "b-78", "b-85", "b-88", "b-93", "b-94", "b-96"],
+  guile: ["b-61", "b-64", "b-68", "b-71", "b-72", "b-74", "b-75", "b-77", "b-95"],
+  // Pitching flavors never deal from the batting curated pool -- but
+  // we still need keys so the type stays exhaustive. Empty lists fall
+  // through to the universal batting pool, which is fine for the
+  // (never-reached) pitching-side batting deal in brawl.
+  heat: [],
+  control: [],
+};
+
+const BRAWL_FLAVOR_PITCHING_POOL: Record<BrawlFlavor, string[]> = {
+  heat: ["p-73", "p-74", "p-81", "p-82", "p-85", "p-89", "p-90", "p-93"],
+  control: ["p-71", "p-80", "p-84", "p-86", "p-91", "p-92", "p-94", "p-96"],
+  guile: ["p-72", "p-76", "p-83", "p-87"],
+  power: [],
+  speed: [],
 };
 
 interface PlayerSeed {
@@ -131,12 +223,19 @@ export const PLAYERS: MlbPlayer[] = PLAYER_SEEDS.map((seed) => {
       `players.ts: ${seed.id} (${seed.name}) is missing a SZN Mode class tag in PLAYER_TAGS.`,
     );
   }
+  const brawlFlavor = PLAYER_BRAWL_FLAVORS[seed.id];
+  if (!brawlFlavor) {
+    throw new Error(
+      `players.ts: ${seed.id} (${seed.name}) is missing a Brawl Mode flavor in PLAYER_BRAWL_FLAVORS.`,
+    );
+  }
   const shapes = _seedShapeFor(seed.signatureCardIds[0]);
   return {
     ...seed,
     leftShape: shapes.left,
     rightShape: shapes.right,
     tag,
+    brawlFlavor,
   };
 });
 
@@ -175,6 +274,59 @@ for (const p of PLAYERS) {
 const GENERAL_BATTING = SESSION_CARDS.filter((c) => c.type === "Batting" && c.abilityType === "General Draw");
 const GENERAL_PITCHING = SESSION_CARDS.filter((c) => c.type === "Pitching" && c.abilityType === "General Draw");
 
+// Brawl Mode general pools: curated subset that pulls only cards whose
+// effect is one-line-readable on the card face. The full general pool
+// contains Hit-Scale-only cards, modal triggers, base-running effects,
+// and discard/reveal mechanics that don't fit the 15s snap timer. Any
+// card without a `brawlTagline` is excluded; the static set of "this
+// card is brawl-eligible" is the single source of truth in
+// `brawlTaglines.ts` -> stamped onto SESSION_CARDS at module load.
+const BRAWL_GENERAL_BATTING = GENERAL_BATTING.filter((c) => !!c.brawlTagline);
+const BRAWL_GENERAL_PITCHING = GENERAL_PITCHING.filter((c) => !!c.brawlTagline);
+
+// Resolve curated brawl flavor pools to live CardDefinitions on
+// startup so the deal-time hot path never re-scans the global card
+// list. The assertion below throws if any tagged card id isn't in
+// the broader brawl pool, which usually means the tag list and the
+// brawl-eligibility tag in `brawlTaglines.ts` drifted out of sync.
+const BRAWL_FLAVOR_POOLS_BATTING: Record<BrawlFlavor, CardDefinition[]> = (() => {
+  const out: Record<BrawlFlavor, CardDefinition[]> = {
+    power: [], speed: [], guile: [], heat: [], control: [],
+  };
+  for (const flavor of Object.keys(BRAWL_FLAVOR_BATTING_POOL) as BrawlFlavor[]) {
+    const ids = BRAWL_FLAVOR_BATTING_POOL[flavor];
+    for (const id of ids) {
+      const card = BRAWL_GENERAL_BATTING.find((c) => c.id === id);
+      if (!card) {
+        throw new Error(
+          `players.ts: BRAWL_FLAVOR_BATTING_POOL.${flavor} references "${id}" but it is not in BRAWL_GENERAL_BATTING (missing brawlTagline or wrong type).`,
+        );
+      }
+      out[flavor].push(card);
+    }
+  }
+  return out;
+})();
+
+const BRAWL_FLAVOR_POOLS_PITCHING: Record<BrawlFlavor, CardDefinition[]> = (() => {
+  const out: Record<BrawlFlavor, CardDefinition[]> = {
+    power: [], speed: [], guile: [], heat: [], control: [],
+  };
+  for (const flavor of Object.keys(BRAWL_FLAVOR_PITCHING_POOL) as BrawlFlavor[]) {
+    const ids = BRAWL_FLAVOR_PITCHING_POOL[flavor];
+    for (const id of ids) {
+      const card = BRAWL_GENERAL_PITCHING.find((c) => c.id === id);
+      if (!card) {
+        throw new Error(
+          `players.ts: BRAWL_FLAVOR_PITCHING_POOL.${flavor} references "${id}" but it is not in BRAWL_GENERAL_PITCHING (missing brawlTagline or wrong type).`,
+        );
+      }
+      out[flavor].push(card);
+    }
+  }
+  return out;
+})();
+
 /** Expected hand size for a fresh at-bat. */
 const EXPECTED_HAND_SIZE = 5;
 
@@ -186,7 +338,11 @@ const EXPECTED_HAND_SIZE = 5;
  * Throws if the player's data is broken (missing signature card, empty
  * pool); silently shrinking the hand was previously a flaky failure mode.
  */
-export function dealHand(player: MlbPlayer, seed = Math.floor(Math.random() * 1_000_000)): CardDefinition[] {
+export function dealHand(
+  player: MlbPlayer,
+  seed = Math.floor(Math.random() * 1_000_000),
+  opts?: { brawlMode?: boolean },
+): CardDefinition[] {
   const signatures = player.signatureCardIds.map((id) => cardsById[id]);
   if (signatures.some((c) => !c)) {
     const missing = player.signatureCardIds.filter((id) => !cardsById[id]);
@@ -194,8 +350,40 @@ export function dealHand(player: MlbPlayer, seed = Math.floor(Math.random() * 1_
       `dealHand: ${player.id} (${player.name}) has unresolved signatureCardIds [${missing.join(", ")}].`,
     );
   }
-  const generalPool = player.role === "Batter" ? GENERAL_BATTING : GENERAL_PITCHING;
-  const generals = pickRandomTwo(generalPool, seed);
+  // Brawl swaps in a curated general pool so every dealt general carries
+  // a one-line `brawlTagline` the player can read inside the 15s snap
+  // window. Other modes keep the full pool. (Signatures are always
+  // dealt as-is; their brawl simplifications live in `brawlTaglines`.)
+  const battingPool = opts?.brawlMode ? BRAWL_GENERAL_BATTING : GENERAL_BATTING;
+  const pitchingPool = opts?.brawlMode ? BRAWL_GENERAL_PITCHING : GENERAL_PITCHING;
+  const generalPool = player.role === "Batter" ? battingPool : pitchingPool;
+  // Per-player brawl flavoring: in brawl mode draw ONE of the two
+  // generals from the player's curated flavor pool (so e.g. Aaron
+  // Judge "feels" power-y every brawl) and the other from the wider
+  // brawl pool (so the player doesn't see the same 5 cards every
+  // deal). Falls back to the wide pool if the flavor pool is empty
+  // for the role (intentional: pitching-flavor batters etc.).
+  let generals: CardDefinition[];
+  if (opts?.brawlMode) {
+    const flavorPool =
+      player.role === "Batter"
+        ? BRAWL_FLAVOR_POOLS_BATTING[player.brawlFlavor]
+        : BRAWL_FLAVOR_POOLS_PITCHING[player.brawlFlavor];
+    if (flavorPool.length > 0) {
+      const [flavored] = pickRandomTwo(flavorPool, seed);
+      // Draw the second general from the wide pool, but EXCLUDE the
+      // flavor card we already picked so duplicates can't co-occur.
+      const widePoolMinusFlavored = generalPool.filter(
+        (c) => c.id !== flavored.id,
+      );
+      const [wide] = pickRandomTwo(widePoolMinusFlavored, seed + 1);
+      generals = [flavored, wide];
+    } else {
+      generals = pickRandomTwo(generalPool, seed);
+    }
+  } else {
+    generals = pickRandomTwo(generalPool, seed);
+  }
   const hand = [...signatures, ...generals];
   if (hand.length !== EXPECTED_HAND_SIZE) {
     throw new Error(

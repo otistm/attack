@@ -97,6 +97,7 @@ export function applyDealEffects(
   batterHand: CardDefinition[],
   pitcherHand: CardDefinition[],
   seed?: number,
+  opts?: { brawlMode?: boolean },
 ): DealEffectResult {
   let bh = batterHand;
   let ph = pitcherHand;
@@ -108,6 +109,17 @@ export function applyDealEffects(
   // would intermittently restore the very b-69 the batter just lost, which
   // surfaced as a flaky test ("b-69 dropped, b-67 spent" failed ~10% of runs).
   const batterDiscarded: CardDefinition[] = [];
+
+  // Brawl Mode: skip every roster-mod deal effect. Brawl assumes a stable
+  // 5-card hand on both sides through the 15s snap window -- p-39's
+  // discard, p-54's extra draw, p-77's swap, and b-67's redraw all
+  // violate that assumption (Skubal's p-39 was dropping the brawl batter
+  // to a 4-card hand every at-bat, Ohtani's p-54 was bloating the
+  // pitcher to 6). The owning cards each have a brawl branch in
+  // `cardEffects` that pays the same intent out as a flat HP delta.
+  if (opts?.brawlMode) {
+    return { batterHand: bh, pitcherHand: ph, log };
+  }
 
   // p-54 Dual Threat: pitcher draws an extra general. Auto-take is always a
   // win for the pitcher (more cards, no downside) so we always accept.

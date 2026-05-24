@@ -5,6 +5,9 @@ import { ShapeType } from "../components/cardShapes";
 // in the registry. `sznEdges.ts` doesn't import from `cards.ts`, so
 // the type-only import doesn't create a real cycle.
 import type { SznEdgeId } from "./sznEdges";
+// Brawl Mode taglines: pure data, no back-reference into cards.ts,
+// stamped onto SESSION_CARDS at module load (see bottom of file).
+import { BRAWL_TAGLINE_DRAFT } from "./brawlTaglines";
 
 export type CardType = "Batting" | "Pitching";
 export type CardAbilityType = string;
@@ -48,6 +51,15 @@ export interface CardDefinition {
   leftShape: ShapeType;
   rightShape: ShapeType;
   description: string;
+  /**
+   * Brawl-only one-line ability text rendered DIRECTLY on the card face
+   * (between the name and the value) instead of in the hover tooltip. The
+   * 15s snap timer leaves no room to hover-read multi-clause descriptions,
+   * so every brawl-eligible card carries a ≤28-char tagline drafted in
+   * `brawlTaglines.ts`. When absent, the card is excluded from the brawl
+   * general pool. Full-game modes ignore this field.
+   */
+  brawlTagline?: string;
   color?: string;
   /**
    * Tags that other cards' effects key off. Free-form strings, but the live
@@ -2550,6 +2562,18 @@ export const SESSION_CARDS: CardDefinition[] = [
   ...randomizeCardShapes(ALL_CARDS, SESSION_SEED),
   ...SZN_ENCOUNTER_ITEM_CARDS,
 ];
+
+// Stamp `brawlTagline` onto every SESSION_CARDS entry that has a tagline
+// drafted in `brawlTaglines.ts`. Mutation rather than a render-time lookup
+// keeps the field directly available on `CardDefinition` everywhere
+// (engine tests, type-checks, debug serialization), and the draft map is
+// pure data with no back-reference to `cards.ts`, so no import cycle.
+for (const c of SESSION_CARDS) {
+  const entry = (BRAWL_TAGLINE_DRAFT as Record<string, { tagline?: string }>)[c.id];
+  if (entry?.tagline && entry.tagline !== "—") {
+    c.brawlTagline = entry.tagline;
+  }
+}
 
 const SESSION_CARDS_BY_ID: Record<string, CardDefinition> = {};
 for (const c of SESSION_CARDS) SESSION_CARDS_BY_ID[c.id] = c;

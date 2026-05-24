@@ -876,6 +876,11 @@ export function asMlbPlayerCompat(p: MlbPlayer | SznPlayer): MlbPlayer {
     leftShape: WILD,
     rightShape: WILD,
     tag: p.tag,
+    // SZN players never enter Brawl Mode (brawl reads exclusively
+    // from the legacy `PLAYERS` registry). "guile" is a safe neutral
+    // pick if somebody later wires this adapter into a brawl path --
+    // it falls through to the universal pool when the role is wrong.
+    brawlFlavor: "guile",
   };
 }
 

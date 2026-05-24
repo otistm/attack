@@ -1,0 +1,1259 @@
+{
+  "stats": {
+    "total": 156,
+    "batSig": 66,
+    "batGen": 34,
+    "pitSig": 30,
+    "pitGen": 26
+  },
+  "cards": [
+    {
+      "id": "b-1",
+      "name": "All Rise",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 8,
+      "desc": "If combined, +4 Value."
+    },
+    {
+      "id": "b-2",
+      "name": "Judge's Chamber",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "Pitcher's highest uncombined card gets -2 Value."
+    },
+    {
+      "id": "b-3",
+      "name": "Barrel It Up",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "Can only combine with SQUARE or DIAMOND. If combined, +3 Value."
+    },
+    {
+      "id": "b-4",
+      "name": "Unicorn Swing",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 9,
+      "desc": "Cannot be combined. High base value."
+    },
+    {
+      "id": "b-5",
+      "name": "Opposite Field Power",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "Reverses your Left and Right shapes on all your cards this round."
+    },
+    {
+      "id": "b-6",
+      "name": "50/50 Club",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "+5 Hit Scale (your hit goes further when you win)."
+    },
+    {
+      "id": "b-7",
+      "name": "Soto Shuffle",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 4,
+      "desc": "Reveal the Pitcher's uncombined cards before you lock in your layout."
+    },
+    {
+      "id": "b-8",
+      "name": "Elite Eye",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 3,
+      "desc": "+3 Value to your highest uncombined card."
+    },
+    {
+      "id": "b-9",
+      "name": "Generational Discipline",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "Ignores all Pitcher debuff mechanics this round."
+    },
+    {
+      "id": "b-10",
+      "name": "Electric Speed",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 4,
+      "desc": "Both sides are Wildcards and match any shape."
+    },
+    {
+      "id": "b-11",
+      "name": "Chaos on the Basepaths",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "If you win with this card uncombined, an automatic Single is awarded regardless of score."
+    },
+    {
+      "id": "b-12",
+      "name": "Switch Hitter",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "Change the shape on one side of one of your General cards this round."
+    },
+    {
+      "id": "b-13",
+      "name": "Leadoff Magic",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "+4 Value if this is the first at-bat of the inning."
+    },
+    {
+      "id": "b-14",
+      "name": "Bowling Strike",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "If combined with a SQUARE, +3 Value."
+    },
+    {
+      "id": "b-15",
+      "name": "Mookie's Hustle",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "Left side acts as a Wildcard."
+    },
+    {
+      "id": "b-16",
+      "name": "Junior's Jump",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "If combined with a DIAMOND, +4 Value."
+    },
+    {
+      "id": "b-17",
+      "name": "Line Drive",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "Pitcher's combined values are reduced by 2."
+    },
+    {
+      "id": "b-18",
+      "name": "In The Gap",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "If combined and you win, +3 Hit Scale."
+    },
+    {
+      "id": "b-19",
+      "name": "Philly Clutch",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 8,
+      "desc": "+5 Value if your team has 2 Outs."
+    },
+    {
+      "id": "b-20",
+      "name": "Showman",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "If this card is between two combined neighbors, base value becomes 12."
+    },
+    {
+      "id": "b-21",
+      "name": "The Pandemonium",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "Destroys one of the Pitcher's uncombined General cards."
+    },
+    {
+      "id": "b-22",
+      "name": "Power/Speed Threat",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "If combined, flip a coin. Heads: +5 Value. Tails: +1 Value."
+    },
+    {
+      "id": "b-23",
+      "name": "Stolen Base Threat",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 4,
+      "desc": "Pitcher cannot use any General cards this round."
+    },
+    {
+      "id": "b-24",
+      "name": "Deep Drive",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "Can only combine with CIRCLE."
+    },
+    {
+      "id": "b-25",
+      "name": "Rookie of the Year",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "+2 Value for every uncombined card you leave on the table."
+    },
+    {
+      "id": "b-26",
+      "name": "Shortstop Slap",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "If combined on the right, +4 Value."
+    },
+    {
+      "id": "b-27",
+      "name": "Camden Power",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "+3 Value if the Pitcher's base card is a Fastball."
+    },
+    {
+      "id": "b-28",
+      "name": "Vlad's Vengeance",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 8,
+      "desc": "Cannot be combined on the left side."
+    },
+    {
+      "id": "b-29",
+      "name": "Home Run Derby",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "+1 Value for every CIRCLE on the board."
+    },
+    {
+      "id": "b-30",
+      "name": "Laser Show",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "Pitcher's base card value is halved (rounded down)."
+    },
+    {
+      "id": "p-31",
+      "name": "Splinker",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 9,
+      "desc": "High base value. Batter cannot use Wildcards."
+    },
+    {
+      "id": "p-32",
+      "name": "Triple Digits",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 8,
+      "desc": "Cannot be combined. If played uncombined, +2 Value."
+    },
+    {
+      "id": "p-33",
+      "name": "The Mustache",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "Shrinks the Batter's hit by 3 — pushes the Batter one rung down the Hit Scale ladder."
+    },
+    {
+      "id": "p-34",
+      "name": "Cole Train",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "+3 Value if combined on the right side."
+    },
+    {
+      "id": "p-35",
+      "name": "Knuckle Curve",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "Batter cannot combine SQUAREs this round."
+    },
+    {
+      "id": "p-36",
+      "name": "Ace's Command",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "Nullifies the mechanic of the Batter's highest valued card."
+    },
+    {
+      "id": "p-37",
+      "name": "Cy Young Heat",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 8,
+      "desc": "+2 Value if the Batter is using a left-handed player."
+    },
+    {
+      "id": "p-38",
+      "name": "Wipeout Changeup",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "If combined, subtract 3 from the Batter's score."
+    },
+    {
+      "id": "p-39",
+      "name": "Mound Presence",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "Batter must discard 1 General card before playing."
+    },
+    {
+      "id": "p-40",
+      "name": "Wheeler's Workhorse",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "+1 Value for every card the Batter combines."
+    },
+    {
+      "id": "p-41",
+      "name": "Sweeping Slider",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "Break the Batter's combo (Choose one connection to nullify)."
+    },
+    {
+      "id": "p-42",
+      "name": "Paint the Corners",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 4,
+      "desc": "Batter's base value is capped at 6 before combos."
+    },
+    {
+      "id": "p-43",
+      "name": "100 MPH Cutter",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 9,
+      "desc": "Flat edges. Cannot be combined. Pure overpowering heat."
+    },
+    {
+      "id": "p-44",
+      "name": "Unhittable",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "If you win the round, it counts as 2 Outs instead of 1."
+    },
+    {
+      "id": "p-45",
+      "name": "Game Over",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "+5 Value if it is the 9th Inning (or final inning)."
+    },
+    {
+      "id": "p-46",
+      "name": "Pure Gas",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 8,
+      "desc": "+2 Value if you have no combinations this round."
+    },
+    {
+      "id": "p-47",
+      "name": "Rising Fastball",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "Batter's DIAMOND shapes are treated as None (Flat)."
+    },
+    {
+      "id": "p-48",
+      "name": "Lights Out",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 4,
+      "desc": "If Batter's total is exactly equal to yours, Pitcher wins the tie."
+    },
+    {
+      "id": "p-49",
+      "name": "The Condor",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "Reverses the Batter's Left and Right shapes."
+    },
+    {
+      "id": "p-50",
+      "name": "Devastating Slider",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "If Batter combines 3 cards, subtract 6 from their score."
+    },
+    {
+      "id": "p-51",
+      "name": "Veteran Savvy",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "Reveal the Batter's hand before you lock in your layout."
+    },
+    {
+      "id": "p-52",
+      "name": "Sweeper",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 8,
+      "desc": "If uncombined, Batter's highest uncombined card gets -3 Value."
+    },
+    {
+      "id": "p-53",
+      "name": "Splitter",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "Value becomes equal to the Batter's highest combined total."
+    },
+    {
+      "id": "p-54",
+      "name": "Dual Threat",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "Draw 1 extra Pitching General card this round."
+    },
+    {
+      "id": "p-55",
+      "name": "Rainbow Curve",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "+3 Value if combined on the left side."
+    },
+    {
+      "id": "p-56",
+      "name": "Pinpoint Control",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "Change the shape of one side of one of your cards this round."
+    },
+    {
+      "id": "p-57",
+      "name": "The Japanese Ace",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "+4 Value if the Batter uses no combinations."
+    },
+    {
+      "id": "p-58",
+      "name": "Strikeout Artist",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 8,
+      "desc": "If Pitcher wins by more than 5 points, next Batter starts with -2."
+    },
+    {
+      "id": "p-59",
+      "name": "Nasty Slider",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "Batter must reveal their layout before Pitcher locks in."
+    },
+    {
+      "id": "p-60",
+      "name": "Filthy Stuff",
+      "type": "Pitching",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "Subtract 1 from the Batter's score for every SQUARE card they play."
+    },
+    {
+      "id": "b-61",
+      "name": "Power Swing",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 6,
+      "desc": "Can only combine with SQUARE or DIAMOND."
+    },
+    {
+      "id": "b-62",
+      "name": "Contact Swing",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "If combined, +2 Value."
+    },
+    {
+      "id": "b-63",
+      "name": "Bunt Attempt",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+2 Value. If you win, your hit is capped at a Single (no double-play risk)."
+    },
+    {
+      "id": "b-64",
+      "name": "Good Eye",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 3,
+      "desc": "+4 Value if the Pitcher uses a Fastball."
+    },
+    {
+      "id": "b-65",
+      "name": "Guess Pitch",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "Name a shape. If Pitcher uses it, +4 Value. Otherwise +1."
+    },
+    {
+      "id": "b-66",
+      "name": "Solid Contact",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "If combined and you win, +2 Hit Scale."
+    },
+    {
+      "id": "b-67",
+      "name": "Foul Ball",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "Discard this to redraw 2 Batting General cards."
+    },
+    {
+      "id": "b-68",
+      "name": "Steal Sign",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 3,
+      "desc": "Left side acts as a Wildcard."
+    },
+    {
+      "id": "b-69",
+      "name": "Sacrifice Fly",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 3,
+      "desc": "If you lose, a runner on 3rd still scores."
+    },
+    {
+      "id": "b-70",
+      "name": "The Sweet Spot",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 7,
+      "desc": "If this card is between two combined neighbors and you win, +15 Hit Scale."
+    },
+    {
+      "id": "b-71",
+      "name": "Manager's Challenge",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 3,
+      "desc": "Batter wins all ties this round (overrides Pitcher tie-breakers)."
+    },
+    {
+      "id": "b-72",
+      "name": "Walk-Off Swing",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+1 Value for each other CLUTCH card in your hand."
+    },
+    {
+      "id": "b-73",
+      "name": "Stolen Sign Read",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "If your hand has 2+ other SPEEDSTER cards, +3 Hit Scale."
+    },
+    {
+      "id": "b-74",
+      "name": "Veteran Presence",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+1 Value for each other VETERAN card in your hand."
+    },
+    {
+      "id": "b-75",
+      "name": "Rookie Energy",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+5 Value if another ROOKIE card is in your hand."
+    },
+    {
+      "id": "b-76",
+      "name": "Power Stance",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "If combined and another POWER-HITTER is in your hand, +3 Value."
+    },
+    {
+      "id": "b-77",
+      "name": "Closer Hunter",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+5 Value if the Pitcher is a CLOSER."
+    },
+    {
+      "id": "b-78",
+      "name": "Bullpen Beater",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "Subtract 2 from the Pitcher's score if they are a STARTER."
+    },
+    {
+      "id": "b-79",
+      "name": "Lefty Killer",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+4 Value if the Pitcher is LEFTY."
+    },
+    {
+      "id": "b-80",
+      "name": "Off-Speed Spotter",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+3 Value if the Pitcher uses an OFF-SPEED pitch."
+    },
+    {
+      "id": "b-91",
+      "name": "RBI Threat",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+3 Value with a runner in scoring position (2nd or 3rd)."
+    },
+    {
+      "id": "b-92",
+      "name": "Grand Slam Threat",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "+6 Value with the bases loaded."
+    },
+    {
+      "id": "b-93",
+      "name": "Comeback Kid",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+4 Value if your team is losing."
+    },
+    {
+      "id": "b-94",
+      "name": "Front-Runner",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "+2 Value if your team is leading."
+    },
+    {
+      "id": "b-95",
+      "name": "Late Innings Hero",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+4 Value in the 7th inning or later."
+    },
+    {
+      "id": "b-96",
+      "name": "Home Cookin'",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "+2 Value during the bottom of any inning (home at-bat)."
+    },
+    {
+      "id": "p-71",
+      "name": "Four-Seam Fastball",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 6,
+      "desc": "Standard Heat. +1 Value if uncombined."
+    },
+    {
+      "id": "p-72",
+      "name": "12-to-6 Curveball",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "If combined with a DIAMOND, subtract 3 from the Batter's score."
+    },
+    {
+      "id": "p-73",
+      "name": "Changeup",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "+3 Value if combined with a Fastball card."
+    },
+    {
+      "id": "p-74",
+      "name": "Backdoor Slider",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "+1 Value for every CIRCLE the Batter has in play."
+    },
+    {
+      "id": "p-75",
+      "name": "Pickoff Move",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 3,
+      "desc": "+2 Value vs SPEEDSTER batters. Automatically erases one base runner if you win the round."
+    },
+    {
+      "id": "p-76",
+      "name": "Pitch Framing",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+2 Value to your highest uncombined card."
+    },
+    {
+      "id": "p-77",
+      "name": "Mound Visit",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 2,
+      "desc": "Swap your lowest-Value card for a fresh General Pitching card."
+    },
+    {
+      "id": "p-78",
+      "name": "The Shift",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "Batter's STAR combos are nullified."
+    },
+    {
+      "id": "p-79",
+      "name": "Intentional Walk",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 0,
+      "desc": "Skip this at-bat. Batter gets a Base Hit. (Use to avoid giving up a HR)."
+    },
+    {
+      "id": "p-80",
+      "name": "Umpire's Call",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 2,
+      "desc": "Pitcher wins all ties this round."
+    },
+    {
+      "id": "p-81",
+      "name": "Slider",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "+2 Value if combined with another BREAKING-BALL."
+    },
+    {
+      "id": "p-82",
+      "name": "Splitter",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "+3 Value if combined with a FASTBALL."
+    },
+    {
+      "id": "p-83",
+      "name": "Sinker",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "+1 Value for each SQUARE the Batter has in play."
+    },
+    {
+      "id": "p-84",
+      "name": "Cutter",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "+2 Value if uncombined."
+    },
+    {
+      "id": "p-85",
+      "name": "Closer's Mentality",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+4 Value if another CLOSER card is in your hand."
+    },
+    {
+      "id": "p-86",
+      "name": "Veteran Wisdom",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+1 Value for each other VETERAN card in your hand."
+    },
+    {
+      "id": "p-87",
+      "name": "Rookie Heat",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+3 Value if another ROOKIE card is in your hand."
+    },
+    {
+      "id": "p-88",
+      "name": "Starter's Stamina",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "Raises the Batter's Hit Scale requirements by 2."
+    },
+    {
+      "id": "p-89",
+      "name": "Lefty Specialist",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+4 Value if the Batter is LEFTY."
+    },
+    {
+      "id": "p-90",
+      "name": "Power-Hitter Killer",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "Subtract 3 from the Batter's score if they have a POWER-HITTER."
+    },
+    {
+      "id": "p-91",
+      "name": "Bases Empty Heat",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+3 Value with no runners on base."
+    },
+    {
+      "id": "p-92",
+      "name": "Damage Control",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+4 Value with 2 or more runners on base."
+    },
+    {
+      "id": "p-93",
+      "name": "Save Situation",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+5 Value if your team is leading by 3 runs or fewer."
+    },
+    {
+      "id": "p-94",
+      "name": "Closer Mode",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "+3 Value in the 8th inning or later."
+    },
+    {
+      "id": "b-100",
+      "name": "Five-Tool Threat",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "If combined and the Pitcher's base card is a FASTBALL, +5 Value."
+    },
+    {
+      "id": "b-101",
+      "name": "MVP Resume",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "+1 Value for every other VETERAN card in the Pitcher's hand."
+    },
+    {
+      "id": "b-102",
+      "name": "Halo Bomb",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 8,
+      "desc": "Cannot be combined on the right side."
+    },
+    {
+      "id": "b-103",
+      "name": "1B Smooth",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "+1 Value for every DIAMOND on the board."
+    },
+    {
+      "id": "b-104",
+      "name": "Calm at the Plate",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "+3 Value if your team has 0 Outs."
+    },
+    {
+      "id": "b-105",
+      "name": "Atlanta-LA Ring",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "The Pitcher's base card mechanic is nullified."
+    },
+    {
+      "id": "b-106",
+      "name": "Cuban Crusher",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 9,
+      "desc": "If combined, base value becomes 14."
+    },
+    {
+      "id": "b-107",
+      "name": "Crawford Boxes",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "+2 Value for every other POWER-HITTER card in your hand."
+    },
+    {
+      "id": "b-108",
+      "name": "DH Threat",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "The Pitcher's OFF-SPEED cards have their effect nullified."
+    },
+    {
+      "id": "b-109",
+      "name": "World Series MVP",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "+3 Value in the 4th inning or later."
+    },
+    {
+      "id": "b-110",
+      "name": "Smooth Stroke",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "If combined on the left, +4 Value."
+    },
+    {
+      "id": "b-111",
+      "name": "October Hero",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "+5 Value if the score is tied."
+    },
+    {
+      "id": "b-112",
+      "name": "Switch Slasher",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "+2 Value for every unique shape on the board (max +6)."
+    },
+    {
+      "id": "b-113",
+      "name": "Cleveland Cutter",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "+1 Value for every card you have combined."
+    },
+    {
+      "id": "b-114",
+      "name": "30-30 Threat",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "+3 Value if your hand has another SPEEDSTER and another POWER-HITTER."
+    },
+    {
+      "id": "b-115",
+      "name": "Polar Power",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 8,
+      "desc": "+1 Value for every STAR on the board."
+    },
+    {
+      "id": "b-116",
+      "name": "HR Derby Champ",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "If combined, +3 to the Hit Scale."
+    },
+    {
+      "id": "b-117",
+      "name": "Citi Bomb",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "If combined, +2 Value and +2 to the Hit Scale."
+    },
+    {
+      "id": "b-118",
+      "name": "Track Star",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "+5 Value if you have no combinations this round."
+    },
+    {
+      "id": "b-119",
+      "name": "Quick Bat",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 4,
+      "desc": "The Pitcher's General cards each get -2 Value."
+    },
+    {
+      "id": "b-120",
+      "name": "Steal Home",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "If combined and you win, all base runners advance an extra base."
+    },
+    {
+      "id": "b-121",
+      "name": "Catcher's Eye",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "Reveal the Pitcher's signature shapes before you lock in your layout."
+    },
+    {
+      "id": "b-122",
+      "name": "Pitch Caller",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "+5 Value if the Pitcher's base card is a BREAKING-BALL."
+    },
+    {
+      "id": "b-123",
+      "name": "Future Captain",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "+1 Value to every other card in your hand."
+    },
+    {
+      "id": "b-124",
+      "name": "Carita's Cannon",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 8,
+      "desc": "If this card is between two combined neighbors, +6 Value."
+    },
+    {
+      "id": "b-125",
+      "name": "Green Monster",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "Your DIAMOND shapes are Wildcards this round."
+    },
+    {
+      "id": "b-126",
+      "name": "Lefty Mash",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "+3 Value if the Pitcher is right-handed."
+    },
+    {
+      "id": "b-127",
+      "name": "Mr. Smile",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "If combined, the Pitcher's lowest uncombined card is nullified."
+    },
+    {
+      "id": "b-128",
+      "name": "Switch-Cap",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "+2 Value and +2 to the Hit Scale if the Pitcher is LEFTY."
+    },
+    {
+      "id": "b-129",
+      "name": "Captain Lindor",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "+1 Value to every uncombined card you leave."
+    },
+    {
+      "id": "b-130",
+      "name": "Postseason Tuve",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 6,
+      "desc": "+5 Value if your team is losing or tied."
+    },
+    {
+      "id": "b-131",
+      "name": "Tiny Terror",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 4,
+      "desc": "+3 Value if your hand has 2 or more other CLUTCH cards."
+    },
+    {
+      "id": "b-132",
+      "name": "Champion's Heart",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 7,
+      "desc": "+1 Value for every Run your team has scored this game."
+    },
+    {
+      "id": "b-133",
+      "name": "Jazz Hands",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "If uncombined, both sides act as Wildcards."
+    },
+    {
+      "id": "b-134",
+      "name": "Bronx Hustle",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 5,
+      "desc": "If uncombined and you win, +5 to the Hit Scale."
+    },
+    {
+      "id": "b-135",
+      "name": "Stolen Bag",
+      "type": "Batting",
+      "abilityType": "Signature",
+      "base": 4,
+      "desc": "If you win, place an additional runner on 1st base."
+    },
+    {
+      "id": "b-81",
+      "name": "Sandwich Single",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "If sandwiched between two DIAMOND-carrying neighbors in your chain, +6 Value."
+    },
+    {
+      "id": "b-82",
+      "name": "Three-Pitch Sequence",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "If your chain reads SQUARE \\u2192 DIAMOND \\u2192 CIRCLE in order, +6 Value."
+    },
+    {
+      "id": "b-83",
+      "name": "Triple Threat",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 3,
+      "desc": "+8 Value if you're in a chain of 3 or more cards."
+    },
+    {
+      "id": "b-84",
+      "name": "Five-Tool Run",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "Scores 0 unless in a 4-card chain. If your chain has 4+ cards, +8 Value."
+    },
+    {
+      "id": "b-85",
+      "name": "Cleanup Stacker",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+1 Value for each card to your right in the same chain."
+    },
+    {
+      "id": "b-86",
+      "name": "Leadoff Spark",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+5 Value as the leftmost card in your lineup."
+    },
+    {
+      "id": "b-87",
+      "name": "Cleanup Crew",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 5,
+      "desc": "+5 Value as the 4th card in your lineup."
+    },
+    {
+      "id": "b-88",
+      "name": "Anchor",
+      "type": "Batting",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "+3 Value when uncombined and in the rightmost slot of your lineup."
+    },
+    {
+      "id": "p-95",
+      "name": "Mirror Image",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 4,
+      "desc": "If your chain reads as a shape palindrome, +5 Value and subtract 3 from the Batter's score."
+    },
+    {
+      "id": "p-96",
+      "name": "Alternating Heat",
+      "type": "Pitching",
+      "abilityType": "General Draw",
+      "base": 3,
+      "desc": "+2 Value for each SQUARE\\u2194DIAMOND alternation in your chain."
+    }
+  ]
+}

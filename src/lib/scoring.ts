@@ -37,6 +37,16 @@ export interface ScoringContext {
   isFirstAtBatOfInning?: boolean;
   outs?: number;
   isFinalInning?: boolean;
+  /**
+   * Game mode the at-bat is being scored under. Currently used by Brawl
+   * Mode to remap effects whose original semantics don't fit the 15s
+   * snap timer or the HP-only resolution path -- e.g. Hit Scale cards
+   * (b-6 / b-18 / b-116 / b-117 / b-128 / b-134 / p-33) get a flat HP
+   * bonus instead of an irrelevant hit-ladder push, and coin-flip cards
+   * (b-22) settle on their average automatically. Undefined in tests
+   * and the standard game so the legacy effects remain untouched.
+   */
+  gameMode?: "draft" | "quick-match" | "szn" | "brawl";
   // Handedness of the at-bat batter, used by p-37 Cy Young Heat.
   batterHandedness?: "L" | "R" | "S";
   /**

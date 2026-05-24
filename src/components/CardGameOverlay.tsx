@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { Reorder, motion, AnimatePresence } from 'motion/react';
 import { CardDefinition } from '../lib/cards';
 import { canConnect, canConnectAny, shapeModeForSide, seamKey } from '../lib/connect';
-import { useGameStore, getUiUserSide, isLowLeverageAtBat, ResolutionBeat, RevealBeatAnimation, Phase } from '../lib/gameStore';
+import { useGameStore, getUiUserSide, isLowLeverageAtBat, ResolutionBeat, RevealBeatAnimation, Phase, BRAWL_SNAP_DURATION_MS as BRAWL_SNAP_DURATION_MS_STORE } from '../lib/gameStore';
 import { HitOutcome, type BrawlOutcomeResolution } from '../lib/scoring';
 import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
 import { SznEdgeHalf } from './SznEdgeHalf';
@@ -382,6 +382,11 @@ const CardItem = ({
   // cards (`isPlayerCard`) skip this branch entirely -- they render
   // their own portrait + team chrome.
   const sznMode = useGameStore((s) => s.gameMode === 'szn');
+  // Brawl Mode: replaces the hover-tooltip ability flow with an inline
+  // one-line `brawlTagline` rendered on the card face. The 15s snap
+  // timer leaves no room to hover-read multi-clause descriptions, so we
+  // also skip the tooltip wiring entirely when this is true.
+  const cardBrawlMode = useGameStore((s) => s.gameMode === 'brawl');
   const hideCardPlayer = sznMode && !isPlayerCard;
   // Normalized team + role lookup that works for BOTH player types:
   // SZN players carry `teamId` + `role`, legacy MLB players carry
@@ -608,6 +613,7 @@ const CardItem = ({
   }, [abilityHoverOpen, syncAbilityAnchor]);
 
   const abilityTooltip =
+    !cardBrawlMode &&
     abilityHoverOpen &&
     abilityAnchor &&
     typeof document !== 'undefined' &&
@@ -665,10 +671,10 @@ const CardItem = ({
         flex flex-col items-center justify-center
         ${readOnly ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'}
       `}
-        onPointerEnter={isPlayerCard ? undefined : openAbilityHover}
-        onPointerLeave={isPlayerCard ? undefined : scheduleCloseAbilityHover}
+        onPointerEnter={isPlayerCard || cardBrawlMode ? undefined : openAbilityHover}
+        onPointerLeave={isPlayerCard || cardBrawlMode ? undefined : scheduleCloseAbilityHover}
         onPointerMove={() => {
-          if (abilityHoverRef.current) syncAbilityAnchor();
+          if (!cardBrawlMode && abilityHoverRef.current) syncAbilityAnchor();
         }}
         animate={revealAnimate ?? baseAnimate}
         transition={revealAnimate ? revealTransition : baseTransition}
@@ -749,13 +755,39 @@ const CardItem = ({
               {rarityLabel(playerRarity)}
             </span>
           </div>
-          <div className="absolute left-0 right-0 z-30 flex justify-center" style={{ top: '36%' }}>
+          <div className="absolute left-0 right-0 z-30 flex flex-col items-center gap-0.5" style={{ top: '36%' }}>
             <span
               className={`${sz.nameText} font-black uppercase tracking-tight text-white leading-tight bg-black/40 rounded px-1.5 py-0.5 max-w-[88%] line-clamp-2 text-center`}
               style={{ textShadow: '0 1px 1px rgba(0,0,0,0.6)' }}
             >
               {card.name}
             </span>
+            {/* Brawl Mode tagline directly below the player-card name.
+                Both sizes wrap to 2 lines for the same readability
+                reason as the non-player card variant. */}
+            {cardBrawlMode && card.brawlTagline && (
+              <motion.span
+                key={`tagline-${highlightTone ?? 'idle'}`}
+                className={`${compact ? 'text-[7px] leading-[1.1]' : 'text-[9px] leading-[1.15]'} font-bold uppercase tracking-tight text-amber-900 bg-amber-200/95 rounded px-1 py-0.5 max-w-[92%] text-center border border-amber-400/60 shadow-sm line-clamp-2`}
+                animate={
+                  highlightTone === 'source'
+                    ? {
+                        backgroundColor: ['rgba(254,243,199,0.95)', 'rgba(250,204,21,0.98)', 'rgba(254,243,199,0.95)'],
+                        scale: [1, 1.18, 1.06],
+                        x: [0, -2, 2, -1, 1, 0],
+                        boxShadow: [
+                          '0 0 0 0 rgba(250,204,21,0)',
+                          '0 0 14px 4px rgba(250,204,21,0.85)',
+                          '0 0 4px 1px rgba(250,204,21,0.35)',
+                        ],
+                      }
+                    : { scale: 1, x: 0 }
+                }
+                transition={{ duration: 0.5, ease: 'easeOut' }}
+              >
+                {card.brawlTagline}
+              </motion.span>
+            )}
           </div>
           {/* "ON DECK" role pill so the user immediately reads the card as
               their active batter/pitcher and not just a portrait. The text
@@ -780,6 +812,43 @@ const CardItem = ({
           <div className={`${sz.nameText} leading-tight font-bold text-slate-700 uppercase tracking-wide bg-white/95 rounded px-1 py-0.5 line-clamp-2 text-center border border-slate-200 shadow-sm`} style={{ maxWidth: '70%' }}>
             {card.name}
           </div>
+          {/* Brawl Mode: replace the hover tooltip with an inline tagline
+              rendered directly on the card face. Both card sizes wrap to
+              2 lines because the 15s snap timer punishes any moment the
+              user spends squinting at a truncated ability -- letting the
+              chip overflow to a second line keeps every brawl tagline
+              fully readable. Clamp at 2 so a malformed long tagline can't
+              push the value text out of position. */}
+          {cardBrawlMode && card.brawlTagline && (
+            <motion.div
+              key={`tagline-${highlightTone ?? 'idle'}`}
+              className={`${compact ? 'text-[7px] leading-[1.1]' : 'text-[9px] leading-[1.15]'} mt-0.5 font-bold uppercase tracking-tight text-amber-900 bg-amber-200/95 rounded px-1 py-0.5 text-center border border-amber-400/60 shadow-sm line-clamp-2`}
+              style={{ maxWidth: '92%' }}
+              animate={
+                highlightTone === 'source'
+                  ? {
+                      // Brawl reveal: tagline IS the ability. Pulse it gold
+                      // + shake + glow when the source-card beat triggers so
+                      // the user reads "this is the card that just fired"
+                      // straight from the chip without needing the spotlight
+                      // overlay to spell it out. ~500ms run keeps the visual
+                      // beat-locked to the existing RevealBeatSpotlight tween.
+                      backgroundColor: ['rgba(254,243,199,0.95)', 'rgba(250,204,21,0.98)', 'rgba(254,243,199,0.95)'],
+                      scale: [1, 1.18, 1.06],
+                      x: [0, -2, 2, -1, 1, 0],
+                      boxShadow: [
+                        '0 0 0 0 rgba(250,204,21,0)',
+                        '0 0 14px 4px rgba(250,204,21,0.85)',
+                        '0 0 4px 1px rgba(250,204,21,0.35)',
+                      ],
+                    }
+                  : { scale: 1, x: 0 }
+              }
+              transition={{ duration: 0.5, ease: 'easeOut' }}
+            >
+              {card.brawlTagline}
+            </motion.div>
+          )}
         </div>
       )}
       {/* The value text used to be keyed by `displayValue`, which forced a
@@ -813,8 +882,10 @@ const CardItem = ({
   );
 };
 
-/** Brawl Mode snap window before auto-lock. Shared by timer + hint UI. */
-const BRAWL_SNAP_DURATION_MS = 15000;
+/** Brawl Mode snap window before auto-lock. Shared by timer + hint UI.
+ *  Re-exported from the store so the snap-speed HP bonus reads from
+ *  the exact same wall-clock budget. */
+const BRAWL_SNAP_DURATION_MS = BRAWL_SNAP_DURATION_MS_STORE;
 /** How often the AI re-optimizes its hand against the user's current layout. */
 const BRAWL_AI_REEVAL_MS = 2500;
 /** Delay between each opponent card shuffle / seam snap during selection. */
@@ -1919,6 +1990,13 @@ export const CardGameOverlay = () => {
           the same DOM rect. The overlay self-gates on `isRevealing`, so
           it's a true no-op during selection / between-at-bats. */}
       <RevealAttackOverlay active={isRevealing} currentAnimation={reveal.currentAnimation} />
+
+      {/* Brawl: half-inning summary flashcard. Fades in during the
+          2.1s side-switch window (`between-at-bats` after a half flip)
+          and reads the snapshotted highlights from the just-completed
+          half (W/L vs the AI, longest chain forged, peak hit). Cleared
+          on `startNextAtBat`. Self-gates so non-brawl modes never see it. */}
+      <BrawlInningSummaryOverlay />
 
       {/* Player hero rail: top slot = opponent (fog `?` only during selection),
           bottom = you (live total once that side has a committed layout). Pairs
@@ -3639,6 +3717,81 @@ const RevealBeatSpotlight = ({
         <p className="mt-4 max-w-[min(24rem,calc(100vw-2rem))] text-center text-[11px] font-semibold leading-snug text-slate-200 drop-shadow-lg">
           {caption}
         </p>
+      </motion.div>
+    </div>
+  );
+};
+
+/**
+ * Brawl Mode: per-half summary flashcard. Renders the user-side
+ * highlights of the just-completed half-inning (W/L vs AI, longest
+ * chain, peak hit outcome) as a centered card during the side-switch
+ * window. Reads `brawlInningSummary` from the store -- populated at
+ * lockIn when the half flips, cleared at startNextAtBat. Self-mutes
+ * when the slot is null OR we're outside brawl OR we're not in the
+ * `between-at-bats` pause, so non-brawl modes never see it.
+ *
+ * Auto-fades on a 2s tween (matches the 2.1s side-switch timer so the
+ * overlay exits just before the next at-bat deals in).
+ */
+const BrawlInningSummaryOverlay = () => {
+  const summary = useGameStore((s) => s.brawlInningSummary);
+  const gameMode = useGameStore((s) => s.gameMode);
+  const phase = useGameStore((s) => s.phase);
+  if (gameMode !== 'brawl') return null;
+  if (phase !== 'between-at-bats' && phase !== 'game-over') return null;
+  if (!summary) return null;
+  const halfLabel = summary.half === 'top' ? 'Top' : 'Bottom';
+  const wlNarrator =
+    summary.userWins > summary.userLosses
+      ? 'YOU TOOK THE INNING'
+      : summary.userWins < summary.userLosses
+        ? 'AI TOOK THE INNING'
+        : 'EVEN INNING';
+  const peakOutcomeCopy = summary.peakUserOutcome
+    ? summary.peakUserOutcome === 'homerun'
+      ? 'HOME RUN'
+      : summary.peakUserOutcome === 'triple'
+        ? 'TRIPLE'
+        : summary.peakUserOutcome === 'double'
+          ? 'DOUBLE'
+          : summary.peakUserOutcome === 'single'
+            ? 'SINGLE'
+            : 'OUT'
+    : 'NO HIT';
+  const chainLabel = summary.longestUserChain >= 2 ? `${summary.longestUserChain}-chain` : 'No chain';
+  return (
+    <div className="fixed inset-0 z-[33] pointer-events-none flex items-center justify-center px-4">
+      <motion.div
+        key={`brawl-summary-${summary.inning}-${summary.half}-${summary.userWins}-${summary.userLosses}`}
+        initial={{ opacity: 0, scale: 0.85, y: 24 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.92, y: 16 }}
+        transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
+        className="min-w-[300px] max-w-[420px] rounded-2xl border-2 border-amber-400/80 bg-slate-950/95 px-8 py-6 shadow-[0_8px_48px_rgba(0,0,0,0.6)] backdrop-blur-md"
+      >
+        <p className="text-center text-[10px] font-black uppercase tracking-[0.28em] text-amber-400 mb-1">
+          {summary.isGameEnd ? 'Final Inning Recap' : `${halfLabel} of ${summary.inning} -- Recap`}
+        </p>
+        <p className="text-center text-base font-black uppercase tracking-wider text-slate-100 mb-4">
+          {wlNarrator}
+        </p>
+        <div className="grid grid-cols-3 gap-3 text-center">
+          <div className="rounded-lg bg-slate-900/80 border border-slate-700/50 px-2 py-2">
+            <p className="text-[8px] font-black uppercase tracking-widest text-slate-400 mb-0.5">Record</p>
+            <p className="text-lg font-black tabular-nums text-slate-100">
+              {summary.userWins}<span className="text-slate-500">-</span>{summary.userLosses}
+            </p>
+          </div>
+          <div className="rounded-lg bg-slate-900/80 border border-slate-700/50 px-2 py-2">
+            <p className="text-[8px] font-black uppercase tracking-widest text-slate-400 mb-0.5">Best Chain</p>
+            <p className="text-lg font-black tabular-nums text-amber-300">{chainLabel}</p>
+          </div>
+          <div className="rounded-lg bg-slate-900/80 border border-slate-700/50 px-2 py-2">
+            <p className="text-[8px] font-black uppercase tracking-widest text-slate-400 mb-0.5">Peak Swing</p>
+            <p className="text-[11px] font-black uppercase tracking-tight text-emerald-300 leading-tight pt-1">{peakOutcomeCopy}</p>
+          </div>
+        </div>
       </motion.div>
     </div>
   );

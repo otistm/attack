@@ -108,11 +108,28 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   "b-5": () => NOOP,
 
   // b-6 50/50 Club: if you win the round, +5 to Hit Scale (typically upgrades the tier).
-  "b-6": () => r({ hitScaleBonus: 5 }),
+  // Brawl Mode: Hit Scale is ignored by `resolveBrawlOutcome` (HP-only), so
+  // this card would be dead weight inside the arena. Convert to a flat +3
+  // selfValueDelta when chained so the brawl tagline "+3 if chained" matches
+  // actual scoring behavior.
+  "b-6": (ctx) =>
+    ctx.gameMode === "brawl"
+      ? ctx.isCombined
+        ? r({ selfValueDelta: 3 })
+        : NOOP
+      : r({ hitScaleBonus: 5 }),
 
   // b-7 Soto Shuffle: information-only. Queues an opponentUncombined reveal
   // request (gameStore.derivePendingReveals) shown by InfoRevealOverlay.
-  "b-7": () => NOOP,
+  // Brawl: the reveal modal would interrupt the 15s snap timer, so we
+  // suppress the reveal (see derivePendingReveals) and grant a flat
+  // +3 if chained instead, matching the brawl tagline.
+  "b-7": (ctx) =>
+    ctx.gameMode === "brawl"
+      ? ctx.isCombined
+        ? r({ selfValueDelta: 3 })
+        : NOOP
+      : NOOP,
 
   // b-8 Elite Eye: +3 to highest UNCOMBINED card.
   "b-8": (ctx) => {
@@ -132,11 +149,23 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   "b-10": () => NOOP,
 
   // b-11 Chaos on the Basepaths: forced single if uncombined and you win.
-  "b-11": (ctx) => (!ctx.isCombined ? r({ forcedOutcome: "single" }) : NOOP),
+  // Brawl: hit ladders don't apply (HP-only). Convert to a flat +4 if solo
+  // matching the brawl tagline so the player still gets a power upside for
+  // leaving b-11 uncombined.
+  "b-11": (ctx) =>
+    ctx.gameMode === "brawl"
+      ? !ctx.isCombined
+        ? r({ selfValueDelta: 4 })
+        : NOOP
+      : !ctx.isCombined
+        ? r({ forcedOutcome: "single" })
+        : NOOP,
 
   // b-12 Switch Hitter: queues a pickShape choice in derivePendingChoices.
   // The chosen shape replaces the left shape of the lowest-value general in
   // the batter's hand (resolveChoice mutation).
+  // Brawl: the pickShape modal is suppressed in derivePendingChoices, so
+  // the card scores at base value only (tagline becomes a flavor read).
   "b-12": () => NOOP,
 
   // b-13 Leadoff Magic: +4 if first at-bat of inning.
@@ -184,7 +213,13 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // Scale is only consulted by `resolveHitScale` after the batter wins
   // head-to-head; a losing batter never reads the bonus, so we don't gate
   // on win here. Same pattern for b-66 and b-134 below.
-  "b-18": (ctx) => (ctx.isCombined ? r({ hitScaleBonus: 3 }) : NOOP),
+  // Brawl: Hit Scale is dead weight; deliver as a flat +4 selfValueDelta.
+  "b-18": (ctx) =>
+    ctx.isCombined
+      ? ctx.gameMode === "brawl"
+        ? r({ selfValueDelta: 4 })
+        : r({ hitScaleBonus: 3 })
+      : NOOP,
 
   // b-19 Philly Clutch: +5 if your team has 2 outs.
   "b-19": (ctx) => (ctx.outs === 2 ? r({ selfValueDelta: 5 }) : NOOP),
@@ -200,6 +235,9 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-21 The Pandemonium: destroys an opponent card. Handled in
   // handTransforms (Phase 2) by zeroing & noCombining the highest-value
   // pitcher general the round the batter holds b-21.
+  // Brawl: the destruction transform still fires at deal time, but the
+  // tagline reads "-2 their general" which translates to the destroyed
+  // card's value loss as visible HP swing — no extra effect needed here.
   "b-21": () => NOOP,
 
   // b-22 Power/Speed Threat: actual coin flip when combined. Heads = +5,
@@ -209,6 +247,12 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // keeps the matchup pill stable while the player arranges cards.
   "b-22": (ctx) => {
     if (!ctx.isCombined) return NOOP;
+    // Brawl Mode: the snap timer leaves no room for a per-at-bat coin
+    // flip animation, so the card settles on its expected-value reward
+    // (+3) deterministically. Matches the brawl tagline "+3 if chained".
+    if (ctx.gameMode === "brawl") {
+      return r({ selfValueDelta: 3, log: ["b-22 brawl avg +3"] });
+    }
     const flip = ctx.coinFlips?.["b-22"];
     if (flip === "heads") return r({ selfValueDelta: 5, log: ["b-22 coin flip HEADS +5"] });
     if (flip === "tails") return r({ selfValueDelta: 1, log: ["b-22 coin flip TAILS +1"] });
@@ -280,7 +324,10 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // "If the Batter wins, subtract 3 from the Batter's score" was
   // functionally identical to the new "shrinks the Batter's hit" text
   // -- both describe the same downstream behaviour.
-  "p-33": () => r({ hitScaleBonus: 3, log: ["p-33 shrinks batter hit by 3 (Hit Scale wall)"] }),
+  "p-33": (ctx) =>
+    ctx.gameMode === "brawl"
+      ? r({ selfValueDelta: 3, log: ["p-33 brawl: +3 to pitcher HP wall"] })
+      : r({ hitScaleBonus: 3, log: ["p-33 shrinks batter hit by 3 (Hit Scale wall)"] }),
 
   // p-34 Cole Train: +3 if combined on the right side.
   "p-34": (ctx) => {
@@ -364,7 +411,14 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
 
   // p-51 Veteran Savvy: information-only. Queues an opponentHand reveal
   // request shown by InfoRevealOverlay.
-  "p-51": () => NOOP,
+  // Brawl: reveal modal suppressed in derivePendingReveals; we give a
+  // flat +3 if chained so the brawl tagline reflects real behavior.
+  "p-51": (ctx) =>
+    ctx.gameMode === "brawl"
+      ? ctx.isCombined
+        ? r({ selfValueDelta: 3 })
+        : NOOP
+      : NOOP,
 
   // p-52 Sweeper (Ohtani Pitching): if uncombined, batter's highest gets -3.
   // Description names the batter's highest as the target -- attribute the
@@ -404,13 +458,27 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     const oppResult = scoreHand(ctx.opponentHand, oppCtx);
     const oppMax = Math.max(0, oppResult.maxValue);
     const card = ctx.group[ctx.indexInGroup];
-    return r({ selfValueDelta: oppMax - card.baseValue });
+    let delta = oppMax - card.baseValue;
+    // Brawl cap: an unbounded copy effect can swing HP by ±20 in a single
+    // card, which dwarfs every other tagline. Cap the spike at +8 over
+    // base so p-53 stays exciting but not match-deciding inside a 3-inning
+    // arena. Sub-baseValue (negative delta) is still allowed -- if the
+    // batter is laying low, the splitter follows them down.
+    if (ctx.gameMode === "brawl" && delta > 8) delta = 8;
+    return r({ selfValueDelta: delta });
   },
 
   // p-54 Dual Threat: draw an extra pitching general at deal time. Handled
   // in dealEffects -- always taken since extra cards are pure upside for the
   // pitcher.
-  "p-54": () => NOOP,
+  // Brawl: extra-draw transform suppressed (hands are already tight at 5);
+  // grant +2 if solo as a flat replacement matching the brawl tagline.
+  "p-54": (ctx) =>
+    ctx.gameMode === "brawl"
+      ? !ctx.isCombined
+        ? r({ selfValueDelta: 2 })
+        : NOOP
+      : NOOP,
 
   // p-55 Rainbow Curve: +3 if combined on the left side.
   "p-55": (ctx) => (ctx.indexInGroup > 0 ? r({ selfValueDelta: 3 }) : NOOP),
@@ -418,7 +486,14 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // p-56 Pinpoint Control: queues a pickShape choice in derivePendingChoices.
   // The chosen shape replaces p-56's own right shape so it can match a drawn
   // general's left shape (resolveChoice mutation).
-  "p-56": () => NOOP,
+  // Brawl: pickShape modal suppressed in derivePendingChoices; give a flat
+  // +3 if chained to match the brawl tagline.
+  "p-56": (ctx) =>
+    ctx.gameMode === "brawl"
+      ? ctx.isCombined
+        ? r({ selfValueDelta: 3 })
+        : NOOP
+      : NOOP,
 
   // p-57 The Japanese Ace: +4 if batter uses no combinations.
   "p-57": (ctx) => {
@@ -429,11 +504,45 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   },
 
   // p-58 Strikeout Artist: future-batter debuff if win by >5 (resolve-step).
-  "p-58": () => NOOP,
+  // Brawl: the "next batter starts at -2" carryover is meaningless inside
+  // a 3-inning arena (the matchup is HP only). The tagline "+3 if win by
+  // 6+" is implemented as a flat selfValueDelta only when the pitcher's
+  // current locked total leads the batter's by 6+ via the opponent hand
+  // (preview during selection); when no preview is available we no-op.
+  "p-58": (ctx) => {
+    if (ctx.gameMode !== "brawl") return NOOP;
+    if (!ctx.opponentHand) return NOOP;
+    // Best-effort: re-score the opponent (batter) hand under their own
+    // seam set and compare to our current group total. Recursion safe:
+    // p-58 doesn't appear in batter hands.
+    const oppCtx: ScoringContext = {
+      ...ctx,
+      side: "Batting",
+      opponentHand: ctx.hand,
+      opponentBaseCard: highestValueCard(ctx.hand) ?? null,
+      affirmedSeams: ctx.opponentAffirmedSeams ?? null,
+      opponentAffirmedSeams: ctx.affirmedSeams ?? null,
+      nullifiedCardIds: undefined,
+      nullifyOpponentBaseMechanic: undefined,
+      nullifyOpponentTagMechanics: undefined,
+    };
+    const oppResult = scoreHand(ctx.opponentHand, oppCtx);
+    const myGroupTotal = ctx.group.reduce((sum, c) => sum + c.baseValue, 0);
+    return myGroupTotal - oppResult.maxValue >= 6
+      ? r({ selfValueDelta: 3 })
+      : NOOP;
+  },
 
   // p-59 Nasty Slider: information-only. Queues an opponentLayout reveal
   // request shown by InfoRevealOverlay.
-  "p-59": () => NOOP,
+  // Brawl: reveal suppressed; grant a flat +3 if chained to match the
+  // brawl tagline.
+  "p-59": (ctx) =>
+    ctx.gameMode === "brawl"
+      ? ctx.isCombined
+        ? r({ selfValueDelta: 3 })
+        : NOOP
+      : NOOP,
 
   // p-60 Filthy Stuff: -1 to batter's score for every card they play (hand-level).
 
@@ -744,9 +853,11 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
 
   // b-95 Late Innings Hero: +4 Value in the 7th inning or later. Mirrors
   // b-13 Leadoff Magic on the opposite axis -- early-inning Magic vs late-
-  // inning Heroics. Total innings is small (typically 9), so this isn't a
-  // free buff -- it requires the at-bat to actually land in the late game.
-  "b-95": (ctx) => ((ctx.inning ?? 0) >= 7 ? r({ selfValueDelta: 4 }) : NOOP),
+  // inning Heroics. The `isFinalInning` fallback covers Brawl Mode (3-inning
+  // arena) where "the late game" lands in inning 3, so the brawl tagline
+  // "+4 in inning 3" stays honest without forking the effect.
+  "b-95": (ctx) =>
+    (ctx.inning ?? 0) >= 7 || ctx.isFinalInning ? r({ selfValueDelta: 4 }) : NOOP,
 
   // b-96 Home Cookin': +2 Value during the bottom half of the inning (the
   // home team's at-bat). Modest but reliable in any "home" matchup.
@@ -769,8 +880,10 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
 
   // p-94 Closer Mode: +3 Value in the 8th inning or later. Same shape as
   // b-95 but pitcher-side and one inning later, since closers usually enter
-  // 8th-9th specifically.
-  "p-94": (ctx) => ((ctx.inning ?? 0) >= 8 ? r({ selfValueDelta: 3 }) : NOOP),
+  // 8th-9th specifically. `isFinalInning` fallback covers Brawl Mode (3 inn)
+  // so the brawl tagline "+3 in inning 3" stays honest.
+  "p-94": (ctx) =>
+    (ctx.inning ?? 0) >= 8 || ctx.isFinalInning ? r({ selfValueDelta: 3 }) : NOOP,
 
   // ============ PHASE 7 BATTER EXPANSION (b-100..b-135) ============
 
@@ -839,8 +952,11 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // gameStore.scorePitcher). Self hook is a no-op like b-105.
   "b-108": () => NOOP,
 
-  // b-109 World Series MVP: +3 in the 4th inning or later.
-  "b-109": (ctx) => ((ctx.inning ?? 0) >= 4 ? r({ selfValueDelta: 3 }) : NOOP),
+  // b-109 World Series MVP: +3 in the 4th inning or later. The
+  // `isFinalInning` fallback covers Brawl Mode (3-inning arena) where
+  // there IS no 4th inning, matching the brawl tagline "+3 in inning 3".
+  "b-109": (ctx) =>
+    (ctx.inning ?? 0) >= 4 || ctx.isFinalInning ? r({ selfValueDelta: 3 }) : NOOP,
 
   // b-110 Smooth Stroke: +4 if combined on the LEFT side. Mirror of b-26
   // Shortstop Slap which fires on the right side.
@@ -889,11 +1005,24 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   },
 
   // b-116 HR Derby Champ: +3 to Hit Scale on combine alone (no win check).
-  "b-116": (ctx) => (ctx.isCombined ? r({ hitScaleBonus: 3 }) : NOOP),
+  "b-116": (ctx) =>
+    ctx.isCombined
+      ? ctx.gameMode === "brawl"
+        ? r({ selfValueDelta: 3 })
+        : r({ hitScaleBonus: 3 })
+      : NOOP,
 
   // b-117 Citi Bomb: +2 Value AND +2 Hit Scale on combine. Dual-buff.
-  "b-117": (ctx) =>
-    ctx.isCombined ? r({ selfValueDelta: 2, hitScaleBonus: 2 }) : NOOP,
+  // Brawl: Hit Scale axis is ignored by `resolveBrawlOutcome`, so the +2
+  // hitScale is wasted -- swap it for an extra +2 selfValueDelta so the
+  // brawl tagline "+2 if chained" still pays out the full intended kick
+  // (total +4 HP on chain vs +2 stand-alone).
+  "b-117": (ctx) => {
+    if (!ctx.isCombined) return NOOP;
+    return ctx.gameMode === "brawl"
+      ? r({ selfValueDelta: 4 })
+      : r({ selfValueDelta: 2, hitScaleBonus: 2 });
+  },
 
   // b-118 Track Star: +5 if no combinations this round (mirror of p-46
   // Pure Gas on the batter side).
@@ -909,7 +1038,14 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
 
   // b-120 Steal Home: runner-advance boost handled by resolveStep. Per-card
   // hook is a no-op -- the bonus only fires after the at-bat resolves.
-  "b-120": () => NOOP,
+  // Brawl: extra-bases payout is meaningless in HP-only resolution; grant
+  // a flat +3 if chained so the brawl tagline pays out as Visible HP.
+  "b-120": (ctx) =>
+    ctx.gameMode === "brawl"
+      ? ctx.isCombined
+        ? r({ selfValueDelta: 3 })
+        : NOOP
+      : NOOP,
 
   // b-121 Catcher's Eye: information-only. derivePendingReveals queues a
   // signatureShapes reveal for the batter side.
@@ -960,10 +1096,15 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-128 Switch-Cap: +2 Value AND +2 Hit Scale if pitcher is LEFTY.
   // "Pitcher is LEFTY" -> opponent hand has a lefty-tagged card. Same read
   // as b-79 Lefty Killer.
-  "b-128": (ctx) =>
-    handHasTag(ctx.opponentHand ?? [], "lefty")
-      ? r({ selfValueDelta: 2, hitScaleBonus: 2 })
-      : NOOP,
+  "b-128": (ctx) => {
+    if (!handHasTag(ctx.opponentHand ?? [], "lefty")) return NOOP;
+    // Brawl: Hit Scale axis is ignored in HP-only resolution; fold the
+    // +2 Hit Scale into selfValueDelta so brawl plays the tagline at full
+    // strength as visible HP swing.
+    return ctx.gameMode === "brawl"
+      ? r({ selfValueDelta: 4 })
+      : r({ selfValueDelta: 2, hitScaleBonus: 2 });
+  },
 
   // b-129 Captain Lindor: +1 to every uncombined card you leave. Same
   // attribution trick as b-123 -- credit the buff onto b-129 itself so the
@@ -1004,11 +1145,26 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-134 Bronx Hustle: +5 Hit Scale if uncombined. The "and you win" gate
   // is implicit in the Hit Scale ladder (it only fires when the batter
   // wins head-to-head), so we don't need a separate win check.
-  "b-134": (ctx) => (!ctx.isCombined ? r({ hitScaleBonus: 5 }) : NOOP),
+  // Brawl: convert Hit Scale to a flat +3 selfValueDelta so the brawl
+  // tagline "+3 if solo" pays out as visible HP.
+  "b-134": (ctx) => {
+    if (ctx.isCombined) return NOOP;
+    return ctx.gameMode === "brawl"
+      ? r({ selfValueDelta: 3 })
+      : r({ hitScaleBonus: 5 });
+  },
 
   // b-135 Stolen Bag: extra runner placed in resolveStep. Per-card hook
   // stays a no-op.
-  "b-135": () => NOOP,
+  // Brawl: extra-runner payout is meaningless in HP-only resolution; grant
+  // a flat +3 if chained (a reliable swing alongside the win-bonus flavor
+  // of the original card) to match the brawl tagline.
+  "b-135": (ctx) =>
+    ctx.gameMode === "brawl"
+      ? ctx.isCombined
+        ? r({ selfValueDelta: 3 })
+        : NOOP
+      : NOOP,
 
   // ============ Phase A puzzle-card expansion (b-81..b-88, p-95, p-96) ============
   //
