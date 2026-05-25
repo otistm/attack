@@ -1903,6 +1903,7 @@ export const CardGameOverlay = () => {
       const t = setTimeout(() => {
         const s = useGameStore.getState();
         if (s.phase !== 'selecting') return;
+        if (s.gameMode === 'brawl' && s.brawlDraftChoice !== null) return;
         const burstArmed =
           s.resolveInningTarget !== null && s.resolveInningTarget === s.inning;
         if (!s.quickResolveEnabled && !burstArmed) return;

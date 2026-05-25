@@ -2982,6 +2982,13 @@ export const useGameStore = create<GameState>((set, get) => ({
   lockIn: () => {
     const sBefore = get();
     if (sBefore.phase !== "selecting") return;
+    // Brawl inning-start draft: the snap timer is unmounted while the
+    // picker is up, but quick-resolve / gamepad paths can still call
+    // lockIn. Resolving under the draft leaves `brawlDraftChoice` set
+    // and traps the player on a blank dark scrim at the next inning.
+    if (sBefore.gameMode === "brawl" && sBefore.brawlDraftChoice !== null) {
+      return;
+    }
     // Tutorial gate: while the walkthrough is active, lockIn is a no-op
     // EXCEPT on the very last step (the interactive "Press Lock In" beat).
     // On that step, lockIn implicitly dismisses the tutorial and then
@@ -3671,8 +3678,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       const afterSet = get();
       if (
         afterSet.inning > afterSet.brawlDraftedInning &&
-        afterSet.inning <= afterSet.totalInnings &&
-        afterSet.brawlDraftChoice === null
+        afterSet.inning <= afterSet.totalInnings
       ) {
         const draft = buildBrawlDraftChoice(afterSet.inning, afterSet.brawlUserPool);
         if (draft) {

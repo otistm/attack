@@ -40,6 +40,7 @@ import { CardItem } from "../CardGameOverlay";
  */
 export function BrawlDraftOverlay() {
   const gameMode = useGameStore((s) => s.gameMode);
+  const phase = useGameStore((s) => s.phase);
   const draft = useGameStore((s) => s.brawlDraftChoice);
   const selectBrawlDraftCard = useGameStore((s) => s.selectBrawlDraftCard);
   const [pickedId, setPickedId] = useState<string | null>(null);
@@ -67,7 +68,7 @@ export function BrawlDraftOverlay() {
   // No extra reset hook needed.
   return (
     <AnimatePresence>
-      {gameMode === "brawl" && draft ? (
+      {gameMode === "brawl" && phase === "selecting" && draft ? (
         <motion.div
           key={`brawl-draft-${draft.inning}`}
           initial={{ opacity: 0 }}

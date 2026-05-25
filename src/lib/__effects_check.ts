@@ -5006,6 +5006,22 @@ import { BATTERS, PITCHERS, PLAYERS } from "./players";
     "Brawl: opponent pool grows to 16 after inning-1 silent draft",
     s.brawlOpponentPool.length,
   );
+  assert(
+    s.brawlDraftChoice !== null,
+    "Brawl: inning-1 draft opens at start",
+  );
+  const atBatBeforeDraft = s.atBatId;
+  store.lockIn();
+  assert(
+    useGameStore.getState().atBatId === atBatBeforeDraft &&
+      useGameStore.getState().phase === "selecting" &&
+      useGameStore.getState().brawlDraftChoice !== null,
+    "Brawl: lockIn is a no-op while brawlDraftChoice is set",
+    {
+      atBatId: useGameStore.getState().atBatId,
+      phase: useGameStore.getState().phase,
+    },
+  );
   if (s.brawlDraftChoice) {
     store.selectBrawlDraftCard(s.brawlDraftChoice.cardIds[0]);
   }
