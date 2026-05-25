@@ -19,6 +19,7 @@ import { BrawlRulesScreen } from './components/BrawlRulesScreen';
 import { RunHud } from './components/RunHud';
 import { SznFooterDecks } from './components/SznFooterDecks';
 import { PurchaseFlightOverlay } from './components/PurchaseFlightOverlay';
+import { BrawlAmbience } from './components/BrawlAmbience';
 import { useGameStore } from './lib/gameStore';
 
 export default function App() {
@@ -71,6 +72,7 @@ export default function App() {
           <Scene />
         </div>
       )}
+      <BrawlAmbience />
       <UIOverlay />
       {/* SZN Mode HUD strip. Self-gates on gameMode === "szn". */}
       <RunHud />

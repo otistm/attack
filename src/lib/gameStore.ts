@@ -47,6 +47,7 @@ import {
   mergeQuestReward,
   QUEST_REWARD_INITIAL,
 } from "./questRewards";
+import { playCardSnap, startStadiumAmbience } from "./gameAudio";
 import { playSfx } from "./sfx";
 import {
   emptyRunState,
@@ -882,7 +883,7 @@ export interface GameState {
    * generals from on every brawl deal. Set at `startBrawl` by sampling
    * the global brawl general pool with a balanced batting/pitching
    * split, then grown by one card per inning when the user picks at
-   * the Concessions / Bathroom Break / Home Stretch overlay. The
+   * the Bathroom Break / Home Stretch overlay (innings 2–3). The
    * OPPONENT mirrors the same constraint via `brawlOpponentPool` so
    * the two sides build a deck of the same size from the same roster.
    * Empty outside brawl mode; treated as "no restriction" so legacy
@@ -915,8 +916,8 @@ export interface GameState {
 
   /**
    * Brawl-only: highest inning the user has already resolved a draft
-   * for. Starts at 0 in `startBrawl` (the inning-1 draft fires right
-   * away), then bumps each time the user picks. `startNextAtBat`
+   * for. Starts at 0; bumps to 2 or 3 when the user picks at the
+   * inning-2 / inning-3 draft overlays. `startNextAtBat`
    * compares this against the current inning to decide whether to
    * open a fresh draft for inning 2 / 3. Stops at `totalInnings` so
    * extras (if they ever ship) never trigger an off-script draft.
@@ -1695,7 +1696,7 @@ function chainBonusFor(chainLen: number): number {
 /**
  * Brawl Mode pool sizing. Both sides start the brawl with this many
  * general-draw cards available to them; each inning adds one more
- * (Concessions / Bathroom Break / Home Stretch on the user side, a
+ * (Bathroom Break / Home Stretch on the user side, a
  * silent random pick on the AI side), so by the bottom of inning 3
  * both pools have 18 cards. The same `buildInitialBrawlUserPool`
  * helper seeds each pool independently so the two decks tend to
@@ -1711,15 +1712,48 @@ const BRAWL_USER_POOL_MIN_PITCHING = 7;
 const BRAWL_DRAFT_OPTIONS_PER_INNING = 3;
 
 /**
- * Inning-titled labels for the per-inning brawl draft overlay. The
- * UI reads this map by inning number (1..3); other innings fall back
- * to a generic label so the overlay never renders without one.
+ * Inning-titled labels for the brawl draft overlay (innings 2 and 3 only).
+ * Inning 1 uses the fixed 15-card starter pool with no picker.
  */
 export const BRAWL_DRAFT_TITLES: Record<number, string> = {
-  1: "Concessions",
   2: "Bathroom Break",
   3: "Home Stretch",
 };
+
+/** User-facing draft overlay only opens for regulation innings 2 and 3. */
+function brawlInningOffersUserDraft(inning: number, totalInnings: number): boolean {
+  return inning >= 2 && inning <= totalInnings;
+}
+
+/**
+ * Open the Bathroom Break / Home Stretch picker when entering innings 2 or 3.
+ * Returns a partial patch (draft slate + deferred snap anchor + silent AI pick)
+ * or `null` when no draft is due.
+ */
+function brawlInningDraftPatch(state: GameState): Partial<GameState> | null {
+  if (state.gameMode !== "brawl") return null;
+  if (state.brawlDraftChoice !== null) return null;
+  if (
+    !brawlInningOffersUserDraft(state.inning, state.totalInnings) ||
+    state.inning <= state.brawlDraftedInning
+  ) {
+    return null;
+  }
+  const draft = buildBrawlDraftChoice(state.inning, state.brawlUserPool);
+  if (!draft) return null;
+  const patch: Partial<GameState> = {
+    brawlDraftChoice: draft,
+    brawlSnapStartedAt: null,
+  };
+  const opponentPick = pickBrawlOpponentDraftCard(
+    state.brawlOpponentPool,
+    state.inning,
+  );
+  if (opponentPick && !state.brawlOpponentPool.includes(opponentPick)) {
+    patch.brawlOpponentPool = [...state.brawlOpponentPool, opponentPick];
+  }
+  return patch;
+}
 
 /**
  * Builds the initial 15-card user pool for a fresh brawl. Pulls from
@@ -2226,7 +2260,7 @@ function freshAtBat(opts: FreshAtBatOptions = {}): FreshAtBat {
   // still send full bag hands the legacy way).
   //
   // Brawl: both seats deal from their own curated pool. The USER's
-  // pool grows via the inning-start Concessions/Bathroom Break/Home
+  // pool grows via inning-2/3 Bathroom Break / Home Stretch drafts;
   // Stretch drafts; the OPPONENT's pool grows in parallel via silent
   // AI picks resolved at the same beats. Either pool being empty /
   // undefined means "no restriction" -- this falls back to the full
@@ -2722,6 +2756,14 @@ export const useGameStore = create<GameState>((set, get) => ({
         const me = hand[idx];
         const right = hand[idx + 1];
         if (canConnectAny(me, right)) next.add(seamKey(me.id, right.id));
+      }
+      if (s.gameMode === "brawl") {
+        for (const key of next) {
+          if (!s.affirmedSeams.has(key)) {
+            playCardSnap();
+            break;
+          }
+        }
       }
       return { affirmedSeams: next };
     }),
@@ -3533,6 +3575,17 @@ export const useGameStore = create<GameState>((set, get) => ({
           }
         : {}),
     });
+    // Brawl: when the inning counter advances (bottom of 2nd -> top of 3rd,
+    // etc.), surface the draft picker during the side-switch pause so the
+    // player is not waiting on `startNextAtBat` / the 2.1s auto-deal timer.
+    if (
+      s.gameMode === "brawl" &&
+      scoreboardPatch &&
+      scoreboardPatch.inning > s.inning
+    ) {
+      const draftPatch = brawlInningDraftPatch(get());
+      if (draftPatch) set(draftPatch);
+    }
     // Brawl: after side retired the half flips and the user's seat swaps,
     // but hands were still the prior half's deal until the player tapped
     // Next At-Bat. If they entered the snap phase on those stale cards
@@ -3637,15 +3690,12 @@ export const useGameStore = create<GameState>((set, get) => ({
       // selecting so the snap-bonus reads the same window the user
       // actually had to think. Null outside brawl so the field never
       // leaks into other lanes. When a new inning has just rolled
-      // over AND the user hasn't drafted for it yet, we DEFER the
-      // anchor until they pick at the draft overlay (mirrors the
-      // `startBrawl` deferral for inning 1). The check below keys
-      // off the LIVE state because the next code block may overwrite
-      // brawlDraftChoice for the new inning.
+      // over AND the user hasn't drafted for it yet (innings 2–3 only),
+      // we DEFER the anchor until they pick at the draft overlay.
       brawlSnapStartedAt:
         isBrawl &&
-        s.inning > s.brawlDraftedInning &&
-        s.inning <= s.totalInnings
+        brawlInningOffersUserDraft(s.inning, s.totalInnings) &&
+        s.inning > s.brawlDraftedInning
           ? null
           : isBrawl
             ? Date.now()
@@ -3669,40 +3719,18 @@ export const useGameStore = create<GameState>((set, get) => ({
       questLegendaryCelebratePulse: false,
     });
     if (get().gameMode === "brawl") {
-      // If the inning just rolled forward into 2 or 3, open the
-      // Bathroom Break / Home Stretch draft overlay. We read the
-      // POST-set state so the inning value reflects whatever
-      // applyOutcome just stamped. The draft only fires when the
-      // user hasn't already picked for this inning AND we're still
-      // in regulation (extras would never trigger one).
       const afterSet = get();
-      if (
-        afterSet.inning > afterSet.brawlDraftedInning &&
-        afterSet.inning <= afterSet.totalInnings
+      const draftPatch = brawlInningDraftPatch(afterSet);
+      if (draftPatch) {
+        set(draftPatch);
+      } else if (
+        afterSet.brawlSnapStartedAt == null &&
+        brawlInningOffersUserDraft(afterSet.inning, afterSet.totalInnings) &&
+        afterSet.inning > afterSet.brawlDraftedInning
       ) {
-        const draft = buildBrawlDraftChoice(afterSet.inning, afterSet.brawlUserPool);
-        if (draft) {
-          set({ brawlDraftChoice: draft });
-        } else if (afterSet.brawlSnapStartedAt == null) {
-          // Degenerate pool edge case: no draft overlay, so start the
-          // snap timer immediately instead of soft-locking selecting.
-          set({ brawlSnapStartedAt: Date.now() });
-        }
-        // Resolve the AI's silent inning draft in lock-step with the
-        // user's. The pool grows by exactly one card per inning on
-        // both sides; the AI picks at random from a fresh 3-card
-        // slate (same `buildBrawlDraftChoice` exclusion the user
-        // overlay shows) so the opponent never gets to skim the top
-        // of the entire roster.
-        const opponentPick = pickBrawlOpponentDraftCard(
-          afterSet.brawlOpponentPool,
-          afterSet.inning,
-        );
-        if (opponentPick && !afterSet.brawlOpponentPool.includes(opponentPick)) {
-          set({
-            brawlOpponentPool: [...afterSet.brawlOpponentPool, opponentPick],
-          });
-        }
+        // Degenerate pool edge case: no draft overlay, so start the
+        // snap timer immediately instead of soft-locking selecting.
+        set({ brawlSnapStartedAt: Date.now() });
       }
       const prep = computeBrawlOpponentPrep(get());
       if (prep) set(prep);
@@ -3725,6 +3753,10 @@ export const useGameStore = create<GameState>((set, get) => ({
     // smuggle in an arbitrary card.
     if (!s.brawlDraftChoice.cardIds.includes(cardId)) return;
     const inning = s.brawlDraftChoice.inning;
+    // Never let a mis-tagged draft inning leap ahead of the live
+    // scoreboard (e.g. inning 3 stamped during inning 2 would block
+    // the real Home Stretch picker at the top of the 3rd).
+    const draftedMark = Math.min(inning, s.inning);
     // Append rather than replace -- the user's pool grows by one
     // card per inning, never shrinks. De-dup just in case the same
     // ID somehow landed twice (the overlay sources from
@@ -3737,7 +3769,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     set({
       brawlUserPool: nextPool,
       brawlDraftChoice: null,
-      brawlDraftedInning: Math.max(s.brawlDraftedInning, inning),
+      brawlDraftedInning: Math.max(s.brawlDraftedInning, draftedMark),
       // Re-anchor the snap timer to NOW so the user gets the full
       // 15-second window starting from when the field becomes
       // interactive. Pickers spend wildly different amounts of time
@@ -4074,27 +4106,13 @@ export const useGameStore = create<GameState>((set, get) => ({
     // Office surface or a previous quick match's inventory.
     get().startQuickMatch(team);
     const s = get();
-    // Seed the brawl-only USER pool: 15 IDs across both roles. Stays
-    // immutable through inning 1's first at-bat (we deal the user's
-    // hand against this pool) and grows by one card per inning via
-    // the Concessions / Bathroom Break / Home Stretch drafts.
+    // Seed the brawl-only USER pool: 15 IDs across both roles. Grows
+    // by one card at the start of innings 2 and 3 (Bathroom Break /
+    // Home Stretch drafts). Inning 1 has no picker.
     const userPool = buildInitialBrawlUserPool();
-    // Seed the parallel OPPONENT pool with the same shape -- 15 IDs,
-    // 7-batting/7-pitching floor, random fill. Sampled independently
-    // so the two decks tend to differ (both pools are random walks
-    // over the same 64-card source, with no shared seed).
-    const opponentInitial = buildInitialBrawlUserPool();
-    // Resolve the AI's inning-1 silent draft up front so the AI's
-    // pool reaches 16 in lock-step with the user (whose user-side
-    // overlay opens before the first snap). Random pick from a fresh
-    // 3-card slate keeps the meta symmetric.
-    const opponentDraftPickInning1 = pickBrawlOpponentDraftCard(
-      opponentInitial,
-      1,
-    );
-    const opponentPool = opponentDraftPickInning1
-      ? [...opponentInitial, opponentDraftPickInning1]
-      : opponentInitial;
+    // Parallel opponent pool: same 15-card starter; +1 each time the
+    // user drafts at innings 2 and 3 (silent AI pick in lock-step).
+    const opponentPool = buildInitialBrawlUserPool();
     // Re-deal hands using the brawl-only general pool so the curated
     // tagline cards are the only generals that can appear. Without
     // this, the player would see the full-game generals (Hit Scale
@@ -4110,11 +4128,6 @@ export const useGameStore = create<GameState>((set, get) => ({
       brawlOpponentPool: opponentPool,
       brawlUserSide: userSide,
     });
-    // Build the inning-1 ("Concessions") draft up-front so the
-    // overlay can render the moment the brawl scene boots. The
-    // snap-timer is held in stasis until the user picks (see
-    // `selectBrawlDraftCard`).
-    const draft = buildBrawlDraftChoice(1, userPool);
     set({
       gameMode: "brawl",
       phase: "selecting",
@@ -4122,15 +4135,10 @@ export const useGameStore = create<GameState>((set, get) => ({
       showBrawlRules: false,
       batterHand: brawlAb.batterHand,
       pitcherHand: brawlAb.pitcherHand,
-      // Don't anchor the snap timer yet -- the draft overlay is up
-      // and the snap-bonus math reads `Date.now() - brawlSnapStartedAt`.
-      // `selectBrawlDraftCard` stamps the anchor when the user picks
-      // so the 15s window starts the instant the field becomes
-      // interactive.
-      brawlSnapStartedAt: null,
+      brawlSnapStartedAt: Date.now(),
       brawlUserPool: userPool,
       brawlOpponentPool: opponentPool,
-      brawlDraftChoice: draft,
+      brawlDraftChoice: null,
       brawlDraftedInning: 0,
       // Clear all brawl-only rolling state when starting a brand new
       // brawl. Streak counters / inning-summary slots persisted from a
@@ -4163,6 +4171,10 @@ export const useGameStore = create<GameState>((set, get) => ({
     });
     const prep = computeBrawlOpponentPrep(get());
     if (prep) set(prep);
+    // Start inside the Continue / New Game click handler so the browser
+    // still treats `play()` as user-initiated. The BrawlAmbience effect
+    // runs after paint and is often blocked by autoplay policy.
+    startStadiumAmbience();
   },
 
   // =========================================================================

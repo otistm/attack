@@ -4998,37 +4998,30 @@ import { BATTERS, PITCHERS, PLAYERS } from "./players";
     "Brawl: user pool seeds at 15",
     s.brawlUserPool.length,
   );
-  // Opponent pool already +1 from inning-1 silent draft resolved inside
-  // startBrawl. The user-side draft is still pending until the overlay
-  // picks; resolve it here so both pools land at 16.
   assert(
-    s.brawlOpponentPool.length === 16,
-    "Brawl: opponent pool grows to 16 after inning-1 silent draft",
+    s.brawlOpponentPool.length === 15,
+    "Brawl: opponent pool seeds at 15 (no inning-1 draft)",
     s.brawlOpponentPool.length,
   );
   assert(
-    s.brawlDraftChoice !== null,
-    "Brawl: inning-1 draft opens at start",
+    s.brawlDraftChoice === null,
+    "Brawl: no draft overlay at game start",
   );
-  const atBatBeforeDraft = s.atBatId;
+  assert(
+    s.brawlSnapStartedAt !== null,
+    "Brawl: snap timer starts immediately at game start",
+  );
   store.lockIn();
   assert(
-    useGameStore.getState().atBatId === atBatBeforeDraft &&
-      useGameStore.getState().phase === "selecting" &&
-      useGameStore.getState().brawlDraftChoice !== null,
-    "Brawl: lockIn is a no-op while brawlDraftChoice is set",
-    {
-      atBatId: useGameStore.getState().atBatId,
-      phase: useGameStore.getState().phase,
-    },
+    useGameStore.getState().phase === "revealing" &&
+      useGameStore.getState().brawlDraftChoice === null,
+    "Brawl: lockIn runs at game start without a draft gate",
+    { phase: useGameStore.getState().phase },
   );
-  if (s.brawlDraftChoice) {
-    store.selectBrawlDraftCard(s.brawlDraftChoice.cardIds[0]);
-  }
   s = useGameStore.getState();
   assert(
-    s.brawlUserPool.length === 16,
-    "Brawl: user pool grows to 16 after inning-1 draft pick",
+    s.brawlUserPool.length === 15,
+    "Brawl: user pool stays at 15 through inning 1",
     s.brawlUserPool.length,
   );
   // Both pools must be subsets of BRAWL_GENERAL_POOL so dealHand's
@@ -5073,6 +5066,53 @@ import { BATTERS, PITCHERS, PLAYERS } from "./players";
     generalsOutOfUnion.length === 0,
     "Brawl: every dealt general lives in one of the two seat pools",
     generalsOutOfUnion,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Brawl inning-3 draft: must open after inning 2 pick even if
+// brawlDraftedInning was previously over-stamped.
+// ---------------------------------------------------------------------------
+{
+  const store = useGameStore.getState();
+  store.startBrawl("AWAY");
+  // Simulate inning-2 draft already taken.
+  useGameStore.setState({
+    inning: 2,
+    brawlDraftedInning: 2,
+    brawlUserPool: [...useGameStore.getState().brawlUserPool, "b-10"],
+    brawlDraftChoice: null,
+    phase: "between-at-bats",
+    isFirstAtBatOfInning: true,
+  });
+  // Bug regression: a mis-tagged inning-3 pick during inning 2 used to
+  // set brawlDraftedInning=3 and suppress the real inning-3 overlay.
+  useGameStore.setState({ brawlDraftedInning: 3 });
+  useGameStore.setState({
+    inning: 3,
+    half: "top",
+    outs: 0,
+    phase: "between-at-bats",
+    isFirstAtBatOfInning: true,
+    brawlDraftChoice: null,
+  });
+  store.startNextAtBat();
+  assert(
+    useGameStore.getState().brawlDraftChoice === null,
+    "Brawl: over-stamped brawlDraftedInning=3 suppresses inning-3 draft",
+  );
+  useGameStore.setState({ brawlDraftedInning: 2, phase: "between-at-bats" });
+  store.startNextAtBat();
+  const after = useGameStore.getState();
+  assert(
+    after.brawlDraftChoice !== null && after.brawlDraftChoice.inning === 3,
+    "Brawl: Home Stretch draft opens at start of inning 3",
+    after.brawlDraftChoice,
+  );
+  assert(
+    after.phase === "selecting",
+    "Brawl: draft transitions into selecting",
+    after.phase,
   );
 }
 

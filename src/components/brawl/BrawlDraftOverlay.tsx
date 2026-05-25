@@ -2,13 +2,14 @@ import { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { useGameStore, BRAWL_DRAFT_TITLES } from "../../lib/gameStore";
 import { SESSION_CARDS, type CardDefinition } from "../../lib/cards";
+import { playCardPick } from "../../lib/gameAudio";
 import { CardItem } from "../CardGameOverlay";
 
 /**
- * Inning-start "concessions" draft overlay.
+ * Inning-start draft overlay (innings 2 and 3 only).
  *
- * Brawl Mode hands the user only 15 general-draw cards to start. At
- * the top of each inning we present three random cards from the rest
+ * Brawl Mode hands the user 15 general-draw cards to start. At the
+ * top of innings 2 and 3 we present three random cards from the rest
  * of the brawl pool and let the user pick one to permanently add to
  * their pool. The screen is intentionally austere -- no body copy
  * beyond "Pick one" -- to match the snap-rip tempo of the rest of
@@ -61,6 +62,17 @@ export function BrawlDraftOverlay() {
   // tweaked, never in a real 3-inning brawl run.
   const title = draft ? BRAWL_DRAFT_TITLES[draft.inning] ?? "Card Draft" : "";
 
+  const draftVisible =
+    gameMode === "brawl" &&
+    draft != null &&
+    (phase === "selecting" || phase === "between-at-bats");
+
+  useEffect(() => {
+    if (draftVisible) {
+      playCardPick();
+    }
+  }, [draftVisible, draft?.inning]);
+
   // The overlay's mount-unmount is driven by `draft != null`, so the
   // local `pickedId` is naturally reset whenever a new draft begins
   // (the previous draft cleared `pickedId === <id>` on its way out,
@@ -68,7 +80,7 @@ export function BrawlDraftOverlay() {
   // No extra reset hook needed.
   return (
     <AnimatePresence>
-      {gameMode === "brawl" && phase === "selecting" && draft ? (
+      {draftVisible ? (
         <motion.div
           key={`brawl-draft-${draft.inning}`}
           initial={{ opacity: 0 }}

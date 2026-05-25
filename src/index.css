@@ -69,6 +69,50 @@
   transform: rotate(35deg);
 }
 
+/* Skewed highlight that whips across the start-screen PLAY button. */
+.dugout-play-btn-shine {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+.dugout-play-btn-shine::after {
+  content: "";
+  position: absolute;
+  top: -20%;
+  bottom: -20%;
+  left: 0;
+  width: 42%;
+  pointer-events: none;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, 0.25) 28%,
+    rgba(255, 255, 255, 0.95) 50%,
+    rgba(255, 255, 255, 0.25) 72%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  transform: skewX(-22deg) translateX(-220%);
+  animation: dugout-play-btn-shine-whip 2.6s ease-in-out infinite;
+}
+@keyframes dugout-play-btn-shine-whip {
+  0%,
+  28% {
+    transform: skewX(-22deg) translateX(-220%);
+  }
+  48% {
+    transform: skewX(-22deg) translateX(340%);
+  }
+  100% {
+    transform: skewX(-22deg) translateX(340%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dugout-play-btn-shine::after {
+    animation: none;
+    opacity: 0;
+  }
+}
+
 /* Block-stacked drop-shadow for the DUGOUT logo. Two breakpoints because
  * the desktop version lays down a few extra layers for crisper edges at
  * size; switching at 768px matches the reference. */

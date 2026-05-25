@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'motion/react';
-import { ArrowLeft, Swords } from 'lucide-react';
+import { Swords } from 'lucide-react';
 import { useGameStore } from '../lib/gameStore';
 
 /** Winner remaining HP → at-bat result (matches `resolveBrawlOutcome`). */
@@ -17,8 +17,6 @@ const HIT_LADDER = [
  */
 export function BrawlRulesScreen() {
   const showBrawlRules = useGameStore((s) => s.showBrawlRules);
-  const setShowBrawlRules = useGameStore((s) => s.setShowBrawlRules);
-  const setShowStartScreen = useGameStore((s) => s.setShowStartScreen);
   const startBrawl = useGameStore((s) => s.startBrawl);
 
   const visible = showBrawlRules;
@@ -93,25 +91,13 @@ export function BrawlRulesScreen() {
                 batter as a single.
               </p>
 
-              <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-center gap-3 pt-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowBrawlRules(false);
-                    setShowStartScreen(true);
-                  }}
-                  className="inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl border-2 border-slate-600 bg-slate-900/80 text-slate-200 text-sm font-bold uppercase tracking-wider hover:bg-slate-800 transition-colors"
-                >
-                  <ArrowLeft className="w-4 h-4" aria-hidden="true" />
-                  Back
-                </button>
+              <div className="flex justify-center pt-2">
                 <button
                   type="button"
                   onClick={() => startBrawl('AWAY')}
                   className="inline-flex items-center justify-center gap-2 px-8 py-3 rounded-xl border-2 border-violet-300/70 bg-gradient-to-r from-violet-600 to-fuchsia-700 text-white text-sm font-black uppercase tracking-[0.2em] shadow-lg shadow-violet-900/40 hover:brightness-110 transition-all"
                 >
-                  <Swords className="w-4 h-4" aria-hidden="true" />
-                  Fight!
+                  Continue
                 </button>
               </div>
             </div>

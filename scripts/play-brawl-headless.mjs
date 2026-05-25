@@ -257,8 +257,8 @@ function flushAtBat(transcript) {
   }
 }
 
-// Brawl drafts are resolved inline at game-start + each inning-roll
-// below by picking a random card from the three options. In the live
+// Brawl drafts (innings 2 and 3 only) are resolved inline when
+// `startNextAtBat` opens the picker. In the live
 // UI the user picks deliberately; in the sim a random pick is good
 // enough -- we're validating that the mechanic + downstream deal-flow
 // stays healthy, not that the AI plays the draft optimally.
@@ -276,22 +276,11 @@ const summary = {
   safetyHits: 0,        // games that hit the 80-atbat safety cap
   atBatsPerGame: [],    // distribution of total at-bats per game
   draftPicks: {},       // count of each card ID picked at the per-inning draft
-  draftedInnings: 0,    // total drafts resolved (sanity: should be 3 × games)
+  draftedInnings: 0,    // total drafts resolved (sanity: should be 2 × games)
 };
 
 for (let g = 0; g < GAMES; g++) {
   useGameStore.getState().startBrawl(TEAM);
-  // Inning-1 ("Concessions") draft fires synchronously inside
-  // startBrawl. Pick before the first at-bat so the user pool is
-  // populated for downstream deals.
-  if (useGameStore.getState().brawlDraftChoice) {
-    const pick = useGameStore.getState().brawlDraftChoice.cardIds[
-      Math.floor(Math.random() * useGameStore.getState().brawlDraftChoice.cardIds.length)
-    ];
-    summary.draftPicks[pick] = (summary.draftPicks[pick] || 0) + 1;
-    useGameStore.getState().selectBrawlDraftCard(pick);
-    summary.draftedInnings++;
-  }
   const transcript = [];
   let safety = 0;
   let maxInning = 1;
@@ -300,7 +289,7 @@ for (let g = 0; g < GAMES; g++) {
     safety < 80
   ) {
     const s = useGameStore.getState();
-    // Inning-2 / inning-3 draft fires inside `startNextAtBat`. Resolve
+    // Innings 2–3 draft fires inside `startNextAtBat`. Resolve
     // before reading the hand so the user pool already includes the
     // new card for downstream deals (the deal itself happens BEFORE
     // the draft, so the new card affects subsequent at-bats this
@@ -379,7 +368,7 @@ const top = Object.entries(summary.cardAppearances)
   .slice(0, 15);
 console.log(`Top appearing cards (id, # appearances):`, top);
 console.log(
-  `Brawl drafts resolved: ${summary.draftedInnings} (expected ~${summary.games * 3})`,
+  `Brawl drafts resolved: ${summary.draftedInnings} (expected ~${summary.games * 2})`,
 );
 const topPicks = Object.entries(summary.draftPicks)
   .sort((a, b) => b[1] - a[1])

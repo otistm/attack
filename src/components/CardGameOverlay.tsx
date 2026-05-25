@@ -5,6 +5,15 @@ import { CardDefinition } from '../lib/cards';
 import { canConnect, canConnectAny, shapeModeForSide, seamKey } from '../lib/connect';
 import { useGameStore, getUiUserSide, isLowLeverageAtBat, ResolutionBeat, RevealBeatAnimation, Phase, BRAWL_SNAP_DURATION_MS as BRAWL_SNAP_DURATION_MS_STORE } from '../lib/gameStore';
 import { HitOutcome, type BrawlOutcomeResolution } from '../lib/scoring';
+import {
+  playBatSuccess,
+  playCardBoost,
+  playCardPickup,
+  playCardSwap,
+  playHit,
+  playOut,
+  scheduleCardsDealSound,
+} from '../lib/gameAudio';
 import { playSfx } from '../lib/sfx';
 import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
 import { SznEdgeHalf } from './SznEdgeHalf';
@@ -1313,7 +1322,7 @@ export const CardGameOverlay = () => {
       }));
       // Impact thud sfx: short, low, punchy. Plays once per attack
       // beat so the cascade of cards reads as a steady percussion line.
-      playSfx("impactThud");
+      playHit();
     },
     // runId pins the timeline to the current at-bat -- two sequential
     // brawl at-bats can't have the second one inherit timers from the
@@ -1736,6 +1745,7 @@ export const CardGameOverlay = () => {
           if (ids.length === 0) return true;
           const id = ids[safeIdx];
           if (!id) return true;
+          if (brawlMode) playCardPickup();
           setGamepadGrabbedHandCardId(id);
           return true;
         }
@@ -2014,11 +2024,8 @@ export const CardGameOverlay = () => {
           on `startNextAtBat`. Self-gates so non-brawl modes never see it. */}
       <BrawlInningSummaryOverlay />
 
-      {/* Brawl: inning-start "concessions" draft. Full-screen dark
-          overlay with three random cards; user picks one to add to
-          their 15-card general-draw pool. Titled per inning
-          ("CONCESSIONS" / "BATHROOM BREAK" / "HOME STRETCH"). Self-
-          gates on `brawlDraftChoice` so non-brawl modes never see it. */}
+      {/* Brawl: inning-2 / inning-3 draft picker ("Bathroom Break" /
+          "Home Stretch"). Self-gates on `brawlDraftChoice`. */}
       <BrawlDraftOverlay />
 
       {/* Player hero rail: top slot = opponent (fog `?` only during selection),
@@ -2100,7 +2107,7 @@ export const CardGameOverlay = () => {
             )}
           </div>
           <div data-tutorial="opponent-hand" data-brawl-hand="opponent">
-            {brawlMode && isSelecting ? (
+            {brawlMode && isSelecting && !brawlDraftActive ? (
               <BrawlOpponentArrangeStrip
                 dealtHand={aiHand}
                 planHand={
@@ -2111,7 +2118,7 @@ export const CardGameOverlay = () => {
                 atBatId={atBatId}
                 compact
               />
-            ) : (
+            ) : brawlMode && isSelecting && brawlDraftActive ? null : (
               <FlipPitcherStrip
                 hand={aiHand}
                 modifiers={aiModifiers}
@@ -2252,7 +2259,7 @@ export const CardGameOverlay = () => {
             />
           )}
 
-          {brawlMode && isSelecting && (
+          {brawlMode && isSelecting && !brawlDraftActive && (
             <BrawlSnapAttackHint
               remainingMs={brawlSnapRemainingMs}
               hasSnapChain={userHasSnapChain}
@@ -2260,6 +2267,7 @@ export const CardGameOverlay = () => {
           )}
 
           <div data-tutorial="user-hand" data-brawl-hand="user">
+            {!(brawlMode && brawlDraftActive) && (
             <HandStrip
               hand={userHand}
               onReorder={reorderUser}
@@ -2305,7 +2313,9 @@ export const CardGameOverlay = () => {
               gamepadGrabbedCardId={
                 gamepadPresent ? gamepadGrabbedHandCardId : null
               }
+              enableBrawlHandSfx={brawlMode && isSelecting}
             />
+            )}
           </div>
 
           <AnimatePresence mode="wait">
@@ -2783,6 +2793,9 @@ const BrawlBonusToast = ({
   const phase = useGameStore((s) => s.phase);
   const gameMode = useGameStore((s) => s.gameMode);
   const atBatId = useGameStore((s) => s.atBatId);
+  const userSide = useGameStore(getUiUserSide);
+  const userSeat: 'batter' | 'pitcher' =
+    userSide === 'Batting' ? 'batter' : 'pitcher';
   // Toast lifetime: pop in at reveal-start, hold through the resolve
   // pause, fade after BONUS_TOAST_LIFETIME_MS. Keyed on atBatId so a
   // fresh at-bat re-triggers the entry animation cleanly even though
@@ -2804,18 +2817,37 @@ const BrawlBonusToast = ({
     const t = window.setTimeout(() => setVisible(false), BONUS_TOAST_LIFETIME_MS);
     return () => window.clearTimeout(t);
   }, [atBatId, inWindow]);
+
+  const snap =
+    breakdown == null
+      ? 0
+      : side === 'batter'
+        ? breakdown.batterSnapBonus
+        : breakdown.pitcherSnapBonus;
+  const chain =
+    breakdown == null
+      ? 0
+      : side === 'batter'
+        ? breakdown.batterChainBonus
+        : breakdown.pitcherChainBonus;
+  const streak =
+    breakdown == null
+      ? 0
+      : side === 'batter'
+        ? breakdown.batterStreakBonus
+        : breakdown.pitcherStreakBonus;
+
+  useEffect(() => {
+    if (!visible || !inWindow || snap <= 0) return;
+    if (side !== userSeat) return;
+    playCardBoost();
+  }, [atBatId, visible, inWindow, snap, side, userSeat]);
+
   if (gameMode !== 'brawl') return null;
   if (!breakdown) return null;
   if (!inWindow) return null;
-  const snap =
-    side === 'batter' ? breakdown.batterSnapBonus : breakdown.pitcherSnapBonus;
-  const chain =
-    side === 'batter' ? breakdown.batterChainBonus : breakdown.pitcherChainBonus;
-  const streak =
-    side === 'batter'
-      ? breakdown.batterStreakBonus
-      : breakdown.pitcherStreakBonus;
   if (snap === 0 && chain === 0 && streak === 0) return null;
+
   const badges: Array<{ key: string; label: string; tone: string }> = [];
   if (snap > 0) {
     badges.push({
@@ -2965,6 +2997,26 @@ const HitResultBanner = ({
     return () => clearTimeout(t);
   }, [phase, outcome, atBatId, sideJustSwitched]);
 
+  // Out sting whenever the user records or suffers an out.
+  useEffect(() => {
+    if (!visible || sideJustSwitched || outcome !== 'out') return;
+    playOut();
+  }, [visible, sideJustSwitched, outcome, atBatId]);
+
+  // Brawl-only hit stings (user batting or opponent hit while user pitches).
+  useEffect(() => {
+    if (!visible || sideJustSwitched || brawlResolution === null) return;
+    if (outcome === null) return;
+    if (
+      outcome === 'single' ||
+      outcome === 'double' ||
+      outcome === 'triple' ||
+      outcome === 'homerun'
+    ) {
+      playBatSuccess();
+    }
+  }, [visible, sideJustSwitched, brawlResolution, outcome, atBatId]);
+
   const cfg = HIT_BANNER_CONFIG[outcome ?? 'out'];
   if (!cfg) return null;
 
@@ -3013,19 +3065,29 @@ const HitResultBanner = ({
     : `${pitcherName ?? 'Pitcher'} ${pitcherTotal}`;
   const isGrandSlam = brawlResolution?.grandSlam === true;
 
-  // Ball-in-play outcomes: video + a single HTML hit-type chyron overlaid
-  // on the clip. Scorelines, resolve-log chips, grand-slam badges, and
-  // confetti were removed from this beat — matchup math already landed
-  // during reveal; the center should read as one broadcast cut-in.
-  const hitVideo =
+  // Ball-in-play + out cut-ins: video + outcome chyron. User batting sees
+  // per-hit clips; user pitching sees `pitcher-hit.mp4` on opponent hits.
+  // Outs: `batter-out.mp4` (user batting) / `out.mp4` (user pitching).
+  const isHitOutcome =
     outcome === 'single' ||
     outcome === 'double' ||
     outcome === 'triple' ||
-    outcome === 'homerun'
+    outcome === 'homerun';
+  const resultVideo = isHitOutcome
+    ? userIsBatting
       ? HIT_VIDEOS[outcome]
+      : PITCHER_HIT_VIDEO
+    : outcome === 'out'
+      ? userIsBatting
+        ? OUT_VIDEOS.userBatterOut
+        : OUT_VIDEOS.userPitcherOut
       : null;
-  const hitTypeLabel = isGrandSlam ? 'Grand Slam!' : cfg.label;
-  const hitVideoAria = hitVideo ? hitTypeLabel : '';
+  const hitTypeLabel = isGrandSlam
+    ? 'Grand Slam!'
+    : resultVideo && outcome === 'out'
+      ? 'Out'
+      : cfg.label;
+  const hitVideoAria = resultVideo ? hitTypeLabel : '';
   // Synchronous gate (don't rely on the visibility timeout alone).
   // When the inning-start draft opens (`selecting` + brawlDraftChoice)
   // or we leave the resolved beat, unmount immediately so a lingering
@@ -3048,7 +3110,7 @@ const HitResultBanner = ({
           }}
           exit={{ opacity: 0, scale: 1.15, transition: { duration: 0.4 } }}
           className={
-            hitVideo
+            resultVideo
               ? // Fixed + high z so the clip paints above score pills,
                 // hands, CTAs, and UIOverlay chrome during the result
                 // beat only. Draft overlay uses z-[220] so it stays on top.
@@ -3056,11 +3118,11 @@ const HitResultBanner = ({
               : 'absolute inset-0 z-30 pointer-events-none flex items-center justify-center'
           }
         >
-          {hitVideo ? (
+          {resultVideo ? (
             <div className="relative w-[min(72vw,540px)] rounded-2xl overflow-hidden shadow-2xl">
               <video
-                key={`hit-video-${atBatId}-${outcome}`}
-                src={hitVideo.src}
+                key={`result-video-${atBatId}-${outcome}`}
+                src={resultVideo.src}
                 autoPlay
                 muted
                 playsInline
@@ -3075,13 +3137,15 @@ const HitResultBanner = ({
                   className={`text-4xl sm:text-5xl font-black uppercase tracking-[0.2em] leading-none ${
                     isGrandSlam
                       ? 'text-amber-200'
-                      : outcome === 'homerun'
-                        ? 'text-orange-200'
-                        : outcome === 'triple'
-                          ? 'text-emerald-200'
-                          : outcome === 'double'
-                            ? 'text-sky-200'
-                            : 'text-blue-100'
+                      : outcome === 'out'
+                        ? 'text-rose-200'
+                        : outcome === 'homerun'
+                          ? 'text-orange-200'
+                          : outcome === 'triple'
+                            ? 'text-emerald-200'
+                            : outcome === 'double'
+                              ? 'text-sky-200'
+                              : 'text-blue-100'
                   }`}
                   style={{ textShadow: '0 2px 12px rgba(0,0,0,0.85)' }}
                 >
@@ -3233,6 +3297,18 @@ const HIT_VIDEOS: Record<
   triple: { src: '/videos/triple.mp4', label: 'Triple!' },
   homerun: { src: '/videos/home-run.mp4', label: 'Home Run!' },
 };
+
+/** Opponent hit while the user is pitching. */
+const PITCHER_HIT_VIDEO = {
+  src: '/videos/pitcher-hit.mp4',
+  label: 'Hit',
+} as const;
+
+/** Out cut-ins keyed by which seat the user occupied for the at-bat. */
+const OUT_VIDEOS = {
+  userBatterOut: { src: '/videos/batter-out.mp4', label: 'Out' },
+  userPitcherOut: { src: '/videos/out.mp4', label: 'Out' },
+} as const;
 
 /**
  * Per-outcome broadcaster barks. Picked deterministically by
@@ -5236,6 +5312,11 @@ const PitcherCard = ({
 }: PitcherCardProps) => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const entry = useMemo(() => buildEntryConfig(isGeneral, index, signatureCount, fromY, fromRot), []);
+  useEffect(() => {
+    const delaySec = entry.animate.transition.delay ?? 0;
+    return scheduleCardsDealSound(delaySec);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const exitConfig = useMemo(
     () => ({
@@ -5392,6 +5473,8 @@ interface HandStripProps {
    * `onAffirmConnections` so chains snap exactly like a mouse drag.
    */
   gamepadGrabbedCardId?: string | null;
+  /** Brawl: card-pickup on drag start, card-swap on live reorder. */
+  enableBrawlHandSfx?: boolean;
 }
 
 const HandStrip = ({
@@ -5412,6 +5495,7 @@ const HandStrip = ({
   tutorialFirstCard = false,
   gamepadFocusedCardId = null,
   gamepadGrabbedCardId = null,
+  enableBrawlHandSfx = false,
 }: HandStripProps) => {
   // Signature cards fly in from the screen edge they belong to (pitcher drops
   // from above, batter rises up from below); general-draw cards then sweep in
@@ -5432,9 +5516,19 @@ const HandStrip = ({
   const draggingIdRef = useRef<string | null>(null);
 
   const handleDragStart = useCallback((id: string) => {
+    if (enableBrawlHandSfx) playCardPickup();
     setDraggingId(id);
     draggingIdRef.current = id;
-  }, []);
+  }, [enableBrawlHandSfx]);
+  const handleReorderWithSfx = useCallback(
+    (next: CardDefinition[]) => {
+      if (enableBrawlHandSfx && draggingIdRef.current) {
+        playCardSwap();
+      }
+      onReorder(next);
+    },
+    [enableBrawlHandSfx, onReorder],
+  );
   const handleDragEnd = useCallback(() => {
     const id = draggingIdRef.current;
     draggingIdRef.current = null;
@@ -5506,7 +5600,7 @@ const HandStrip = ({
     <Reorder.Group
       axis="x"
       values={hand}
-      onReorder={onReorder}
+      onReorder={handleReorderWithSfx}
       className="flex flex-row items-center justify-center list-none p-0 m-0"
     >
       {/*
@@ -5709,6 +5803,13 @@ const HandCard = ({
   }, []);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const entry = useMemo(() => buildEntryConfig(isGeneral, index, signatureCount, fromY, fromRot), []);
+  useEffect(() => {
+    if (skipEntryAnim) return;
+    const delaySec = entry.animate.transition.delay ?? 0;
+    return scheduleCardsDealSound(delaySec);
+    // Entry config is snapshotted at mount; one sound per deal-in.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const exitConfig = useMemo(
     () => ({
