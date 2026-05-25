@@ -2184,6 +2184,247 @@ export const ALL_CARDS: CardDefinition[] = [
     "description": "+2 Value for each SQUARE\u2194DIAMOND alternation in your chain.",
     "color": "bg-violet-500",
     "tags": ["fastball"]
+  },
+
+  // ============================================================================
+  // Brawl-Exclusive turn-the-tide cards (b-136..b-145, p-97..p-106).
+  //
+  // Live ONLY in the Brawl Mode general pool -- the non-brawl `GENERAL_*`
+  // filters in players.ts blacklist these IDs via `BRAWL_EXCLUSIVE_IDS` in
+  // brawlTaglines.ts. Each has a swing condition that can flip a losing HP
+  // matchup. Design constraints (enforced by code review, not data):
+  //   - No wildcard edges (no `combineConstraint: { wildEdge: ... }` or
+  //     star-shape-as-wild semantics carried into the effect).
+  //   - No tag / archetype gates in the effect -- any build can play them.
+  //   - No shape-link restrictions -- works in any snap layout.
+  //   - Mostly base 3-7; spike cards use low base + high conditional so the
+  //     unconditional HP they leak when the swing doesn't fire stays modest.
+  // ============================================================================
+
+  // ---- Batting (b-136..b-145) ---------------------------------------------
+
+  {
+    "id": "b-136",
+    "name": "Snap Fuel",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "+2 Value per seam you forged this snap (cap +8).",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-137",
+    "name": "Rally Cry",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "circle",
+    "rightShape": "square",
+    "description": "+6 Value if your team is down by 2 or more runs.",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-138",
+    "name": "Lone Wolf",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 7,
+    "leftShape": "circle",
+    "rightShape": "star",
+    "description": "+8 Value if your best chain is just this card.",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-139",
+    "name": "Chain Ripper",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "star",
+    "rightShape": "square",
+    "description": "If the pitcher's longest chain is 4+, subtract 5 from their score.",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-140",
+    "name": "Debt Collector",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "diamond",
+    "rightShape": "circle",
+    "description": "+3 Value for each run you trail by (cap +9).",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-141",
+    "name": "Full Swing",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "square",
+    "rightShape": "circle",
+    "description": "+7 Value if there are 2 outs.",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-142",
+    "name": "Glass Cannon",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 3,
+    "leftShape": "star",
+    "rightShape": "diamond",
+    "description": "+10 Value if combined AND in the rightmost slot of your lineup.",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-143",
+    "name": "All In",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "square",
+    "description": "+6 Value if your chain has all 5 cards.",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-144",
+    "name": "Borrowed Time",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 6,
+    "leftShape": "diamond",
+    "rightShape": "star",
+    "description": "+Value equal to the pitcher's highest uncombined card (cap +6).",
+    "color": "bg-amber-500"
+  },
+  {
+    "id": "b-145",
+    "name": "Pressure Cook",
+    "type": "Batting",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "circle",
+    "rightShape": "circle",
+    "description": "+4 Value if there are 1 or 2 outs.",
+    "color": "bg-amber-500"
+  },
+
+  // ---- Pitching (p-97..p-106) ---------------------------------------------
+
+  {
+    "id": "p-97",
+    "name": "Seam Snare",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "Subtract 2 from the batter's score per seam they forged (cap -8).",
+    "color": "bg-violet-500"
+  },
+  {
+    "id": "p-98",
+    "name": "Scatter Shot",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "circle",
+    "rightShape": "square",
+    "description": "+5 Value if the batter has 3 or more uncombined cards.",
+    "color": "bg-violet-500"
+  },
+  {
+    "id": "p-99",
+    "name": "Ace Anchor",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "star",
+    "rightShape": "circle",
+    "description": "If the batter's base card is in a chain, subtract 4 from their score.",
+    "color": "bg-violet-500"
+  },
+  {
+    "id": "p-100",
+    "name": "Save Point",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "square",
+    "rightShape": "star",
+    "description": "+6 Value if your team leads by 1 or 2 runs.",
+    "color": "bg-violet-500"
+  },
+  {
+    "id": "p-101",
+    "name": "Shutout Bid",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "diamond",
+    "rightShape": "square",
+    "description": "+5 Value if the batter's team has scored 0 runs this game.",
+    "color": "bg-violet-500"
+  },
+  {
+    "id": "p-102",
+    "name": "Chain Tax",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "circle",
+    "rightShape": "diamond",
+    "description": "Subtract 2 from the batter's score per card in their longest chain (cap -8).",
+    "color": "bg-violet-500"
+  },
+  {
+    "id": "p-103",
+    "name": "Iron Wall",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "square",
+    "rightShape": "circle",
+    "description": "+5 Value if there are 0 outs.",
+    "color": "bg-violet-500"
+  },
+  {
+    "id": "p-104",
+    "name": "Closer's Edge",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 3,
+    "leftShape": "star",
+    "rightShape": "square",
+    "description": "You win ties. +3 Value if combined.",
+    "color": "bg-violet-500"
+  },
+  {
+    "id": "p-105",
+    "name": "Overwhelmed",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 4,
+    "leftShape": "diamond",
+    "rightShape": "circle",
+    "description": "If the batter's chain has all 5 cards, subtract 8 from their score.",
+    "color": "bg-violet-500"
+  },
+  {
+    "id": "p-106",
+    "name": "Counterpunch",
+    "type": "Pitching",
+    "abilityType": "General Draw",
+    "baseValue": 5,
+    "leftShape": "square",
+    "rightShape": "diamond",
+    "description": "+6 Value if the batter's longest chain is 4+ cards.",
+    "color": "bg-violet-500"
   }
 ];
 

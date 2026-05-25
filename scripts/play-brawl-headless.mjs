@@ -109,6 +109,41 @@ function seamSubsets(hand) {
   return out;
 }
 
+// Convert a brawl `outcome` into the number of runs the user scores
+// given the current `bases` array `[1B, 2B, 3B]`. The engine's
+// actual base advancement is a tick more nuanced (e.g. forced
+// advances on walks, runner-by-runner sequencing), but for an
+// optimizer tie-break this matches the common-case bat result
+// closely enough to bias picks toward situational power.
+//
+// Without this, `snapOptimal` treats "single with bases loaded" the
+// same as "single with bases empty" — both score `winnerHP * 10` on
+// the score column. The runner conversion fold-in raises the value
+// of an at-bat that ACTUALLY CASHES IN runners, so the sim's user
+// stops trading a bases-loaded single for an empty-base homerun on
+// the same hand of cards.
+function estimateRunsForOutcome(outcome, bases) {
+  const [r1, r2, r3] = bases;
+  switch (outcome) {
+    case "out":
+      return 0;
+    case "single":
+      // runners advance 1; the runner on 3rd scores.
+      return r3 ? 1 : 0;
+    case "double":
+      // runners advance 2; 3rd + 2nd score, 1st advances to 3rd.
+      return (r3 ? 1 : 0) + (r2 ? 1 : 0);
+    case "triple":
+      // every runner scores; batter ends on 3rd.
+      return (r1 ? 1 : 0) + (r2 ? 1 : 0) + (r3 ? 1 : 0);
+    case "homerun":
+      // batter + all runners score.
+      return 1 + (r1 ? 1 : 0) + (r2 ? 1 : 0) + (r3 ? 1 : 0);
+    default:
+      return 0;
+  }
+}
+
 // Optimize the USER's hand for their OWN benefit. (The shipped
 // `optimizeBrawlOpponentHand` is wired to maximize OPPONENT advantage --
 // using it on the user's hand inverts the optimization and sabotages
@@ -117,6 +152,7 @@ function snapOptimal(state) {
   const side = userSide(state);
   const myHand = side === "Batting" ? state.batterHand : state.pitcherHand;
   const probe = probeFactory(side);
+  const bases = state.bases;
   let best = { hand: myHand, seams: new Set(), score: -Infinity };
   for (const order of permutations(myHand)) {
     for (const seams of seamSubsets(order)) {
@@ -125,12 +161,20 @@ function snapOptimal(state) {
       const userWon = side === "Batting" ? res.batterWon : !res.batterWon;
       const userHP = side === "Batting" ? res.batterRemainingHP : res.pitcherRemainingHP;
       const oppHP = side === "Batting" ? res.pitcherRemainingHP : res.batterRemainingHP;
-      // Higher = better for user: win first, then bigger HP margin, then bigger hit (winnerHP).
+      // Higher = better for user: win first, then RUNS-SCORED on this
+      // at-bat (the runner-conversion fold), then HP margin, then hit
+      // type as a final tie-break. Runs are weighted strongly because
+      // brawl is ultimately won on the scoreboard, not on HP swings.
       let s = 0;
       if (userWon) s += 1_000_000;
+      const runs =
+        side === "Batting" && userWon
+          ? estimateRunsForOutcome(res.outcome, bases)
+          : 0;
+      s += runs * 10_000;
       s += (userHP - oppHP) * 1000;
       if (side === "Batting" && userWon) {
-        s += res.winnerHP * 10; // prefer bigger hits when batting
+        s += res.winnerHP * 10;
         if (res.grandSlam) s += 500;
       }
       if (s > best.score) best = { hand: order, seams, score: s };
@@ -213,6 +257,12 @@ function flushAtBat(transcript) {
   }
 }
 
+// Brawl drafts are resolved inline at game-start + each inning-roll
+// below by picking a random card from the three options. In the live
+// UI the user picks deliberately; in the sim a random pick is good
+// enough -- we're validating that the mechanic + downstream deal-flow
+// stays healthy, not that the AI plays the draft optimally.
+
 const summary = {
   games: 0,
   wins: 0,
@@ -225,10 +275,23 @@ const summary = {
   inningsReached: {},   // distribution of max inning reached in each game
   safetyHits: 0,        // games that hit the 80-atbat safety cap
   atBatsPerGame: [],    // distribution of total at-bats per game
+  draftPicks: {},       // count of each card ID picked at the per-inning draft
+  draftedInnings: 0,    // total drafts resolved (sanity: should be 3 × games)
 };
 
 for (let g = 0; g < GAMES; g++) {
   useGameStore.getState().startBrawl(TEAM);
+  // Inning-1 ("Concessions") draft fires synchronously inside
+  // startBrawl. Pick before the first at-bat so the user pool is
+  // populated for downstream deals.
+  if (useGameStore.getState().brawlDraftChoice) {
+    const pick = useGameStore.getState().brawlDraftChoice.cardIds[
+      Math.floor(Math.random() * useGameStore.getState().brawlDraftChoice.cardIds.length)
+    ];
+    summary.draftPicks[pick] = (summary.draftPicks[pick] || 0) + 1;
+    useGameStore.getState().selectBrawlDraftCard(pick);
+    summary.draftedInnings++;
+  }
   const transcript = [];
   let safety = 0;
   let maxInning = 1;
@@ -237,6 +300,19 @@ for (let g = 0; g < GAMES; g++) {
     safety < 80
   ) {
     const s = useGameStore.getState();
+    // Inning-2 / inning-3 draft fires inside `startNextAtBat`. Resolve
+    // before reading the hand so the user pool already includes the
+    // new card for downstream deals (the deal itself happens BEFORE
+    // the draft, so the new card affects subsequent at-bats this
+    // inning -- same as the live UI).
+    if (s.brawlDraftChoice) {
+      const pick = s.brawlDraftChoice.cardIds[
+        Math.floor(Math.random() * s.brawlDraftChoice.cardIds.length)
+      ];
+      summary.draftPicks[pick] = (summary.draftPicks[pick] || 0) + 1;
+      useGameStore.getState().selectBrawlDraftCard(pick);
+      summary.draftedInnings++;
+    }
     maxInning = Math.max(maxInning, s.inning);
     if (s.phase === "selecting") {
       if (s.batterHand.length !== 5) summary.shortHands++;
@@ -302,3 +378,10 @@ const top = Object.entries(summary.cardAppearances)
   .sort((a, b) => b[1] - a[1])
   .slice(0, 15);
 console.log(`Top appearing cards (id, # appearances):`, top);
+console.log(
+  `Brawl drafts resolved: ${summary.draftedInnings} (expected ~${summary.games * 3})`,
+);
+const topPicks = Object.entries(summary.draftPicks)
+  .sort((a, b) => b[1] - a[1])
+  .slice(0, 10);
+console.log(`Top drafted cards (id, # times picked):`, topPicks);

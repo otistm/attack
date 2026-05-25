@@ -231,7 +231,13 @@ export function UIOverlay() {
 
       {cardsReady && !sznOutsideGameplay && <PlayerChoiceModal />}
       {cardsReady && !sznOutsideGameplay && <InfoRevealOverlay />}
-      {cardsReady && !sznOutsideGameplay && <InningTransitionBanner />}
+      {/* Brawl mode merges the inning-transition cue into the centered
+          `BrawlInningSummaryOverlay` recap card so the player only sees
+          one side-switch overlay instead of two stacked banners. The
+          generic banner stays on for every other mode. */}
+      {cardsReady && !sznOutsideGameplay && gameMode !== 'brawl' && (
+        <InningTransitionBanner />
+      )}
     </div>
     {gameMode !== 'brawl' && <QuestCompleteOverlay />}
     </ScreenShake>

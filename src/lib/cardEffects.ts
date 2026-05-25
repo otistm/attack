@@ -248,10 +248,12 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   "b-22": (ctx) => {
     if (!ctx.isCombined) return NOOP;
     // Brawl Mode: the snap timer leaves no room for a per-at-bat coin
-    // flip animation, so the card settles on its expected-value reward
-    // (+3) deterministically. Matches the brawl tagline "+3 if chained".
+    // flip animation, so the card settles on a deterministic reward.
+    // Bumped from +3 to +5 to match the brawl tagline "+5 if chained"
+    // and to address the audit's "underpowered" read -- a flat +3 was
+    // a wet smack compared to b-106's +14 or b-83/b-84's +8 + chain.
     if (ctx.gameMode === "brawl") {
-      return r({ selfValueDelta: 3, log: ["b-22 brawl avg +3"] });
+      return r({ selfValueDelta: 5, log: ["b-22 brawl +5 chained"] });
     }
     const flip = ctx.coinFlips?.["b-22"];
     if (flip === "heads") return r({ selfValueDelta: 5, log: ["b-22 coin flip HEADS +5"] });
@@ -324,9 +326,16 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // "If the Batter wins, subtract 3 from the Batter's score" was
   // functionally identical to the new "shrinks the Batter's hit" text
   // -- both describe the same downstream behaviour.
+  // Brawl: the tagline "−3 from their total" is phrased as a debuff
+  // against the batter, but the prior implementation buffed the
+  // pitcher (selfValueDelta: 3). Mathematically equivalent at the HP
+  // duel, but the reveal animation and breakdown copy attributed the
+  // swing to the wrong side. Switch to opponentValueDelta so the
+  // direction of the dart matches the card text -- and so the
+  // batter's pill is the one that visibly drops.
   "p-33": (ctx) =>
     ctx.gameMode === "brawl"
-      ? r({ selfValueDelta: 3, log: ["p-33 brawl: +3 to pitcher HP wall"] })
+      ? r({ opponentValueDelta: -3, log: ["p-33 brawl: -3 batter HP"] })
       : r({ hitScaleBonus: 3, log: ["p-33 shrinks batter hit by 3 (Hit Scale wall)"] }),
 
   // p-34 Cole Train: +3 if combined on the right side.
@@ -354,7 +363,11 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // p-39 Mound Presence: batter discards 1 general at deal time. Handled in
   // dealEffects -- auto-discards the lowest-value general until the picker UI
   // exists.
-  "p-39": () => NOOP,
+  // Brawl: deal-time roster mutations are suppressed entirely (see
+  // `applyDealEffects`'s brawl short-circuit), which left p-39 as a base-value
+  // brick. The brawl tagline reads "-2 their general", so apply a flat -2 to
+  // the opposing batter's score in brawl to deliver the promised swing.
+  "p-39": (ctx) => (ctx.gameMode === "brawl" ? r({ opponentValueDelta: -2 }) : NOOP),
 
   // p-40 Wheeler's Workhorse: +1 per card the batter combines.
   "p-40": (ctx) => {
@@ -379,7 +392,12 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   "p-43": () => NOOP,
 
   // p-44 Unhittable: if you win, counts as 2 outs (resolve-step).
-  "p-44": () => NOOP,
+  // Brawl: the extra-out resolve step has marginal value in a 3-inning
+  // arena (especially since brawl rarely strings outs back-to-back), and
+  // the brawl tagline reads "+3 if you win". Apply +3 flat in brawl --
+  // the HP only matters if the pitcher actually wins the snap, so the
+  // "if you win" gate is structurally implicit (mirrors b-18 / b-134).
+  "p-44": (ctx) => (ctx.gameMode === "brawl" ? r({ selfValueDelta: 3 }) : NOOP),
 
   // p-45 Game Over: +5 if final inning.
   "p-45": (ctx) => (ctx.isFinalInning ? r({ selfValueDelta: 5 }) : NOOP),
@@ -935,10 +953,16 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   "b-105": () => NOOP,
 
   // b-106 Cuban Crusher: if combined, base value becomes 14.
+  // Brawl: soft-cap at 10 instead of 14. At 14 the card was a
+  // round-deciding lever (one combine = +10 HP) that pushed b-106
+  // into auto-include territory in playtests. Capping at 10 keeps
+  // the "set base to X" identity while putting it in the same
+  // ballpark as the +5 chain bonus and other top-shelf generals.
   "b-106": (ctx) => {
     if (!ctx.isCombined) return NOOP;
     const card = ctx.group[ctx.indexInGroup];
-    return r({ selfValueDelta: 14 - card.baseValue });
+    const cap = ctx.gameMode === "brawl" ? 10 : 14;
+    return r({ selfValueDelta: cap - card.baseValue });
   },
 
   // b-107 Crawford Boxes: +2 per OTHER POWER-HITTER card in your hand.
@@ -1049,7 +1073,17 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
 
   // b-121 Catcher's Eye: information-only. derivePendingReveals queues a
   // signatureShapes reveal for the batter side.
-  "b-121": () => NOOP,
+  // Brawl: the reveal modal is suppressed (`derivePendingReveals` returns
+  // empty in brawl), which left b-121 as a base-value brick. The brawl
+  // tagline reads "+3 vs breaking ace" -- mirror the b-122 read against
+  // the pitcher's locked base card so the card pays out the promised
+  // swing when the AI's headliner is a breaking-ball pitch.
+  "b-121": (ctx) => {
+    if (ctx.gameMode !== "brawl") return NOOP;
+    return ctx.opponentBaseCard?.tags?.includes("breaking-ball")
+      ? r({ selfValueDelta: 3 })
+      : NOOP;
+  },
 
   // b-122 Pitch Caller: +5 if pitcher's base card is a BREAKING-BALL.
   "b-122": (ctx) =>
@@ -1145,26 +1179,27 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-134 Bronx Hustle: +5 Hit Scale if uncombined. The "and you win" gate
   // is implicit in the Hit Scale ladder (it only fires when the batter
   // wins head-to-head), so we don't need a separate win check.
-  // Brawl: convert Hit Scale to a flat +3 selfValueDelta so the brawl
-  // tagline "+3 if solo" pays out as visible HP.
+  // Brawl: convert Hit Scale to a flat +5 selfValueDelta so the brawl
+  // tagline "+5 if solo" pays out as visible HP. Bumped from +3 to +5
+  // alongside b-22 to put solo-bonus cards on the same footing as the
+  // pool's chain-stack heavy hitters; +3 played as a brick in headless.
   "b-134": (ctx) => {
     if (ctx.isCombined) return NOOP;
     return ctx.gameMode === "brawl"
-      ? r({ selfValueDelta: 3 })
+      ? r({ selfValueDelta: 5 })
       : r({ hitScaleBonus: 5 });
   },
 
   // b-135 Stolen Bag: extra runner placed in resolveStep. Per-card hook
   // stays a no-op.
-  // Brawl: extra-runner payout is meaningless in HP-only resolution; grant
-  // a flat +3 if chained (a reliable swing alongside the win-bonus flavor
-  // of the original card) to match the brawl tagline.
+  // Brawl: extra-runner payout is meaningless in HP-only resolution. The
+  // brawl tagline reads "+3 if you win", so grant a flat +3 -- the HP
+  // only matters when the batter wins the snap (implicit win gate, same
+  // pattern as b-18 / b-134). Previous "+3 if chained" implementation
+  // didn't match the tagline; players reading the card would expect the
+  // bonus to fire whenever they took the at-bat.
   "b-135": (ctx) =>
-    ctx.gameMode === "brawl"
-      ? ctx.isCombined
-        ? r({ selfValueDelta: 3 })
-        : NOOP
-      : NOOP,
+    ctx.gameMode === "brawl" ? r({ selfValueDelta: 3 }) : NOOP,
 
   // ============ Phase A puzzle-card expansion (b-81..b-88, p-95, p-96) ============
   //
@@ -1267,6 +1302,197 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   "p-96": (ctx) => {
     const flips = countAlternations(ctx.group, "square", "diamond");
     return flips > 0 ? r({ selfValueDelta: flips * 2 }) : NOOP;
+  },
+
+  // ============ Brawl-Exclusive turn-the-tide cards (b-136..b-145, p-97..p-106) ============
+  // Each card has ONE swing condition (snap skill, deficit, all-in chain,
+  // opponent over-chain, late-AB pressure, etc.) capable of flipping a
+  // losing HP matchup. All effects are pure `selfValueDelta` /
+  // `opponentValueDelta`; no modals, reveals, or deal-time transforms --
+  // they have to resolve inside the 15s snap window.
+  //
+  // The cards are brawl-pool-only at the pool gate in players.ts, so these
+  // effects only fire in brawl. They're not gated on `ctx.gameMode` because
+  // double-defending the same invariant just adds noise -- if a brawl-only
+  // card ever leaks into another mode, that's a pool-gate bug to fix.
+
+  // b-136 Snap Fuel: +2 per seam forged this snap. Caps at +8 (4 seams = a
+  // perfect 5-card chain). Rewards snap skill directly -- the global +3
+  // snap-speed bonus rewards typing fast; this rewards finding seams.
+  "b-136": (ctx) => {
+    const seams = ctx.affirmedSeams?.size ?? 0;
+    if (seams <= 0) return NOOP;
+    return r({ selfValueDelta: Math.min(8, seams * 2) });
+  },
+
+  // b-137 Rally Cry: +6 if your team is down by 2+ runs. Bigger than b-93's
+  // flat "+4 if losing" because the trigger window is stricter (binary
+  // losing-by-1 doesn't qualify).
+  "b-137": (ctx) => (batterTeamLead(ctx) <= -2 ? r({ selfValueDelta: 6 }) : NOOP),
+
+  // b-138 Lone Wolf: +8 if the WINNING (best) chain is just this card.
+  // Distinguishes from b-88 Anchor (slot-3 solo) -- this fires anywhere in
+  // the lineup as long as this card forms the entire bestGroup. We can't
+  // see the bestGroup directly from per-card hook, but `ctx.group` is
+  // exactly the group this card is currently being scored in, and the
+  // scoring engine only calls the hook on the *winning* group's cards.
+  "b-138": (ctx) =>
+    ctx.group.length === 1 && !ctx.isCombined ? r({ selfValueDelta: 8 }) : NOOP,
+
+  // b-139 Chain Ripper: -5 to the pitcher's score if their longest chain
+  // is 4+ cards. Direct counter to chain-heavy pitcher hands; pairs well
+  // against opponents who lean into p-50 / p-94 style setups.
+  "b-139": (ctx) => {
+    if (!ctx.opponentHand) return NOOP;
+    const longest = longestRunIn(ctx.opponentHand, ctx.opponentAffirmedSeams ?? null);
+    return longest >= 4 ? r({ opponentValueDelta: -5 }) : NOOP;
+  },
+
+  // b-140 Debt Collector: +3 per run behind, capped at +9 (3-run deficit).
+  // Scales with the size of the hole instead of binary "losing" -- a
+  // 4-run blowout pays the same as 3 because we don't want a "you lost
+  // by 7 so I win by 21" runaway state.
+  "b-140": (ctx) => {
+    const deficit = -batterTeamLead(ctx);
+    if (deficit <= 0) return NOOP;
+    return r({ selfValueDelta: Math.min(9, deficit * 3) });
+  },
+
+  // b-141 Full Swing: +7 with 2 outs. Brawl uses outs straight from the
+  // scoring context; the threshold is harder than b-19 (+5 on a signature)
+  // because this card has no other utility.
+  "b-141": (ctx) => ((ctx.outs ?? 0) === 2 ? r({ selfValueDelta: 7 }) : NOOP),
+
+  // b-142 Glass Cannon: +10 only when combined AND in the rightmost slot
+  // of the lineup. Stacks two conditions for a low-floor / high-ceiling
+  // card -- losing the chain or the slot drops it to a base-3 dud.
+  "b-142": (ctx) => {
+    if (!ctx.isCombined) return NOOP;
+    const card = ctx.group[ctx.indexInGroup];
+    const idx = indexInHand(card, ctx.hand);
+    return idx === ctx.hand.length - 1 ? r({ selfValueDelta: 10 }) : NOOP;
+  },
+
+  // b-143 All In: +6 if the chain has all 5 cards. The brawl hand is
+  // exactly 5 cards (asserted in players.ts), so `>= 5` and `=== 5` are
+  // equivalent. Using `>=` keeps it robust if hand size ever changes.
+  "b-143": (ctx) => (ctx.group.length >= 5 ? r({ selfValueDelta: 6 }) : NOOP),
+
+  // b-144 Borrowed Time: copy the opponent's strongest uncombined card's
+  // base value as a self bonus (cap +6 so a 12-base solo can't dump
+  // +12 onto this card). Mirrors enemy power without referencing any
+  // specific tag or archetype.
+  "b-144": (ctx) => {
+    const target = highestUncombinedInHand(
+      ctx.opponentHand ?? [],
+      ctx.opponentAffirmedSeams ?? null,
+    );
+    if (!target) return NOOP;
+    return r({ selfValueDelta: Math.min(6, target.baseValue) });
+  },
+
+  // b-145 Pressure Cook: +4 with any outs (1 or 2). Broader than b-141's
+  // 2-out spike -- catches "late half" pressure as a smaller, more
+  // reliable HP bump.
+  "b-145": (ctx) => {
+    const outs = ctx.outs ?? 0;
+    return outs >= 1 && outs <= 2 ? r({ selfValueDelta: 4 }) : NOOP;
+  },
+
+  // p-97 Seam Snare: -2 per opponent seam forged. Cap at -8 to mirror
+  // b-136's cap. Direct counter to snap skill -- the more chain the
+  // batter built, the more this card erodes their total.
+  "p-97": (ctx) => {
+    const oppSeams = ctx.opponentAffirmedSeams?.size ?? 0;
+    if (oppSeams <= 0) return NOOP;
+    return r({ opponentValueDelta: -Math.min(8, oppSeams * 2) });
+  },
+
+  // p-98 Scatter Shot: +5 if the batter has 3+ uncombined cards (i.e. a
+  // broken / scattered hand). Punishes hands that fail to find seams --
+  // complementary to p-97 which punishes seam-heavy hands.
+  "p-98": (ctx) => {
+    if (!ctx.opponentHand) return NOOP;
+    const oppSeams = ctx.opponentAffirmedSeams ?? null;
+    let solos = 0;
+    for (let i = 0; i < ctx.opponentHand.length; i++) {
+      if (isCardUncombinedAt(ctx.opponentHand, i, oppSeams)) solos++;
+    }
+    return solos >= 3 ? r({ selfValueDelta: 5 }) : NOOP;
+  },
+
+  // p-99 Ace Anchor: -4 if the batter's BASE card (their highest single,
+  // typically a signature) is in a chain. Punishes the strong-and-common
+  // "ace + 1 chain" play.
+  "p-99": (ctx) => {
+    if (!ctx.opponentHand || !ctx.opponentBaseCard) return NOOP;
+    const idx = ctx.opponentHand.findIndex((c) => c.id === ctx.opponentBaseCard!.id);
+    if (idx < 0) return NOOP;
+    const aceCombined = !isCardUncombinedAt(
+      ctx.opponentHand,
+      idx,
+      ctx.opponentAffirmedSeams ?? null,
+    );
+    if (!aceCombined) return NOOP;
+    return r({
+      opponentValueDelta: -4,
+      opponentTargetCardId: ctx.opponentBaseCard.id,
+    });
+  },
+
+  // p-100 Save Point: +6 when your team leads by 1-2 runs. Brawl's HP
+  // ladder maps loosely to score lead via inning summaries -- the
+  // pitcher side reads `-batterTeamLead` for "how far ahead we are".
+  "p-100": (ctx) => {
+    const pitcherLead = -batterTeamLead(ctx);
+    return pitcherLead >= 1 && pitcherLead <= 2 ? r({ selfValueDelta: 6 }) : NOOP;
+  },
+
+  // p-101 Shutout Bid: +5 if the batter's team has scored 0 runs this
+  // game. Early-half dominance card; payoff dwindles as the brawl wears
+  // on and runs leak across the board.
+  "p-101": (ctx) =>
+    batterTeamRunsThisGame(ctx) === 0 ? r({ selfValueDelta: 5 }) : NOOP,
+
+  // p-102 Chain Tax: -2 per card in the batter's longest chain, cap -8.
+  // Scales with chain length instead of being a single threshold (cf.
+  // p-50's flat -6 at 3+) so it's a smooth tax instead of a cliff.
+  "p-102": (ctx) => {
+    if (!ctx.opponentHand) return NOOP;
+    const longest = longestRunIn(ctx.opponentHand, ctx.opponentAffirmedSeams ?? null);
+    if (longest < 2) return NOOP;
+    return r({ opponentValueDelta: -Math.min(8, longest * 2) });
+  },
+
+  // p-103 Iron Wall: +5 with 0 outs. Counterpart to b-141 Full Swing.
+  "p-103": (ctx) => ((ctx.outs ?? 0) === 0 ? r({ selfValueDelta: 5 }) : NOOP),
+
+  // p-104 Closer's Edge: pitcher wins ties AND +3 if combined. Tie-break
+  // swing card distinct from p-48 / p-80, which only flip the tie. The
+  // +3 if combined gives it a base-power floor when the matchup isn't
+  // close to a tie.
+  "p-104": (ctx) => r({
+    pitcherWinsTies: true,
+    selfValueDelta: ctx.isCombined ? 3 : 0,
+  }),
+
+  // p-105 Overwhelmed: -8 if the batter chained all 5 cards. Hard
+  // counter to "perfect snap" hands. Bigger than p-102's cap on purpose
+  // -- this is a binary "they got greedy, now they pay" hammer.
+  "p-105": (ctx) => {
+    if (!ctx.opponentHand) return NOOP;
+    const longest = longestRunIn(ctx.opponentHand, ctx.opponentAffirmedSeams ?? null);
+    return longest >= 5 ? r({ opponentValueDelta: -8 }) : NOOP;
+  },
+
+  // p-106 Counterpunch: +6 if the batter's longest chain is 4+. Mirrors
+  // b-139 from the pitcher side but as a SELF bonus instead of an
+  // opponent debuff, so the pitcher's HP swings up while the batter's
+  // chain-bonus from gameStore still lands on the batter side.
+  "p-106": (ctx) => {
+    if (!ctx.opponentHand) return NOOP;
+    const longest = longestRunIn(ctx.opponentHand, ctx.opponentAffirmedSeams ?? null);
+    return longest >= 4 ? r({ selfValueDelta: 6 }) : NOOP;
   },
 };
 

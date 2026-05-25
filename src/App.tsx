@@ -28,7 +28,7 @@ export default function App() {
 
   // Brawl Mode strips every pre-game / between-day interstitial -- no
   // Shop, no Front Office, no pack rip. The lane drops straight into
-  // a 5-second-timer at-bat and stays there. We hoist the flag here
+  // a 15-second-timer at-bat and stays there. We hoist the flag here
   // so the screen gates below stay explicit at the App level instead
   // of relying on each child to self-suppress.
   const inBrawl = gameMode === 'brawl';
@@ -61,7 +61,12 @@ export default function App() {
           to drive ONE WebGL context (Pack3D) instead of two. Browsers cap
           live contexts (~8-16 depending on driver) and the playtest hit a
           THREE.WebGLRenderer "Context Lost" when both ran together. */}
-      {!sznShowPack && !showBrawlRules && (
+      {/* The 3D field stays mounted under the brawl rules screen so
+          the "Fight!" tap dissolves the rules into the live stadium
+          beneath rather than cold-cutting from a 2D background to the
+          R3F canvas. Pack rip still unmounts the field to free the
+          second WebGL context. */}
+      {!sznShowPack && (
         <div data-tutorial="field" className="absolute inset-0">
           <Scene />
         </div>

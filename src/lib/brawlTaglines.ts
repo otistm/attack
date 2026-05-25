@@ -3,17 +3,21 @@
  *
  * Rules:
  *   - Max ~28 characters; one line; HP-relevant only in brawl.
- *   - pool "in"  = signature (always dealt via dealHand)
- *   - pool "gen" = curated general pool (2 random per hand in brawl)
- *   - pool "out" = excluded from brawl general pool
- *   - remap      = brawl should use simplified effect (not just tagline)
+ *   - pool "in"         = signature (always dealt via dealHand)
+ *   - pool "gen"        = curated general pool (2 random per hand in brawl)
+ *   - pool "brawl-excl" = brawl general pool ONLY — never dealt in Quick
+ *                         Match, Auction Draft, or any other lane. Backed
+ *                         by `BRAWL_EXCLUSIVE_IDS` below so the non-brawl
+ *                         general filters in players.ts can blacklist them.
+ *   - pool "out"        = excluded from brawl general pool
+ *   - remap             = brawl should use simplified effect (not just tagline)
  */
 export const BRAWL_TAGLINE_DRAFT = {
   "b-1":  { tagline: "+4 if chained",                    pool: "in" },
   "b-2":  { tagline: "−2 their top solo",               pool: "in" },
   "b-3":  { tagline: "□/◆ only · +3 chained",           pool: "in" },
   "b-4":  { tagline: "Solo · high power",               pool: "in" },
-  "b-5":  { tagline: "Swap all your shapes",            pool: "in", remap: "Keep shape-swap OR brawl: +3 if chained" },
+  "b-5":  { tagline: "Swap all your shapes",            pool: "in", remap: "Shape-swap kept (handTransforms fires in brawl)" },
   "b-6":  { tagline: "+3 if chained",                    pool: "in", remap: "Hit Scale → flat +3 chained in brawl" },
   "b-7":  { tagline: "+3 if chained",                    pool: "in", remap: "Reveal → removed in brawl" },
   "b-8":  { tagline: "+3 to your top solo",              pool: "in" },
@@ -30,7 +34,7 @@ export const BRAWL_TAGLINE_DRAFT = {
   "b-19": { tagline: "+5 with 2 outs",                  pool: "in" },
   "b-20": { tagline: "12 if sandwiched",                pool: "in" },
   "b-21": { tagline: "−2 their general",                pool: "in", remap: "Destroy → −2 one general in brawl" },
-  "b-22": { tagline: "+3 if chained",                   pool: "in", remap: "Coin flip → flat +3 chained" },
+  "b-22": { tagline: "+5 if chained",                   pool: "in", remap: "Coin flip → flat +5 chained" },
   "b-23": { tagline: "Their generals −1 each",          pool: "in", remap: "Silence generals → −1 each" },
   "b-24": { tagline: "● links only",                    pool: "in" },
   "b-25": { tagline: "+2 per solo card left",           pool: "in" },
@@ -45,7 +49,7 @@ export const BRAWL_TAGLINE_DRAFT = {
   "b-103": { tagline: "+1 per ◆ on board",              pool: "in" },
   "b-104": { tagline: "+3 with 0 outs",                 pool: "in" },
   "b-105": { tagline: "Blank their ace ability",        pool: "in" },
-  "b-106": { tagline: "14 if chained",                  pool: "in" },
+  "b-106": { tagline: "10 if chained",                  pool: "in", remap: "Brawl soft-cap at 10 (regulation: 14)" },
   "b-107": { tagline: "+2 per power in hand",           pool: "in" },
   "b-108": { tagline: "Their off-speed silenced",       pool: "in" },
   "b-109": { tagline: "+3 in inning 3",                pool: "in", remap: "4th+ inning → inning 3 in brawl" },
@@ -73,7 +77,7 @@ export const BRAWL_TAGLINE_DRAFT = {
   "b-131": { tagline: "+3 with 2+ clutch cards",       pool: "in" },
   "b-132": { tagline: "+1 per run you've scored",       pool: "in" },
   "b-133": { tagline: "Solo · both edges wild",         pool: "in" },
-  "b-134": { tagline: "+3 if solo",                     pool: "in", remap: "Hit Scale → +3 solo" },
+  "b-134": { tagline: "+5 if solo",                     pool: "in", remap: "Hit Scale → +5 solo" },
   "b-135": { tagline: "+3 if you win",                  pool: "in", remap: "Extra runner → +3 win bonus" },
   "b-61": { tagline: "□/◆ links only",                  pool: "gen" },
   "b-62": { tagline: "+2 if chained",                   pool: "gen" },
@@ -165,17 +169,66 @@ export const BRAWL_TAGLINE_DRAFT = {
   "p-79": { tagline: "—",                               pool: "out", remap: "Skip at-bat" },
   "p-88": { tagline: "—",                               pool: "out", remap: "Hit Scale wall" },
   "p-95": { tagline: "—",                               pool: "out", remap: "Palindrome check" },
+
+  // ============ Brawl-Exclusive Turn-the-Tide cards (brawl general only) ============
+  // Live ONLY in the brawl general pool — excluded from Quick Match / Draft
+  // general pools by `BRAWL_EXCLUSIVE_IDS` below. Each has a swing condition
+  // that can flip a losing HP matchup; no wildcard edges, no tag/archetype
+  // gates, no shape-link restrictions — usable in any build.
+  "b-136": { tagline: "+2 per seam forged",             pool: "brawl-excl" },
+  "b-137": { tagline: "+6 if down 2+ runs",             pool: "brawl-excl" },
+  "b-138": { tagline: "+8 if entire chain solo",        pool: "brawl-excl" },
+  "b-139": { tagline: "−5 if they chain 4+",            pool: "brawl-excl" },
+  "b-140": { tagline: "+3 per run down (max +9)",       pool: "brawl-excl" },
+  "b-141": { tagline: "+7 with 2 outs",                 pool: "brawl-excl" },
+  "b-142": { tagline: "+10 chained · last slot",        pool: "brawl-excl" },
+  "b-143": { tagline: "+6 if 5-card chain",             pool: "brawl-excl" },
+  "b-144": { tagline: "Steal their top solo",           pool: "brawl-excl" },
+  "b-145": { tagline: "+4 with any outs",               pool: "brawl-excl" },
+  "p-97":  { tagline: "−2 per their seam",              pool: "brawl-excl" },
+  "p-98":  { tagline: "+5 vs 3+ solos",                 pool: "brawl-excl" },
+  "p-99":  { tagline: "−4 if their ace chained",        pool: "brawl-excl" },
+  "p-100": { tagline: "+6 lead by 1–2",                 pool: "brawl-excl" },
+  "p-101": { tagline: "+5 if they scored 0",            pool: "brawl-excl" },
+  "p-102": { tagline: "−2 per chain card",              pool: "brawl-excl" },
+  "p-103": { tagline: "+5 with 0 outs",                 pool: "brawl-excl" },
+  "p-104": { tagline: "Win ties · +3 chained",          pool: "brawl-excl" },
+  "p-105": { tagline: "−8 if their 5-chain",            pool: "brawl-excl" },
+  "p-106": { tagline: "+6 if they chain 4+",            pool: "brawl-excl" },
 } as const;
 
+/**
+ * Brawl-only general pool IDs (curated `gen` carriers).
+ *
+ * Includes both legacy `gen`-tagged cards AND the new `brawl-excl` cards
+ * that ONLY appear here. Other lanes (Quick Match, Auction Draft, SZN)
+ * filter the brawl-exclusive IDs OUT via `BRAWL_EXCLUSIVE_IDS` below.
+ */
 export const BRAWL_GENERAL_POOL = [
   "b-61","b-62","b-64","b-68","b-71","b-72","b-74","b-75","b-76","b-77",
   "b-78","b-79","b-80","b-81","b-83","b-84","b-85","b-86","b-87","b-88",
   "b-93","b-94","b-95","b-96",
+  // Brawl-exclusive batter cards (b-136..b-145).
+  "b-136","b-137","b-138","b-139","b-140","b-141","b-142","b-143","b-144","b-145",
   "p-71","p-72","p-73","p-74","p-76","p-80","p-81","p-82","p-83","p-84",
   "p-85","p-86","p-87","p-89","p-90","p-91","p-92","p-93","p-94","p-96",
+  // Brawl-exclusive pitcher cards (p-97..p-106).
+  "p-97","p-98","p-99","p-100","p-101","p-102","p-103","p-104","p-105","p-106",
 ] as const;
 
 export const BRAWL_GENERAL_POOL_EXCLUDED = [
   "b-63","b-65","b-66","b-67","b-69","b-70","b-73","b-82","b-91","b-92",
   "p-75","p-77","p-78","p-79","p-88","p-95",
 ] as const;
+
+/**
+ * Card IDs that live ONLY in the brawl general pool. The non-brawl lane
+ * deal pools (`GENERAL_BATTING` / `GENERAL_PITCHING` in players.ts) must
+ * blacklist these so a Quick Match / Auction Draft hand can't deal a
+ * brawl-only card. Brawl mode itself includes them via the
+ * `brawlTagline`-filtered subset, exactly like the legacy `gen` cards.
+ */
+export const BRAWL_EXCLUSIVE_IDS: ReadonlySet<string> = new Set([
+  "b-136","b-137","b-138","b-139","b-140","b-141","b-142","b-143","b-144","b-145",
+  "p-97","p-98","p-99","p-100","p-101","p-102","p-103","p-104","p-105","p-106",
+]);

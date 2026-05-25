@@ -1,7 +1,7 @@
 /**
  * BrawlAttackReveal — Brawl Mode's bespoke reveal sequence.
  *
- * Visual concept: the moment the 5-second snap timer auto-locks, the
+ * Visual concept: the moment the 15-second snap timer auto-locks, the
  * cards on both sides leap off the hand strip and *fly at the opposing
  * HP pill*, each card dealing damage equal to its power level. Impacts
  * spawn dramatic VFX (sparks, shockwave rings, screen shake) and tick

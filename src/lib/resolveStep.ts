@@ -25,6 +25,14 @@ export interface ResolveContext {
   batterTotal: number;
   pitcherTotal: number;
   batterWins: boolean;
+  /**
+   * Game mode the at-bat resolves under. Optional so the existing
+   * test fixtures and non-brawl call sites can omit it; resolve-step
+   * effects that need to short-circuit in brawl (e.g. b-120 Steal
+   * Home's runner-advance boost has no HP-only equivalent) read it
+   * directly.
+   */
+  gameMode?: "quick-match" | "draft" | "szn" | "brawl";
 }
 
 export type RunnerSlot = "first" | "second" | "third";
@@ -99,7 +107,13 @@ export const RESOLVE_STEPS: Record<string, ResolveFn> = {
   // b-120 Steal Home: if b-120 is in the best (combined) group AND the batter
   // wins, every base runner advances one extra base. Combine + win mirrors
   // the description's "if combined and you win" gate.
+  // Brawl: runners are decorative (HP-only resolution), so the bonus
+  // would silently apply to a never-read diamond. The brawl tagline
+  // already pays out as +3 selfValueDelta via the cardEffects branch;
+  // gating the runner boost off in brawl removes the dead-code
+  // double-dip the audit flagged.
   "b-120": (ctx) => {
+    if (ctx.gameMode === "brawl") return {};
     if (!ctx.batterWins) return {};
     if (!bestGroupContains(ctx.batterResult, "b-120")) return {};
     if (ctx.batterResult.bestGroup.length < 2) return {};

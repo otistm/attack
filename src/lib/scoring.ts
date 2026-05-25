@@ -791,6 +791,11 @@ export function resolveHitScale(score: number): HitOutcome {
   return "out";
 }
 
+/** RBI from a home run given who is on base before the swing (batter + runners). */
+export function homerunRunsFromBases(bases: readonly [boolean, boolean, boolean]): number {
+  return 1 + bases.filter(Boolean).length;
+}
+
 /**
  * Brawl Mode outcome resolution.
  *
@@ -809,7 +814,7 @@ export function resolveHitScale(score: number): HitOutcome {
  *   - 6 - 10 : double
  *   - 11 - 15: triple
  *   - 16 - 20: homerun
- *   - 21 +   : homerun, flagged `grandSlam`
+ *   - 21 +   : homerun, flagged `grandSlam` (cosmetic tier; RBI use live bases)
  *
  * If the pitcher's remaining HP exceeds the batter's, the at-bat is an out.
  * Ties (both 0) go to the batter as a single.

@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { CardDefinition, SESSION_CARDS, randomizeCardEdges } from "./cards";
 import { BATTERS, dealHand, MlbPlayer, PITCHERS, PLAYERS } from "./players";
+import { BRAWL_GENERAL_POOL } from "./brawlTaglines";
 import {
   HitOutcome,
   resolveBrawlOutcome,
@@ -814,7 +815,7 @@ export interface GameState {
    * Brawl-only: wall-clock timestamp the current `selecting` phase began
    * for THIS at-bat. lockIn reads `Date.now() - brawlSnapStartedAt` to
    * compute the "snap-speed" HP bonus on the user side -- locking with
-   * >10s left grants +4 HP, >5s left grants +2 HP, otherwise nothing.
+   * >=10s left grants +3 HP, >=5s left grants +1 HP, otherwise nothing.
    * Null between at-bats and outside of brawl.
    */
   brawlSnapStartedAt: number | null;
@@ -822,7 +823,7 @@ export interface GameState {
   /**
    * Brawl-only: most-recent snap bonuses + streak deltas the engine
    * applied at the last lock-in, surfaced so the result-phase UI can
-   * caption "Hot Streak +3" / "Snap! +4" / "Chain x3 +5" badges next
+   * caption "Hot Streak +3" / "Snap! +3" / "Chain x3 +5" badges next
    * to the HP pills. Cleared at `startNextAtBat` and `reset`.
    */
   lastBrawlBonusBreakdown: {
@@ -877,6 +878,52 @@ export interface GameState {
   } | null;
 
   /**
+   * Brawl-only: the 15-card "starter pool" the USER's hand draws its 2
+   * generals from on every brawl deal. Set at `startBrawl` by sampling
+   * the global brawl general pool with a balanced batting/pitching
+   * split, then grown by one card per inning when the user picks at
+   * the Concessions / Bathroom Break / Home Stretch overlay. The
+   * OPPONENT mirrors the same constraint via `brawlOpponentPool` so
+   * the two sides build a deck of the same size from the same roster.
+   * Empty outside brawl mode; treated as "no restriction" so legacy
+   * lanes never accidentally inherit it via `freshAtBat`.
+   */
+  brawlUserPool: string[];
+
+  /**
+   * Brawl-only: parallel 15-card pool the AI's hand draws its generals
+   * from. Sampled independently of `brawlUserPool` so the two decks
+   * tend to differ, but follows the same 7 batting + 7 pitching + 1
+   * random fill rule via `buildInitialBrawlUserPool`. Grows by one
+   * silent draft pick per inning (no UI; the AI picks at random from
+   * the same `buildBrawlDraftChoice` slate the user would see). This
+   * is the symmetric-pool fix the audit called out -- before this
+   * field landed the AI drew from the full 64-card `BRAWL_GENERAL_POOL`
+   * while the user was capped at 15 → 18, which created a measurable
+   * win-rate gap in playtests.
+   */
+  brawlOpponentPool: string[];
+
+  /**
+   * Brawl-only: the pending draft choice presented to the user before
+   * an inning starts. Three random card IDs sampled from the brawl
+   * general pool MINUS whatever is already in `brawlUserPool`. The
+   * snap timer is suppressed while this is non-null so the user can
+   * take their time picking. Cleared by `selectBrawlDraftCard`.
+   */
+  brawlDraftChoice: { inning: number; cardIds: string[] } | null;
+
+  /**
+   * Brawl-only: highest inning the user has already resolved a draft
+   * for. Starts at 0 in `startBrawl` (the inning-1 draft fires right
+   * away), then bumps each time the user picks. `startNextAtBat`
+   * compares this against the current inning to decide whether to
+   * open a fresh draft for inning 2 / 3. Stops at `totalInnings` so
+   * extras (if they ever ship) never trigger an off-script draft.
+   */
+  brawlDraftedInning: number;
+
+  /**
    * Coin flips resolved at lock-in time for cards whose effect tosses (e.g.
    * b-22 Power/Speed Threat). Keyed by cardId; absent during the selecting
    * phase so previews fall back to deterministic averages. Cleared on
@@ -909,20 +956,28 @@ export interface GameState {
   /**
    * During `revealing`, card strips and camera use this seat instead of
    * {@link getUserSide} so the UI does not swap batter/pitcher lanes until
-   * {@link completeReveal} — the engine applies the next half's `half` in the
-   * same tick as `lockIn`, but the reveal is still for the prior at-bat.
+   * {@link completeReveal} applies the pending scoreboard patch (inning /
+   * half flip included).
    */
   revealUiUserSide: Side | null;
 
   /**
-   * Brawl-only stash: `lockIn` commits runs/outs immediately but holds
-   * bases + runner animation until `completeReveal` so the diamond and
-   * scoreboard don't show a new occupant while cards are still attacking.
+   * Stash for scoreboard + diamond state computed at `lockIn`. Applied at
+   * `completeReveal` so runs, outs, inning/half, bases, and runner paths
+   * don't update until the reveal / result beat finishes — the
+   * scoreboard and 3D field stay frozen on the pre-play read while cards
+   * attack and the hit banner plays.
    */
-  pendingBrawlBasePatch: {
+  pendingScoreboardPatch: {
+    homeScore: number;
+    awayScore: number;
+    outs: number;
+    inning: number;
+    half: Half;
     bases: Bases;
     baseRunners: BaseRunners;
     runnerMoves: RunnerMove[];
+    isFirstAtBatOfInning: boolean;
   } | null;
 
   /**
@@ -1191,6 +1246,14 @@ export interface GameState {
    * selection, and once more at lock-in.
    */
   prepareBrawlOpponent: () => void;
+  /**
+   * Brawl-only: append the chosen card to `brawlUserPool`, close the
+   * `brawlDraftChoice` overlay, and re-anchor `brawlSnapStartedAt` to
+   * now so the 15s snap timer starts from a clean slate (the user
+   * spent however long picking — they shouldn't be penalised in HP
+   * for it). No-op when no draft is pending.
+   */
+  selectBrawlDraftCard: (cardId: string) => void;
   equipItem: (itemId: string, targetCardId: string) => void;
   unEquipItem: (itemId: string, sourceCardId: string) => void;
   /**
@@ -1629,6 +1692,144 @@ function chainBonusFor(chainLen: number): number {
   return 0;
 }
 
+/**
+ * Brawl Mode pool sizing. Both sides start the brawl with this many
+ * general-draw cards available to them; each inning adds one more
+ * (Concessions / Bathroom Break / Home Stretch on the user side, a
+ * silent random pick on the AI side), so by the bottom of inning 3
+ * both pools have 18 cards. The same `buildInitialBrawlUserPool`
+ * helper seeds each pool independently so the two decks tend to
+ * differ while remaining the same size and shape.
+ *
+ * Minimum batting / pitching slices guarantee each side can ALWAYS
+ * pull 2 generals on either seat of the matchup. If the random draw
+ * happens to short-change one role we resample that role.
+ */
+const BRAWL_USER_POOL_INITIAL_SIZE = 15;
+const BRAWL_USER_POOL_MIN_BATTING = 7;
+const BRAWL_USER_POOL_MIN_PITCHING = 7;
+const BRAWL_DRAFT_OPTIONS_PER_INNING = 3;
+
+/**
+ * Inning-titled labels for the per-inning brawl draft overlay. The
+ * UI reads this map by inning number (1..3); other innings fall back
+ * to a generic label so the overlay never renders without one.
+ */
+export const BRAWL_DRAFT_TITLES: Record<number, string> = {
+  1: "Concessions",
+  2: "Bathroom Break",
+  3: "Home Stretch",
+};
+
+/**
+ * Builds the initial 15-card user pool for a fresh brawl. Pulls from
+ * `BRAWL_GENERAL_POOL` (the curated brawl-eligible ID list) with a
+ * floor on the per-role count so the user always has at least
+ * `BRAWL_USER_POOL_MIN_*` cards on each side of the matchup. Returns
+ * a shuffled flat ID list -- the order is irrelevant for downstream
+ * code, which always intersects against `BRAWL_GENERAL_BATTING` /
+ * `BRAWL_GENERAL_PITCHING` per seat.
+ */
+/**
+ * Resolve the AI's silent inning draft. Builds a fresh slate via
+ * `buildBrawlDraftChoice` (same exclusion + sample-3 rule the user
+ * sees on the overlay) and picks one uniformly at random. Returning
+ * `null` is the same "pool exhausted" edge that the user-side draft
+ * already guards against.
+ *
+ * The audit committed to randomness for parity with the headless sim
+ * and to keep the AI from out-running the user via a stronger pool.
+ * A future P3 task can swap this for a probe-scored pick that
+ * maximizes expected HP against the user's known pool.
+ */
+function pickBrawlOpponentDraftCard(
+  ownedIds: ReadonlyArray<string>,
+  inning: number,
+): string | null {
+  const slate = buildBrawlDraftChoice(inning, ownedIds);
+  if (!slate || slate.cardIds.length === 0) return null;
+  return slate.cardIds[Math.floor(Math.random() * slate.cardIds.length)];
+}
+
+function buildInitialBrawlUserPool(): string[] {
+  const allIds = [...BRAWL_GENERAL_POOL];
+  // Partition by role using SESSION_CARDS so a future pool-list typo
+  // would surface as a "missing card" assertion below rather than
+  // silently shrinking the user pool. The lookups are O(n) each but
+  // this only runs once per brawl start.
+  const battingIds = allIds.filter((id) => {
+    const c = SESSION_CARDS.find((sc) => sc.id === id);
+    return c?.type === "Batting";
+  });
+  const pitchingIds = allIds.filter((id) => {
+    const c = SESSION_CARDS.find((sc) => sc.id === id);
+    return c?.type === "Pitching";
+  });
+  // Defensive: assert the floors are achievable. With 37 batting + 30
+  // pitching brawl-eligible cards as of this writing the floors fit
+  // an order of magnitude under either count; this throws only if a
+  // future pool shrink accidentally drops below 7 on one side.
+  if (battingIds.length < BRAWL_USER_POOL_MIN_BATTING) {
+    throw new Error(
+      `Brawl user-pool seed: only ${battingIds.length} batting IDs available; need ${BRAWL_USER_POOL_MIN_BATTING}.`,
+    );
+  }
+  if (pitchingIds.length < BRAWL_USER_POOL_MIN_PITCHING) {
+    throw new Error(
+      `Brawl user-pool seed: only ${pitchingIds.length} pitching IDs available; need ${BRAWL_USER_POOL_MIN_PITCHING}.`,
+    );
+  }
+  // Sample at-least-N from each role's sub-pool, then fill the
+  // remainder from the union so the rest of the slate stays random.
+  const battingPicks = sampleWithoutReplacement(battingIds, BRAWL_USER_POOL_MIN_BATTING);
+  const pitchingPicks = sampleWithoutReplacement(pitchingIds, BRAWL_USER_POOL_MIN_PITCHING);
+  const seedSet = new Set<string>([...battingPicks, ...pitchingPicks]);
+  const remainingPool = allIds.filter((id) => !seedSet.has(id));
+  const remainingCount = BRAWL_USER_POOL_INITIAL_SIZE - seedSet.size;
+  const fillers = sampleWithoutReplacement(remainingPool, Math.max(0, remainingCount));
+  return [...seedSet, ...fillers];
+}
+
+/**
+ * Picks N distinct random cards from `pool`. Returns at most `pool.length`
+ * entries when the request is bigger than the pool. Uses `Math.random`
+ * (callers don't need reproducibility here -- the brawl draft is
+ * intentionally fresh each game).
+ */
+function sampleWithoutReplacement<T>(pool: readonly T[], n: number): T[] {
+  if (n <= 0 || pool.length === 0) return [];
+  const copy = [...pool];
+  const out: T[] = [];
+  const count = Math.min(n, copy.length);
+  for (let i = 0; i < count; i++) {
+    const idx = Math.floor(Math.random() * copy.length);
+    out.push(copy[idx]);
+    copy.splice(idx, 1);
+  }
+  return out;
+}
+
+/**
+ * Build a `BRAWL_DRAFT_OPTIONS_PER_INNING`-card draft choice for the
+ * given inning. Excludes everything the user already owns AND the
+ * previously-offered slate (if any) so the inning-2 / inning-3
+ * drafts don't dangle the same three options the user already
+ * declined. Returns `null` if the remaining brawl pool is empty,
+ * which would only happen on a degenerate test where the user-pool
+ * has somehow swallowed the entire brawl roster.
+ */
+function buildBrawlDraftChoice(
+  inning: number,
+  ownedIds: ReadonlyArray<string>,
+): GameState["brawlDraftChoice"] {
+  const owned = new Set(ownedIds);
+  const remaining = BRAWL_GENERAL_POOL.filter((id) => !owned.has(id));
+  if (remaining.length === 0) return null;
+  const cardIds = sampleWithoutReplacement(remaining, BRAWL_DRAFT_OPTIONS_PER_INNING);
+  if (cardIds.length === 0) return null;
+  return { inning, cardIds };
+}
+
 function pickAvoidingRecent<T extends { id: string }>(pool: T[], recent: string[]): T {
   const fresh = pool.filter((p) => !recent.includes(p.id));
   const candidates = fresh.length > 0 ? fresh : pool;
@@ -1892,6 +2093,27 @@ interface FreshAtBatOptions {
    * and their brawl simplifications live in the tagline map).
    */
   brawlMode?: boolean;
+  /**
+   * Brawl Mode: restrict the USER's seat to the IDs in this list when
+   * drawing generals. Only the seat matching `brawlUserSide` is
+   * filtered; the opponent reads `brawlOpponentPool` instead.
+   * Empty / undefined means "no restriction" -- used by the
+   * `startBrawl` first-deal path before the user-pool seed is
+   * built, and by all non-brawl lanes.
+   */
+  brawlUserPool?: ReadonlyArray<string>;
+  /**
+   * Brawl Mode: parallel pool that restricts the OPPONENT's seat.
+   * Same shape and rules as `brawlUserPool`. Empty / undefined means
+   * "no restriction", matching the user-side behavior.
+   */
+  brawlOpponentPool?: ReadonlyArray<string>;
+  /**
+   * Brawl Mode: which seat is the user occupying for this at-bat.
+   * Used together with `brawlUserPool` to apply the restriction to
+   * the correct seat. Computed via `getUserSide` at the callsite.
+   */
+  brawlUserSide?: Side;
 }
 
 function freshAtBat(opts: FreshAtBatOptions = {}): FreshAtBat {
@@ -2002,19 +2224,54 @@ function freshAtBat(opts: FreshAtBatOptions = {}): FreshAtBat {
   }
   // Hand overrides take precedence over SZN seeds (non-SZN-mode lanes
   // still send full bag hands the legacy way).
-  const dealOpts = opts.brawlMode ? { brawlMode: true } : undefined;
+  //
+  // Brawl: both seats deal from their own curated pool. The USER's
+  // pool grows via the inning-start Concessions/Bathroom Break/Home
+  // Stretch drafts; the OPPONENT's pool grows in parallel via silent
+  // AI picks resolved at the same beats. Either pool being empty /
+  // undefined means "no restriction" -- this falls back to the full
+  // brawl pool, which is what the very first `startBrawl` deal does
+  // before the seed pools are built.
+  const userRestrictionSet =
+    opts.brawlMode && opts.brawlUserPool && opts.brawlUserPool.length > 0
+      ? new Set(opts.brawlUserPool)
+      : null;
+  const opponentRestrictionSet =
+    opts.brawlMode &&
+    opts.brawlOpponentPool &&
+    opts.brawlOpponentPool.length > 0
+      ? new Set(opts.brawlOpponentPool)
+      : null;
+  const batterDealOpts = opts.brawlMode
+    ? {
+        brawlMode: true as const,
+        restrictGeneralPoolTo:
+          opts.brawlUserSide === "Batting"
+            ? userRestrictionSet
+            : opponentRestrictionSet,
+      }
+    : undefined;
+  const pitcherDealOpts = opts.brawlMode
+    ? {
+        brawlMode: true as const,
+        restrictGeneralPoolTo:
+          opts.brawlUserSide === "Pitching"
+            ? userRestrictionSet
+            : opponentRestrictionSet,
+      }
+    : undefined;
   const rawBatter =
     opts.userBatterHandOverride && opts.userBatterHandOverride.length > 0
       ? opts.userBatterHandOverride.slice(0, 5)
       : sznBatterHand
         ? sznBatterHand
-        : dealHand(batter, undefined, dealOpts);
+        : dealHand(batter, undefined, batterDealOpts);
   const rawPitcher =
     opts.userPitcherHandOverride && opts.userPitcherHandOverride.length > 0
       ? opts.userPitcherHandOverride.slice(0, 5)
       : sznPitcherHand
         ? sznPitcherHand
-        : dealHand(pitcher, undefined, dealOpts);
+        : dealHand(pitcher, undefined, pitcherDealOpts);
 
   // Phase 2 ordering: roster mods (add/remove/swap) run BEFORE shape/value
   // transforms, so b-21 / p-31 / p-47 etc. see the final hand composition.
@@ -2257,10 +2514,14 @@ function resetEphemeralGameplay(): Partial<GameState> {
     brawlStreakPitcher: 0,
     brawlInningHighlights: null,
     brawlInningSummary: null,
+    brawlUserPool: [],
+    brawlOpponentPool: [],
+    brawlDraftChoice: null,
+    brawlDraftedInning: 0,
     revealScript: [],
     pendingResolvedPhase: null,
     revealUiUserSide: null,
-    pendingBrawlBasePatch: null,
+    pendingScoreboardPatch: null,
   };
 }
 
@@ -2389,13 +2650,17 @@ export const useGameStore = create<GameState>((set, get) => ({
   brawlStreakPitcher: 0,
   brawlInningHighlights: null,
   brawlInningSummary: null,
+  brawlUserPool: [],
+  brawlOpponentPool: [],
+  brawlDraftChoice: null,
+  brawlDraftedInning: 0,
   recentBatterIds: [INITIAL_AT_BAT.batter.id],
   recentPitcherIds: [INITIAL_AT_BAT.pitcher.id],
 
   revealScript: [],
   pendingResolvedPhase: null,
   revealUiUserSide: null,
-  pendingBrawlBasePatch: null,
+  pendingScoreboardPatch: null,
 
   // Empty until the player picks a lane on the StartGameScreen. Auction
   // path: `startDraft` populates with `initDraftState()` and the user
@@ -2667,10 +2932,35 @@ export const useGameStore = create<GameState>((set, get) => ({
     // pitcher's still-face-down hand. lockIn calls computeMatchup with the
     // default `revealsGuess: true` so the final score still reflects it.
     const m = computeMatchup(s, batterResult, pitcherResult, /* revealsGuess */ false);
+    // Brawl Mode preview: fold the deterministic chain + hot-streak HP
+    // bonuses into the displayed totals so the selection-phase pill
+    // matches what lockIn will land on. Snap-speed is INTENTIONALLY
+    // omitted -- it depends on real-time clock and would make the
+    // pill jitter every frame as the snap timer drains, which reads
+    // as flicker rather than feedback. Players still get the actual
+    // snap-speed reward at lock-in via `lastBrawlBonusBreakdown`.
+    let batterDisplay = m.batterDisplay;
+    let pitcherDisplay = m.pitcherDisplay;
+    if (s.gameMode === "brawl") {
+      const batterChainBonus = chainBonusFor(batterResult.bestGroup?.length ?? 0);
+      const pitcherChainBonus = chainBonusFor(pitcherResult.bestGroup?.length ?? 0);
+      const batterStreakBonus = s.brawlStreakBatter >= 2 ? 3 : 0;
+      const pitcherStreakBonus = s.brawlStreakPitcher >= 2 ? 3 : 0;
+      batterDisplay = m.batterDisplay + batterChainBonus + batterStreakBonus;
+      pitcherDisplay = m.pitcherDisplay + pitcherChainBonus + pitcherStreakBonus;
+    }
+    // In brawl mode the win indicator should reflect the post-bonus
+    // totals so the green/red tone of the pill stays consistent with
+    // the displayed numbers. Outside brawl the displays equal m.* so
+    // this just preserves the existing read.
+    const batterWinning =
+      s.gameMode === "brawl"
+        ? batterDisplay > pitcherDisplay
+        : m.batterWins;
     return {
-      batterDisplay: m.batterDisplay,
-      pitcherDisplay: m.pitcherDisplay,
-      batterWinning: m.batterWins,
+      batterDisplay,
+      pitcherDisplay,
+      batterWinning,
       batterHitScaleBonus: m.batterHitScaleNet,
       // The strip and "Best chain" / breakdown UI all key off the same
       // ScoringResult that fed the pill -- when p-41 mutates the working
@@ -2803,8 +3093,8 @@ export const useGameStore = create<GameState>((set, get) => ({
     // the brawl resolution UP FRONT so the rest of lockIn (resolve
     // step, runner queue, banner formatting) sees a normal HitOutcome
     // and stays oblivious to the override; the grand-slam flag is
-    // surfaced via `lastBrawlResolution` and used below to pre-load
-    // the bases so the swing actually clears 4 runs.
+    // surfaced via `lastBrawlResolution` for banner copy only; RBI still
+    // follow regulation `advance(4)` from the live base state.
     const isBrawl = s.gameMode === "brawl";
 
     // ============ Brawl Mode bonus stack ============
@@ -2904,20 +3194,10 @@ export const useGameStore = create<GameState>((set, get) => ({
       batterTotal: m.batterTotal,
       pitcherTotal: m.pitcherTotal,
       batterWins: brawlBatterWon,
+      gameMode: s.gameMode ?? undefined,
     });
 
-    // Brawl Mode grand-slam (winnerHP >= 21) credits four runs without
-    // pre-loading phantom runners on the bases — that trick scored correctly
-    // but painted three gold "anonymous" figures on the diamond before the
-    // HR animation. `applyOutcome` handles the 4-RBI path directly.
-    const next = applyOutcome(
-      s,
-      outcome,
-      resolveDelta,
-      brawlResolution?.grandSlam && brawlResolution.batterWon
-        ? { brawlGrandSlam: true }
-        : undefined,
-    );
+    const next = applyOutcome(s, outcome, resolveDelta);
     const message = brawlResolution
       ? formatOutcome(
           outcome,
@@ -3009,9 +3289,9 @@ export const useGameStore = create<GameState>((set, get) => ({
     // Reveal-sequence orchestrator: park the at-bat in `revealing` while the
     // UI animates each scoring beat. The resolved-state phase (between-at-bats
     // or game-over) is stashed and applied by `completeReveal` once the UI
-    // finishes the script. Other state mutations (bases, runs, outs, message,
-    // score) still flush now so the orchestrator and the post-reveal banner
-    // share the same numbers.
+    // finishes the script. Runs/outs/bases/inning land in
+    // `pendingScoreboardPatch` and flush at `completeReveal`; `lastOutcome`
+    // and message update now so the reveal banner can read the play.
     const script = buildRevealScript(s, batterResult, pitcherResult, m);
 
     const lastRevealMathSnapshot: RevealMathSnapshot = {
@@ -3040,13 +3320,17 @@ export const useGameStore = create<GameState>((set, get) => ({
         ? { run: { ...s.run, ...sznSide.runPatch } }
         : null;
 
-    const brawlBasePatch = isBrawl
-      ? {
-          bases: next.bases,
-          baseRunners: next.baseRunners,
-          runnerMoves: next.runnerMoves,
-        }
-      : null;
+    const scoreboardPatch = {
+      homeScore: next.homeScore,
+      awayScore: next.awayScore,
+      outs: next.outs,
+      inning: next.inning,
+      half: next.half,
+      bases: next.bases,
+      baseRunners: next.baseRunners,
+      runnerMoves: next.runnerMoves,
+      isFirstAtBatOfInning: next.isFirstAtBatOfInning,
+    };
 
     // ============ Brawl streak + per-inning highlight bookkeeping ============
     //
@@ -3124,9 +3408,16 @@ export const useGameStore = create<GameState>((set, get) => ({
         // `nextHighlights` resets for the new half on the very next
         // at-bat. `isGameEnd` lets the overlay swap to "Game Over"
         // copy when the just-flipped inning was the last one.
-        const justEndedGame =
-          next.phase === "game-over" ||
-          (s.half === "bottom" && next.inning > s.totalInnings);
+        //
+        // IMPORTANT: trust `next.phase === "game-over"` as the sole
+        // authority here. The earlier `s.half === "bottom" && next.inning > totalInnings`
+        // heuristic produced a false positive when a tied game rolled
+        // into extras -- the inning counter advances past totalInnings
+        // but applyOutcome only flips to game-over once the score is
+        // not tied (see ~7643). Without this guard the side-switch
+        // recap shows "Final Inning Recap" while extras are still
+        // being played.
+        const justEndedGame = next.phase === "game-over";
         nextInningSummary = nextHighlights
           ? { ...nextHighlights, isGameEnd: justEndedGame }
           : null;
@@ -3145,15 +3436,18 @@ export const useGameStore = create<GameState>((set, get) => ({
       : null;
 
     set({
-      ...(isBrawl
-        ? {
-            ...next,
-            bases: s.bases,
-            baseRunners: s.baseRunners,
-            runnerMoves: [],
-          }
-        : next),
-      pendingBrawlBasePatch: brawlBasePatch,
+      // Keep the live scoreboard + diamond on the pre-play snapshot until
+      // `completeReveal`. Outcome math is already in `next` / lastOutcome.
+      homeScore: s.homeScore,
+      awayScore: s.awayScore,
+      outs: s.outs,
+      inning: s.inning,
+      half: s.half,
+      bases: s.bases,
+      baseRunners: s.baseRunners,
+      runnerMoves: [],
+      isFirstAtBatOfInning: s.isFirstAtBatOfInning,
+      pendingScoreboardPatch: scoreboardPatch,
       ...questPatch,
       ...(sznRunPatch ?? {}),
       lastOutcome: outcome,
@@ -3193,7 +3487,6 @@ export const useGameStore = create<GameState>((set, get) => ({
       phase: "revealing",
       pendingResolvedPhase: next.phase,
       revealScript: script,
-      runnerMoves: next.runnerMoves,
       pendingDebuffs: nextDebuffs,
       // Phase change closes any modal the player left open. The choice is
       // already snapshot into resolvedChoices (or auto-declined) by the
@@ -3206,22 +3499,30 @@ export const useGameStore = create<GameState>((set, get) => ({
   completeReveal: () => {
     const s = get();
     if (s.phase !== "revealing") return;
-    const brawlBases = s.pendingBrawlBasePatch;
+    const scoreboardPatch = s.pendingScoreboardPatch;
     const pendingPhase = s.pendingResolvedPhase ?? "between-at-bats";
     const brawlAutoDeal =
       s.gameMode === "brawl" && pendingPhase === "between-at-bats";
-    const sideSwitchDeal = brawlAutoDeal && s.isFirstAtBatOfInning;
+    const sideSwitchDeal =
+      brawlAutoDeal &&
+      (scoreboardPatch?.isFirstAtBatOfInning ?? s.isFirstAtBatOfInning);
     set({
       phase: pendingPhase,
       pendingResolvedPhase: null,
       revealScript: [],
       revealUiUserSide: null,
-      ...(brawlBases
+      ...(scoreboardPatch
         ? {
-            bases: brawlBases.bases,
-            baseRunners: brawlBases.baseRunners,
-            runnerMoves: brawlBases.runnerMoves,
-            pendingBrawlBasePatch: null,
+            homeScore: scoreboardPatch.homeScore,
+            awayScore: scoreboardPatch.awayScore,
+            outs: scoreboardPatch.outs,
+            inning: scoreboardPatch.inning,
+            half: scoreboardPatch.half,
+            bases: scoreboardPatch.bases,
+            baseRunners: scoreboardPatch.baseRunners,
+            runnerMoves: scoreboardPatch.runnerMoves,
+            isFirstAtBatOfInning: scoreboardPatch.isFirstAtBatOfInning,
+            pendingScoreboardPatch: null,
           }
         : {}),
     });
@@ -3267,6 +3568,7 @@ export const useGameStore = create<GameState>((set, get) => ({
     const ghostIsHome = s.userTeam === "AWAY";
     const ghostScore = ghostIsHome ? s.homeScore : s.awayScore;
     const userScore = ghostIsHome ? s.awayScore : s.homeScore;
+    const isBrawl = s.gameMode === "brawl";
     const ab = freshAtBat({
       recent: { batters: s.recentBatterIds, pitchers: s.recentPitcherIds },
       battersPool: pools.battersPool,
@@ -3282,7 +3584,14 @@ export const useGameStore = create<GameState>((set, get) => ({
       sznUserNextGameBoost: sznMode ? s.run!.nextGameRosterBoost ?? 0 : 0,
       // Brawl filters the general pool to the curated tagline set so
       // every dealt general is readable inside the 15s snap timer.
-      brawlMode: s.gameMode === "brawl",
+      brawlMode: isBrawl,
+      // Apply the per-brawl pools to their respective seats. Both
+      // pools grow by one card each inning via the parallel drafts,
+      // and we always read the live value here so a pick made
+      // mid-inning immediately affects the next deal.
+      brawlUserPool: isBrawl ? s.brawlUserPool : undefined,
+      brawlOpponentPool: isBrawl ? s.brawlOpponentPool : undefined,
+      brawlUserSide: isBrawl ? getUserSide(s) : undefined,
     });
     const userNext = getUserSide(s);
     let batterHand = ab.batterHand;
@@ -3320,8 +3629,20 @@ export const useGameStore = create<GameState>((set, get) => ({
       // Brawl: stamp a fresh wall-clock anchor every time we re-enter
       // selecting so the snap-bonus reads the same window the user
       // actually had to think. Null outside brawl so the field never
-      // leaks into other lanes.
-      brawlSnapStartedAt: get().gameMode === "brawl" ? Date.now() : null,
+      // leaks into other lanes. When a new inning has just rolled
+      // over AND the user hasn't drafted for it yet, we DEFER the
+      // anchor until they pick at the draft overlay (mirrors the
+      // `startBrawl` deferral for inning 1). The check below keys
+      // off the LIVE state because the next code block may overwrite
+      // brawlDraftChoice for the new inning.
+      brawlSnapStartedAt:
+        isBrawl &&
+        s.inning > s.brawlDraftedInning &&
+        s.inning <= s.totalInnings
+          ? null
+          : isBrawl
+            ? Date.now()
+            : null,
       // Clear the inning-summary overlay snapshot when the next at-bat
       // begins so the flashcard doesn't bleed into the new half. The
       // 2.1s `between-at-bats` window before `startNextAtBat` fires is
@@ -3336,11 +3657,47 @@ export const useGameStore = create<GameState>((set, get) => ({
       revealScript: [],
       pendingResolvedPhase: null,
       revealUiUserSide: null,
-      pendingBrawlBasePatch: null,
+      pendingScoreboardPatch: null,
       questWildcardNextBatterHand: false,
       questLegendaryCelebratePulse: false,
     });
     if (get().gameMode === "brawl") {
+      // If the inning just rolled forward into 2 or 3, open the
+      // Bathroom Break / Home Stretch draft overlay. We read the
+      // POST-set state so the inning value reflects whatever
+      // applyOutcome just stamped. The draft only fires when the
+      // user hasn't already picked for this inning AND we're still
+      // in regulation (extras would never trigger one).
+      const afterSet = get();
+      if (
+        afterSet.inning > afterSet.brawlDraftedInning &&
+        afterSet.inning <= afterSet.totalInnings &&
+        afterSet.brawlDraftChoice === null
+      ) {
+        const draft = buildBrawlDraftChoice(afterSet.inning, afterSet.brawlUserPool);
+        if (draft) {
+          set({ brawlDraftChoice: draft });
+        } else if (afterSet.brawlSnapStartedAt == null) {
+          // Degenerate pool edge case: no draft overlay, so start the
+          // snap timer immediately instead of soft-locking selecting.
+          set({ brawlSnapStartedAt: Date.now() });
+        }
+        // Resolve the AI's silent inning draft in lock-step with the
+        // user's. The pool grows by exactly one card per inning on
+        // both sides; the AI picks at random from a fresh 3-card
+        // slate (same `buildBrawlDraftChoice` exclusion the user
+        // overlay shows) so the opponent never gets to skim the top
+        // of the entire roster.
+        const opponentPick = pickBrawlOpponentDraftCard(
+          afterSet.brawlOpponentPool,
+          afterSet.inning,
+        );
+        if (opponentPick && !afterSet.brawlOpponentPool.includes(opponentPick)) {
+          set({
+            brawlOpponentPool: [...afterSet.brawlOpponentPool, opponentPick],
+          });
+        }
+      }
       const prep = computeBrawlOpponentPrep(get());
       if (prep) set(prep);
     }
@@ -3351,6 +3708,37 @@ export const useGameStore = create<GameState>((set, get) => ({
     if (s.gameMode !== "brawl" || s.phase !== "selecting") return;
     const prep = computeBrawlOpponentPrep(s);
     if (prep) set(prep);
+  },
+
+  selectBrawlDraftCard: (cardId) => {
+    const s = get();
+    if (s.gameMode !== "brawl") return;
+    if (!s.brawlDraftChoice) return;
+    // Defense-in-depth: only accept IDs the overlay actually offered
+    // so a stale event (e.g. double-click between renders) can't
+    // smuggle in an arbitrary card.
+    if (!s.brawlDraftChoice.cardIds.includes(cardId)) return;
+    const inning = s.brawlDraftChoice.inning;
+    // Append rather than replace -- the user's pool grows by one
+    // card per inning, never shrinks. De-dup just in case the same
+    // ID somehow landed twice (the overlay sources from
+    // BRAWL_GENERAL_POOL minus owned, so it shouldn't, but a stale
+    // call shouldn't widen the pool to 16 by re-adding an existing
+    // card).
+    const nextPool = s.brawlUserPool.includes(cardId)
+      ? s.brawlUserPool
+      : [...s.brawlUserPool, cardId];
+    set({
+      brawlUserPool: nextPool,
+      brawlDraftChoice: null,
+      brawlDraftedInning: Math.max(s.brawlDraftedInning, inning),
+      // Re-anchor the snap timer to NOW so the user gets the full
+      // 15-second window starting from when the field becomes
+      // interactive. Pickers spend wildly different amounts of time
+      // on the draft and shouldn't be docked snap-bonus HP for
+      // reading three new cards.
+      brawlSnapStartedAt: Date.now(),
+    });
   },
 
   reset: (team) => {
@@ -3393,6 +3781,10 @@ export const useGameStore = create<GameState>((set, get) => ({
       brawlStreakPitcher: 0,
       brawlInningHighlights: null,
       brawlInningSummary: null,
+      brawlUserPool: [],
+      brawlOpponentPool: [],
+      brawlDraftChoice: null,
+      brawlDraftedInning: 0,
       recentBatterIds: [ab.batter.id],
       recentPitcherIds: [ab.pitcher.id],
       revealScript: [],
@@ -3676,16 +4068,47 @@ export const useGameStore = create<GameState>((set, get) => ({
     // Office surface or a previous quick match's inventory.
     get().startQuickMatch(team);
     const s = get();
+    // Seed the brawl-only USER pool: 15 IDs across both roles. Stays
+    // immutable through inning 1's first at-bat (we deal the user's
+    // hand against this pool) and grows by one card per inning via
+    // the Concessions / Bathroom Break / Home Stretch drafts.
+    const userPool = buildInitialBrawlUserPool();
+    // Seed the parallel OPPONENT pool with the same shape -- 15 IDs,
+    // 7-batting/7-pitching floor, random fill. Sampled independently
+    // so the two decks tend to differ (both pools are random walks
+    // over the same 64-card source, with no shared seed).
+    const opponentInitial = buildInitialBrawlUserPool();
+    // Resolve the AI's inning-1 silent draft up front so the AI's
+    // pool reaches 16 in lock-step with the user (whose user-side
+    // overlay opens before the first snap). Random pick from a fresh
+    // 3-card slate keeps the meta symmetric.
+    const opponentDraftPickInning1 = pickBrawlOpponentDraftCard(
+      opponentInitial,
+      1,
+    );
+    const opponentPool = opponentDraftPickInning1
+      ? [...opponentInitial, opponentDraftPickInning1]
+      : opponentInitial;
     // Re-deal hands using the brawl-only general pool so the curated
     // tagline cards are the only generals that can appear. Without
     // this, the player would see the full-game generals (Hit Scale
     // cards, modal triggers, base-running effects) that the brawl
-    // pool was explicitly designed to exclude.
+    // pool was explicitly designed to exclude. Both seats are now
+    // restricted to their respective curated starter pools.
+    const userSide = getUserSide(s);
     const brawlAb = freshAtBat({
       battersPool: [s.batter],
       pitchersPool: [s.pitcher],
       brawlMode: true,
+      brawlUserPool: userPool,
+      brawlOpponentPool: opponentPool,
+      brawlUserSide: userSide,
     });
+    // Build the inning-1 ("Concessions") draft up-front so the
+    // overlay can render the moment the brawl scene boots. The
+    // snap-timer is held in stasis until the user picks (see
+    // `selectBrawlDraftCard`).
+    const draft = buildBrawlDraftChoice(1, userPool);
     set({
       gameMode: "brawl",
       phase: "selecting",
@@ -3693,10 +4116,16 @@ export const useGameStore = create<GameState>((set, get) => ({
       showBrawlRules: false,
       batterHand: brawlAb.batterHand,
       pitcherHand: brawlAb.pitcherHand,
-      // Stamp the snap-timer anchor exactly when we drop into selecting
-      // so the snap-speed bonus reads from the actual moment the
-      // player can act, not from gameplay-store boot.
-      brawlSnapStartedAt: Date.now(),
+      // Don't anchor the snap timer yet -- the draft overlay is up
+      // and the snap-bonus math reads `Date.now() - brawlSnapStartedAt`.
+      // `selectBrawlDraftCard` stamps the anchor when the user picks
+      // so the 15s window starts the instant the field becomes
+      // interactive.
+      brawlSnapStartedAt: null,
+      brawlUserPool: userPool,
+      brawlOpponentPool: opponentPool,
+      brawlDraftChoice: draft,
+      brawlDraftedInning: 0,
       // Clear all brawl-only rolling state when starting a brand new
       // brawl. Streak counters / inning-summary slots persisted from a
       // prior game would otherwise paint a "Hot Streak" banner on the
@@ -5688,6 +6117,46 @@ function computeBrawlOpponentPrep(
   const opponentHand = userSide === "Batting" ? s.pitcherHand : s.batterHand;
   if (opponentHand.length === 0) return null;
 
+  // Hot-streak bonuses are determined by the running streak counters at
+  // the time the AI plans, so they're stable across every probe in this
+  // pass. Folding them in lets the optimizer prefer layouts that still
+  // win once the same +3 the engine will add at lockIn lands.
+  const batterStreakBonus = s.brawlStreakBatter >= 2 ? 3 : 0;
+  const pitcherStreakBonus = s.brawlStreakPitcher >= 2 ? 3 : 0;
+  // Multi-at-bat plan context. The AI was previously myopic — it picked
+  // the layout with the best CURRENT HP outcome and ignored the score-
+  // board entirely. We give it three signals:
+  //  1. Run diff from the AI's perspective so it can lean toward
+  //     loss-prevention when leading and big-swing variance when down.
+  //  2. User at-bats remaining, used for late-game weighting.
+  //  3. A pessimistic user snap-bonus floor (the engine awards +3 at
+  //     >=10s remaining; assume the user lands it). This counters the
+  //     prior fairness gap where the AI planned as if the user got 0.
+  const aiSide = userSide === "Batting" ? "Pitching" : "Batting";
+  const aiIsHome = aiSide === "Batting" ? s.half === "bottom" : s.half === "top";
+  const aiRuns = aiIsHome ? s.homeScore : s.awayScore;
+  const userRuns = aiIsHome ? s.awayScore : s.homeScore;
+  const runDiff = aiRuns - userRuns;
+  // Approximate remaining user at-bats this game. Each half is ~3 at-bats
+  // (3-out side), so we estimate optimistically from the current outs.
+  const halvesRemaining = Math.max(
+    0,
+    (s.totalInnings - s.inning) * 2 + (s.half === "top" ? 1 : 0),
+  );
+  const userBatsThisHalf = userSide === "Batting" && s.half === ("top" as const)
+    ? Math.max(0, 3 - s.outs)
+    : 0;
+  // Rough estimate — accuracy isn't critical, this only nudges scoring.
+  const userAtBatsRemaining = userBatsThisHalf + halvesRemaining * 1.5;
+  const isFinalHalf =
+    s.inning >= s.totalInnings && s.half === ("bottom" as const);
+  const planContext = {
+    runDiff,
+    userAtBatsRemaining,
+    userSnapBonusFloor: 3,
+    isFinalHalf,
+    bases: s.bases,
+  } as const;
   const optimized = optimizeBrawlOpponentHand(opponentHand, userSide, (hand, seams) => {
     const batterHand = userSide === "Batting" ? s.batterHand : hand;
     const pitcherHand = userSide === "Batting" ? hand : s.pitcherHand;
@@ -5715,8 +6184,25 @@ function computeBrawlOpponentPrep(
       pitcherResult,
       false,
     );
-    return { batterDisplay: m.batterDisplay, pitcherDisplay: m.pitcherDisplay };
-  });
+    // Mirror the chain + hot-streak bonus stack that lockIn will apply.
+    // Snap-speed bonus IS now modeled (pessimistic floor of +3 to the
+    // user side), so the optimizer plans against the user's best-case
+    // clicking speed rather than ignoring the bonus entirely. Without
+    // this the AI would propose layouts that win on raw HP but lose
+    // once the user banks their snap reward.
+    const batterChainBonus = chainBonusFor(batterResult.bestGroup?.length ?? 0);
+    const pitcherChainBonus = chainBonusFor(pitcherResult.bestGroup?.length ?? 0);
+    const userSnapBatter =
+      userSide === "Batting" ? planContext.userSnapBonusFloor : 0;
+    const userSnapPitcher =
+      userSide === "Pitching" ? planContext.userSnapBonusFloor : 0;
+    return {
+      batterDisplay:
+        m.batterDisplay + batterChainBonus + batterStreakBonus + userSnapBatter,
+      pitcherDisplay:
+        m.pitcherDisplay + pitcherChainBonus + pitcherStreakBonus + userSnapPitcher,
+    };
+  }, planContext);
 
   const patch: Partial<GameState> = {
     brawlOpponentPlanHand: optimized.hand,
@@ -7107,15 +7593,20 @@ function applyOutcome(
     runnerAdvanceBoost: number;
     extraRunnerOn: RunnerSlot | null;
   },
-  opts?: { brawlGrandSlam?: boolean },
 ): OutcomeApplyResult {
   let { inning, half, outs, homeScore, awayScore, totalInnings } = s;
   // SZN games cap extras at exactly one extra inning, then declare a
   // draw if still tied. Without this cap, a 3-inning weekend game can
   // grind into unbounded extras and gum up the run schedule.
-  const sznTiedExtrasCap = s.gameMode === "szn" && s.run !== null
-    ? totalInnings + 1
-    : null;
+  // Brawl mirrors the same cap for the same reason: a 3-inning arena
+  // bout tied 41-41 shouldn't drag into inning 6+. The "draw if tied
+  // after one extra frame" outcome is fine here because the post-game
+  // screen treats anything that isn't a clear win as a loss for the
+  // user without breaking series math (brawl is a single-shot mode).
+  const tiedExtrasCap =
+    (s.gameMode === "szn" && s.run !== null) || s.gameMode === "brawl"
+      ? totalInnings + 1
+      : null;
   let bases: Bases = [...s.bases] as Bases;
   // Mirror of `bases` carrying the actual MlbPlayer per occupied slot.
   // Mutated in lockstep so the 3D scene's name labels track the same
@@ -7215,22 +7706,7 @@ function applyOutcome(
       runs = advance(3, runnerBoost);
       break;
     case "homerun":
-      if (opts?.brawlGrandSlam) {
-        // Bases were empty; credit four runs and animate only the batter
-        // rounding the path so we never spawn gold phantom baserunners.
-        runs = 4;
-        bases = [false, false, false];
-        baseRunners = [null, null, null];
-        runnerMoves.push({
-          id: nextMoveId(),
-          from: "home",
-          to: "scored",
-          kind: "batter",
-          player: s.batter,
-        });
-      } else {
-        runs = advance(4, runnerBoost);
-      }
+      runs = advance(4, runnerBoost);
       break;
   }
 
@@ -7354,8 +7830,8 @@ function applyOutcome(
       if (inning > totalInnings && homeScore !== awayScore) {
         phase = "game-over";
       } else if (
-        sznTiedExtrasCap !== null &&
-        inning > sznTiedExtrasCap &&
+        tiedExtrasCap !== null &&
+        inning > tiedExtrasCap &&
         homeScore === awayScore
       ) {
         phase = "game-over";

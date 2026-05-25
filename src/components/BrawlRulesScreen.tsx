@@ -30,8 +30,17 @@ export function BrawlRulesScreen() {
           key="brawl-rules"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1, transition: { duration: 0.35, ease: 'easeOut' } }}
-          exit={{ opacity: 0, transition: { duration: 0.25 } }}
-          className="absolute inset-0 z-[35] dugout-stadium-bg dugout-font-base text-white overflow-y-auto pointer-events-auto"
+          // Slow the exit fade so the rules screen dissolves into the
+          // live 3D stadium underneath instead of snapping away. The
+          // field is now mounted while these rules are visible (see
+          // App.tsx), so the longer crossfade gives the player a clear
+          // "we're stepping into the arena" beat.
+          exit={{ opacity: 0, transition: { duration: 0.55, ease: 'easeIn' } }}
+          // Translucent scrim + backdrop blur instead of the opaque
+          // stadium tile so the live R3F field peeks through. The
+          // rules content is readable thanks to the dark wash and the
+          // panel's own opaque card.
+          className="absolute inset-0 z-[35] dugout-font-base text-white overflow-y-auto pointer-events-auto bg-slate-950/65 backdrop-blur-md"
           role="dialog"
           aria-modal="true"
           aria-label="Brawl Mode rules"

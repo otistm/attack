@@ -1,6 +1,7 @@
 import { CardDefinition, Handedness, SESSION_CARDS } from "./cards";
 import type { ShapeType } from "../components/cardShapes";
 import type { ClassTag } from "./run";
+import { BRAWL_EXCLUSIVE_IDS } from "./brawlTaglines";
 
 /**
  * Brawl Mode playstyle flavor. Drives the curated 2-card general
@@ -134,9 +135,18 @@ const PLAYER_BRAWL_FLAVORS: Record<string, BrawlFlavor> = {
  * typo can't silently fall through.
  */
 const BRAWL_FLAVOR_BATTING_POOL: Record<BrawlFlavor, string[]> = {
-  power: ["b-62", "b-76", "b-79", "b-80", "b-81", "b-83", "b-84", "b-86", "b-87"],
-  speed: ["b-71", "b-72", "b-78", "b-85", "b-88", "b-93", "b-94", "b-96"],
-  guile: ["b-61", "b-64", "b-68", "b-71", "b-72", "b-74", "b-75", "b-77", "b-95"],
+  // power: chain-rewards, all-in, big-base spikes, slot/right-edge hammers.
+  power: ["b-62", "b-76", "b-79", "b-80", "b-81", "b-83", "b-84", "b-86", "b-87",
+          "b-138", "b-142", "b-143"],
+  // speed: comeback / state-driven swings -- the new deficit-scaling and
+  // 2-out clutch cards slot in cleanly with the existing speedster set.
+  speed: ["b-71", "b-72", "b-78", "b-85", "b-88", "b-93", "b-94", "b-96",
+          "b-137", "b-140", "b-141", "b-145"],
+  // guile: situational tools and "use what they bring" tricks. Snap Fuel
+  // rewards reading the snap layout; Chain Ripper and Borrowed Time turn
+  // the opponent's strengths back on them.
+  guile: ["b-61", "b-64", "b-68", "b-71", "b-72", "b-74", "b-75", "b-77", "b-95",
+          "b-136", "b-139", "b-144"],
   // Pitching flavors never deal from the batting curated pool -- but
   // we still need keys so the type stays exhaustive. Empty lists fall
   // through to the universal batting pool, which is fine for the
@@ -146,9 +156,16 @@ const BRAWL_FLAVOR_BATTING_POOL: Record<BrawlFlavor, string[]> = {
 };
 
 const BRAWL_FLAVOR_PITCHING_POOL: Record<BrawlFlavor, string[]> = {
-  heat: ["p-73", "p-74", "p-81", "p-82", "p-85", "p-89", "p-90", "p-93"],
-  control: ["p-71", "p-80", "p-84", "p-86", "p-91", "p-92", "p-94", "p-96"],
-  guile: ["p-72", "p-76", "p-83", "p-87"],
+  // heat: raw debuffs and chain-tax hammers -- fits the existing fastball
+  // / power-hating set. p-105 Overwhelmed is the perfect heat hammer.
+  heat: ["p-73", "p-74", "p-81", "p-82", "p-85", "p-89", "p-90", "p-93",
+         "p-98", "p-102", "p-105", "p-106"],
+  // control: command pitchers -- ties, lead-protection, shutout gates.
+  control: ["p-71", "p-80", "p-84", "p-86", "p-91", "p-92", "p-94", "p-96",
+            "p-100", "p-101", "p-103", "p-104"],
+  // guile: anti-chain reads and snap counters. Seam Snare and Ace Anchor
+  // both reward reading the opponent's snap intent.
+  guile: ["p-72", "p-76", "p-83", "p-87", "p-97", "p-99"],
   power: [],
   speed: [],
 };
@@ -271,8 +288,26 @@ for (const p of PLAYERS) {
   }
 }
 
-const GENERAL_BATTING = SESSION_CARDS.filter((c) => c.type === "Batting" && c.abilityType === "General Draw");
-const GENERAL_PITCHING = SESSION_CARDS.filter((c) => c.type === "Pitching" && c.abilityType === "General Draw");
+// Non-brawl general pools: Quick Match, Auction Draft, and any other
+// lane that deals from the full general roster. Brawl-exclusive cards
+// (b-136..b-145, p-97..p-106) are blacklisted here so a non-brawl hand
+// can never accidentally deal a "Snap Fuel" or "Seam Snare" -- those
+// cards reference brawl-only state (snap-timer seams, HP-ladder swings)
+// that the other lanes don't surface. Brawl Mode itself reads from the
+// `BRAWL_GENERAL_*` subsets below, which DO include them via the
+// `brawlTagline` filter.
+const GENERAL_BATTING = SESSION_CARDS.filter(
+  (c) =>
+    c.type === "Batting" &&
+    c.abilityType === "General Draw" &&
+    !BRAWL_EXCLUSIVE_IDS.has(c.id),
+);
+const GENERAL_PITCHING = SESSION_CARDS.filter(
+  (c) =>
+    c.type === "Pitching" &&
+    c.abilityType === "General Draw" &&
+    !BRAWL_EXCLUSIVE_IDS.has(c.id),
+);
 
 // Brawl Mode general pools: curated subset that pulls only cards whose
 // effect is one-line-readable on the card face. The full general pool
@@ -281,8 +316,18 @@ const GENERAL_PITCHING = SESSION_CARDS.filter((c) => c.type === "Pitching" && c.
 // card without a `brawlTagline` is excluded; the static set of "this
 // card is brawl-eligible" is the single source of truth in
 // `brawlTaglines.ts` -> stamped onto SESSION_CARDS at module load.
-const BRAWL_GENERAL_BATTING = GENERAL_BATTING.filter((c) => !!c.brawlTagline);
-const BRAWL_GENERAL_PITCHING = GENERAL_PITCHING.filter((c) => !!c.brawlTagline);
+//
+// The brawl-exclusive cards live ONLY here -- we re-scan SESSION_CARDS
+// instead of starting from `GENERAL_BATTING` (which strips them) so the
+// brawl pool keeps its full size.
+const BRAWL_GENERAL_BATTING = SESSION_CARDS.filter(
+  (c) =>
+    c.type === "Batting" && c.abilityType === "General Draw" && !!c.brawlTagline,
+);
+const BRAWL_GENERAL_PITCHING = SESSION_CARDS.filter(
+  (c) =>
+    c.type === "Pitching" && c.abilityType === "General Draw" && !!c.brawlTagline,
+);
 
 // Resolve curated brawl flavor pools to live CardDefinitions on
 // startup so the deal-time hot path never re-scans the global card
@@ -337,11 +382,19 @@ const EXPECTED_HAND_SIZE = 5;
  *
  * Throws if the player's data is broken (missing signature card, empty
  * pool); silently shrinking the hand was previously a flaky failure mode.
+ *
+ * Brawl-only `restrictGeneralPoolTo`: when set, the random generals are
+ * drawn ONLY from cards whose ID is in this set (intersected with the
+ * curated brawl pool for the player's role). Used by the inning-start
+ * "concession" draft so the user has a tight 15-card pool to plan
+ * around. Falls back to the wider brawl pool if the intersection has
+ * fewer than 2 cards, so a misconfigured restriction can never produce
+ * a short hand.
  */
 export function dealHand(
   player: MlbPlayer,
   seed = Math.floor(Math.random() * 1_000_000),
-  opts?: { brawlMode?: boolean },
+  opts?: { brawlMode?: boolean; restrictGeneralPoolTo?: ReadonlySet<string> | null },
 ): CardDefinition[] {
   const signatures = player.signatureCardIds.map((id) => cardsById[id]);
   if (signatures.some((c) => !c)) {
@@ -356,19 +409,42 @@ export function dealHand(
   // dealt as-is; their brawl simplifications live in `brawlTaglines`.)
   const battingPool = opts?.brawlMode ? BRAWL_GENERAL_BATTING : GENERAL_BATTING;
   const pitchingPool = opts?.brawlMode ? BRAWL_GENERAL_PITCHING : GENERAL_PITCHING;
-  const generalPool = player.role === "Batter" ? battingPool : pitchingPool;
+  let generalPool = player.role === "Batter" ? battingPool : pitchingPool;
+  // Apply the user's brawl-draft pool restriction when set. Intersect
+  // with the curated role pool so a stray non-role ID in the user's
+  // pool can't sneak in (the user's pool is a single combined list of
+  // both batting + pitching IDs; only the matching subset applies to
+  // each seat). If the intersection drops below 2 we fall back to the
+  // wider role pool so a hand can always be dealt -- failing closed
+  // would soft-lock the brawl.
+  if (opts?.brawlMode && opts.restrictGeneralPoolTo && opts.restrictGeneralPoolTo.size > 0) {
+    const allow = opts.restrictGeneralPoolTo;
+    const filtered = generalPool.filter((c) => allow.has(c.id));
+    if (filtered.length >= 2) generalPool = filtered;
+  }
   // Per-player brawl flavoring: in brawl mode draw ONE of the two
   // generals from the player's curated flavor pool (so e.g. Aaron
   // Judge "feels" power-y every brawl) and the other from the wider
   // brawl pool (so the player doesn't see the same 5 cards every
   // deal). Falls back to the wide pool if the flavor pool is empty
   // for the role (intentional: pitching-flavor batters etc.).
+  //
+  // When the user's draft restriction is active we also intersect the
+  // flavor pool with the restriction. If that intersection is empty,
+  // we skip the flavor draw entirely and pull both generals from the
+  // restricted role pool -- the player's "feel" gives way to the
+  // user-curated pool, which is what they signed up for at the
+  // Concessions/Bathroom-Break/Home-Stretch screens.
   let generals: CardDefinition[];
   if (opts?.brawlMode) {
-    const flavorPool =
+    let flavorPool =
       player.role === "Batter"
         ? BRAWL_FLAVOR_POOLS_BATTING[player.brawlFlavor]
         : BRAWL_FLAVOR_POOLS_PITCHING[player.brawlFlavor];
+    if (opts.restrictGeneralPoolTo && opts.restrictGeneralPoolTo.size > 0) {
+      const allow = opts.restrictGeneralPoolTo;
+      flavorPool = flavorPool.filter((c) => allow.has(c.id));
+    }
     if (flavorPool.length > 0) {
       const [flavored] = pickRandomTwo(flavorPool, seed);
       // Draw the second general from the wide pool, but EXCLUDE the

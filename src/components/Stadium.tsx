@@ -150,16 +150,12 @@ export function Stadium() {
       {/* Runners.
           - During a hit's between-at-bats phase: render an AnimatedRunner per
             recorded RunnerMove so the user can see them traverse the bases.
-          - Otherwise (selecting / outs / game-over): render static runners on
-            whichever bases are currently occupied. */}
+          - During revealing / selecting / game-over: static runners on
+            whichever bases the store says are occupied (the pre-play
+            snapshot during reveal — new occupants apply at completeReveal). */}
       {!fieldEmpty && (() => {
         const showAnimated =
           phase === 'between-at-bats' && lastOutcome && lastOutcome !== 'out' && runnerMoves.length > 0;
-        // lockIn commits bases immediately but keeps phase in `revealing`
-        // until the card / brawl attack timeline finishes. Static runners
-        // during that window make a figure pop onto 1B while cards are
-        // still flying — especially noticeable in Brawl Mode's long reveal.
-        if (phase === 'revealing') return null;
         if (showAnimated) {
           return runnerMoves.map((move) => (
             <AnimatedRunner
