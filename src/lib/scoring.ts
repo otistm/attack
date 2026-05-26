@@ -1,4 +1,5 @@
 import { CardDefinition, TagLiteral } from "./cards";
+import { isAbilityCard, isValueCard } from "./cardModel";
 import { ITEMS } from "./items";
 import { ShapeType } from "../components/cardShapes";
 import { canConnect, canConnectAny, seamKey } from "./connect";
@@ -586,9 +587,11 @@ function scoreGroup(rawGroup: CardDefinition[], ctx: ScoringContext, hand: CardD
       baseSilenced ||
       tagSilenced ||
       chainTooShort;
-    const effect: EffectResult = isNullified
-      ? { selfValueDelta: 0, opponentValueDelta: 0, hitScaleBonus: 0, pitcherCombinedDelta: 0 }
-      : applyCardEffect(card, effectCtx);
+
+    const effect: EffectResult =
+      isNullified || isValueCard(card)
+        ? { selfValueDelta: 0, opponentValueDelta: 0, hitScaleBonus: 0, pitcherCombinedDelta: 0 }
+        : applyCardEffect(card, effectCtx);
     // chainTooShort zeros the baseValue too (mirrors `disabled` semantics).
     
     let itemValueBonus = 0;
@@ -609,10 +612,18 @@ function scoreGroup(rawGroup: CardDefinition[], ctx: ScoringContext, hand: CardD
     // doesn't double-dip.
     const tier = (card.sznItemTier as ItemTier | undefined) ?? "bronze";
     const tierMul = TIER_MULTIPLIER[tier];
-    const scaledBase = tier === "bronze" ? card.baseValue : Math.round(card.baseValue * tierMul);
-    const scaledDelta = tier === "bronze"
-      ? effect.selfValueDelta
-      : Math.round(effect.selfValueDelta * tierMul);
+    const scaledBase =
+      isValueCard(card) && !chainTooShort
+        ? tier === "bronze"
+          ? card.baseValue
+          : Math.round(card.baseValue * tierMul)
+        : 0;
+    const scaledDelta =
+      isAbilityCard(card) && !chainTooShort
+        ? tier === "bronze"
+          ? effect.selfValueDelta
+          : Math.round(effect.selfValueDelta * tierMul)
+        : 0;
     const finalValue = chainTooShort ? 0 : scaledBase + scaledDelta + itemValueBonus;
 
     let highlightColor: string | undefined;

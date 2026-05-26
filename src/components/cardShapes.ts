@@ -1,3 +1,6 @@
+import type { EdgeColor } from '../lib/cardModel';
+import { EDGE_COLOR_LABEL, EDGE_COLORS, shapeToDefaultColor } from '../lib/cardModel';
+
 export type ShapeType = 'diamond' | 'circle' | 'square' | 'star' | 'wildcard' | 'none';
 
 export const SHAPE_COLORS: Record<ShapeType, string> = {
@@ -59,12 +62,17 @@ export type ShapeMode = 'normal' | 'wildcard' | 'blocked' | 'picky';
  */
 export type ConnectHint = 'allow' | 'block' | undefined;
 
+export type ColorMode = 'normal' | 'wildcard' | 'blocked' | 'picky';
+
 export interface ShapeHalfProps {
   shape: ShapeType;
+  /** Edge fill — independent of shape geometry. Falls back to legacy shape palette. */
+  edgeColor?: EdgeColor;
   side: 'left' | 'right';
   isConnected: boolean;
   compact?: boolean;
   mode?: ShapeMode;
+  colorMode?: ColorMode;
   hint?: ConnectHint;
   /**
    * True while ANY card in the parent HandStrip is being actively dragged.

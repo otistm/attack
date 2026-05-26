@@ -27,6 +27,7 @@
  */
 
 import type { CardDefinition } from "./cards";
+import { printedNumericValue } from "./cardModel";
 import type { Rarity, RosterPlayer } from "./run";
 import { RARITY_BASE_VALUE } from "./run";
 import { SZN_EDGES, type SznEdgeId } from "./sznEdges";
@@ -220,22 +221,62 @@ export const ENCOUNTER_UTILITY_TAGS: Record<string, string> = {
 };
 
 /**
- * What number / tag to show in the big body slot of a card. Returns
- * the raw `baseValue` for normal cards; returns the utility tag for
- * zero-base EncounterItems; returns "—" for unknown utility items so
- * the surface never goes blank.
+ * Center body number for any catalog card. Value cards use `baseValue`;
+ * ability cards use the legacy printed value captured at normalize time.
  */
-export function displayValueFor(card: CardDefinition | undefined): number | string {
+export function displayValueFor(card: CardDefinition | undefined): number {
   if (!card) return 0;
-  if (card.baseValue === 0 && card.abilityType === "EncounterItem") {
-    return ENCOUNTER_UTILITY_TAGS[card.id] ?? "—";
-  }
-  return card.baseValue;
+  return printedNumericValue(card);
 }
 
-/** True when the value should render as a short text tag (1rem) instead of a big numeric. */
-export function isUtilityValue(value: number | string): value is string {
+/** Full-width top header strip for player + card name on play-card surfaces. */
+export function cardHeaderClassName(compact: boolean, onColoredBody = false): string {
+  const pad = compact ? "px-1.5 py-1" : "px-2 py-1.5";
+  const surface = onColoredBody
+    ? "bg-black/30 border-white/25"
+    : "bg-white border-slate-200";
+  return `${pad} border-b ${surface}`;
+}
+
+export function cardHeaderPlayerClassName(compact: boolean, onColoredBody = false): string {
+  const color = onColoredBody ? "text-white/85" : "text-slate-500";
+  return compact
+    ? `text-[8px] font-extrabold uppercase tracking-widest leading-none truncate ${color}`
+    : `text-[10px] font-extrabold uppercase tracking-widest leading-none truncate ${color}`;
+}
+
+export function cardHeaderNameClassName(compact: boolean, onColoredBody = false): string {
+  const color = onColoredBody ? "text-white" : "text-slate-800";
+  return compact
+    ? `text-[9px] leading-tight font-bold uppercase tracking-wide line-clamp-2 ${color}`
+    : `text-[11px] leading-tight font-bold uppercase tracking-wide line-clamp-2 ${color}`;
+}
+
+/** Full-width bottom footer for ability rules text on play-card surfaces. */
+export function abilityFooterClassName(compact: boolean): string {
+  return compact
+    ? "text-[9px] leading-snug font-semibold normal-case tracking-normal text-slate-700 text-center line-clamp-3 bg-white border-t border-slate-200 px-1.5 py-1"
+    : "text-[11px] leading-snug font-semibold normal-case tracking-normal text-slate-700 text-center line-clamp-3 bg-white border-t border-slate-200 px-2 py-1.5";
+}
+
+/** Vertical inset classes so center value sits in true card center. */
+export function cardCenterInsetClass(_compact: boolean, _hasFooter: boolean): string {
+  return "inset-0";
+}
+
+/** Absolute positioning + flex centering for the big card number. */
+export function cardCenterValueClass(): string {
+  return "absolute inset-0 flex items-center justify-center";
+}
+
+/** True when the center body should render as readable text, not a big number. */
+export function isTextCenterValue(value: number | string): value is string {
   return typeof value === "string";
+}
+
+/** True when the value should render as short text instead of a big numeric. */
+export function isUtilityValue(value: number | string): value is string {
+  return isTextCenterValue(value);
 }
 
 /**
@@ -431,6 +472,19 @@ export function rosterSubtitle(rp: RosterPlayer): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * Quick Match / Brawl in-hand card footprint (200×176). Extra width for
+ * ability faceText; height unchanged from the legacy 176px shell.
+ */
+export const PLAY_CARD = {
+  widthPx: 200,
+  heightPx: 176,
+  compactWidthPx: 125,
+  compactHeightPx: 112,
+  cardClass: "w-[200px] h-[176px] rounded-xl",
+  compactCardClass: "w-[125px] h-[112px] rounded-lg",
+} as const;
+
+/**
  * Canonical size table for the unified `<SznCard>` shell. Every
  * card-shaped surface in SZN mode picks one of these sizes; the
  * actual pixel dimensions, border radius, font scale, and padding
@@ -439,8 +493,8 @@ export function rosterSubtitle(rp: RosterPlayer): string {
  *
  * "chip"     — 96×136, footer rail / merchant / market / pickers
  * "compact"  — 96×128 (slightly shorter), tight grids
- * "standard" — 128×176, the canonical 5:7 playable card
- * "large"    — 176×240, pack reveal hero
+ * "standard" — 200×176, the canonical playable card (matches PLAY_CARD)
+ * "large"    — 220×176, pack reveal hero
  */
 export const SZN_CARD_SIZES = {
   chip: {
@@ -466,26 +520,26 @@ export const SZN_CARD_SIZES = {
     padClass: "px-1.5",
   },
   standard: {
-    widthPx: 128,
-    heightPx: 176,
+    widthPx: PLAY_CARD.widthPx,
+    heightPx: PLAY_CARD.heightPx,
     radiusClass: "rounded-xl",
-    nameTextClass: "text-[10px]",
-    teamTextClass: "text-[8px]",
-    valueFontSize: "3rem",
+    nameTextClass: "text-[11px]",
+    teamTextClass: "text-[9px]",
+    valueFontSize: "3.25rem",
     utilityFontSize: "1.125rem",
-    badgeTextClass: "text-[8px]",
-    padClass: "px-2",
+    badgeTextClass: "text-[9px]",
+    padClass: "px-2.5",
   },
   large: {
-    widthPx: 176,
-    heightPx: 240,
+    widthPx: 220,
+    heightPx: 176,
     radiusClass: "rounded-xl",
     nameTextClass: "text-xs",
     teamTextClass: "text-[10px]",
-    valueFontSize: "3.75rem",
+    valueFontSize: "4rem",
     utilityFontSize: "1.5rem",
     badgeTextClass: "text-[10px]",
-    padClass: "px-2.5",
+    padClass: "px-3",
   },
 } as const;
 

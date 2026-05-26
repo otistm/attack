@@ -2,7 +2,20 @@ import { useMemo, useState, useCallback, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { Reorder, motion, AnimatePresence } from 'motion/react';
 import { CardDefinition } from '../lib/cards';
-import { canConnect, canConnectAny, shapeModeForSide, seamKey } from '../lib/connect';
+import { canConnect, canConnectAny, colorModeForSide, edgeColorForSide, shapeModeForSide, seamKey } from '../lib/connect';
+import { isAbilityCard, isValueCard } from '../lib/cardModel';
+import { abilityFaceText } from '../lib/cards';
+import {
+  abilityFooterClassName,
+  cardCenterValueClass,
+  cardHeaderClassName,
+  cardHeaderNameClassName,
+  cardHeaderPlayerClassName,
+  displayValueFor,
+  rarityLabel,
+  RARITY_GRADIENT,
+  PLAY_CARD,
+} from '../lib/cardDisplay';
 import { useGameStore, getUiUserSide, isLowLeverageAtBat, ResolutionBeat, RevealBeatAnimation, Phase, BRAWL_SNAP_DURATION_MS as BRAWL_SNAP_DURATION_MS_STORE } from '../lib/gameStore';
 import { HitOutcome, type BrawlOutcomeResolution } from '../lib/scoring';
 import {
@@ -16,6 +29,8 @@ import {
 } from '../lib/gameAudio';
 import { playSfx } from '../lib/sfx';
 import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
+import type { EdgeColor } from '../lib/cardModel';
+import { EDGE_COLOR_LABEL, EDGE_COLORS, shapeToDefaultColor } from '../lib/cardModel';
 import { SznEdgeHalf } from './SznEdgeHalf';
 import type { SznEdgeId } from '../lib/sznEdges';
 import { PlayerHero } from './PlayerHero';
@@ -30,7 +45,6 @@ import { BrawlDraftOverlay } from './brawl/BrawlDraftOverlay';
 import type { BrawlAura } from './brawl/BrawlImpactCanvas';
 import { teamPalette } from '../lib/teamColors';
 import { RARITY_BASE_VALUE } from '../lib/run';
-import { displayValueFor, rarityLabel, RARITY_GRADIENT } from '../lib/cardDisplay';
 import { activeSynergies, teamBatterBonus, teamPitcherBonus } from '../lib/synergies';
 import { PLAYERS } from '../lib/players';
 import { ALL_SZN_PLAYERS, isSznPlayer } from '../lib/sznPlayers';
@@ -85,26 +99,33 @@ const TEXT_COLORS: Record<string, string> = {
 
 export const ShapeHalf = ({
   shape,
+  edgeColor,
   side,
   isConnected,
   compact = false,
   mode = 'normal',
+  colorMode = 'normal',
   hint,
   dragActive = false,
 }: ShapeHalfProps) => {
   // Wildcard override: render as the emerald hexagon regardless of literal shape.
   const visualShape = mode === 'wildcard' ? 'wildcard' : shape;
+  const resolvedEdgeColor = edgeColor ?? shapeToDefaultColor(shape);
+  const visualColor: EdgeColor =
+    colorMode === 'wildcard' ? 'emerald' : resolvedEdgeColor;
 
   // 'blocked' edges still need to take up space so card layout matches; we
   // render a darkened nub and an X overlay so the player can see the side
   // can't combine.
-  const isBlocked = mode === 'blocked';
+  const isBlocked = mode === 'blocked' || colorMode === 'blocked';
 
   if (visualShape === 'none' && !isBlocked) return null;
 
   const { rotate, baseScale, borderRadius, clipPath } =
     SHAPE_DEFAULTS[isBlocked ? 'square' : visualShape];
-  const color = isBlocked ? '#475569' /* slate-600 */ : SHAPE_COLORS[visualShape];
+  const color = isBlocked
+    ? '#475569'
+    : EDGE_COLORS[visualColor] ?? SHAPE_COLORS[visualShape];
 
   // Wrapper is the visible "half" cut at the card edge. Shape is twice as wide
   // so half of it appears outside the wrapper's clip and the other half forms
@@ -121,18 +142,14 @@ export const ShapeHalf = ({
   // 'picky' sides get a dashed slate outline on their shape so the player can
   // see at a glance that this edge has shape restrictions. Slate-900 reads
   // clearly against every shape color in the palette.
-  const isPicky = mode === 'picky';
+  const isPicky = mode === 'picky' || colorMode === 'picky';
   const borderStyle = isPicky
     ? { border: '2.5px dashed #0f172a' /* slate-900 */ }
     : { border: '1.5px solid rgba(0,0,0,0.1)' };
 
-  // Hover-tooltip the shape with its plain capitalized name so descriptions
-  // like "+2 if combined with a SQUARE neighbor" stay anchored in the same
-  // vocabulary the player sees on the card. Skipped for blocked / wildcard
-  // sides because the title would lie about the underlying meaning.
   const shapeTitle =
     !isBlocked && visualShape !== 'wildcard' && visualShape !== 'none'
-      ? SHAPE_LABEL[visualShape as ShapeType]
+      ? `${SHAPE_LABEL[visualShape as ShapeType]} · ${EDGE_COLOR_LABEL[visualColor]}`
       : undefined;
 
   return (
@@ -432,57 +449,47 @@ export const CardItem = ({
   // `playerBaseValue + playerDelta` equals `modifier.value`.
   const playerDelta =
     isPlayerCard && modifier ? modifier.value - card.baseValue : 0;
-  // Combat display value. Player cards build their value from the
-  // rarity floor + scoring delta. Item cards use the scored modifier
-  // when present; when absent (no snap math contributed) we fall
-  // through to `displayValueFor`, which prints the encounter
-  // utility tag (SNAP / AURA / DEF / etc.) for zero-base encounter
-  // items instead of a literal "0". This is the same helper the
-  // footer rail, the merchant preview, and the bag picker use, so
-  // a utility item reads the same way in every surface of the game.
-  const displayValue: number | string = valueOverride ?? (
+  const cardIsAbility = isAbilityCard(card);
+  const cardIsValue = isValueCard(card);
+  // Combat display: player cards use rarity floor + delta; value cards
+  // use the live scored modifier when present; ability cards show their
+  // printed number in the center (footer holds the rules text).
+  const displayValue: number = valueOverride ?? (
     isPlayerCard && playerBaseValue != null
       ? playerBaseValue + playerDelta
-      : modifier?.value !== undefined && modifier.value !== 0
-        ? modifier.value
-        : displayValueFor(card)
+      : cardIsValue
+        ? modifier?.value !== undefined && modifier.value !== 0
+          ? modifier.value
+          : displayValueFor(card)
+        : cardIsAbility
+          ? displayValueFor(card)
+          : 0
   );
-  // General Draw cards take on their label color as their card body so they
-  // stand out from signature cards (which stay white) on a busy field view.
-  // In SZN Mode we also color every Signature card body with its `card.color`
-  // so encounter-acquired buff cards (All Rise, etc.) don't show up as a
-  // blank white tile in the at-bat hand strip. Legacy Victory / Quick Match
-  // still use the classic white-body-with-colored-band design.
-  const isGeneralDraw = card.abilityType === 'General Draw';
-  const tintAllSignatureCards = sznMode && !isPlayerCard;
-  const shouldUseCardColorBody =
-    (isGeneralDraw || tintAllSignatureCards) && !!card.color;
+  const abilityFooterText = cardIsAbility && !isPlayerCard ? abilityFaceText(card) : null;
+  const showCenterNumber = !isPlayerCard && (cardIsValue || cardIsAbility);
+  // General Draw value cards take their label color as the body fill.
+  // Signature ability cards stay white so the footer description reads
+  // clearly against a neutral face.
+  const isGeneralDraw = cardIsValue && card.abilityType === 'General Draw';
+  const shouldUseCardColorBody = isGeneralDraw && !!card.color;
   const cardBgClass = isPlayerCard
-    // Body color is applied via inline `style.background` for player
-    // cards (team gradient). `bg-slate-700` is a safety floor for the
-    // theoretical case where neither player registry can resolve the
-    // card id -- prevents the legacy "see-through card" bug from ever
-    // returning if a future code path ships a player card with an
-    // unknown id. Live SZN play always paints over this with the team
-    // gradient below.
     ? (playerPalette ? '' : 'bg-slate-700')
     : shouldUseCardColorBody ? card.color! : 'bg-white';
   const defaultValueColor = isPlayerCard
     ? 'text-white'
     : shouldUseCardColorBody ? 'text-white' : 'text-slate-800';
-  // Modifier colors recolor the value text to match the source ability -- but
-  // only on signature cards. General cards keep white text to stay readable on
-  // their colored body (an orange-tagged buff on an orange general would paint
-  // the value invisible against the background otherwise). Player cards
-  // (SZN Mode) also stay white so the team-color body never washes the
-  // tier value into a low-contrast smear.
-  const valueColorClass = shouldUseCardColorBody || isPlayerCard
+  const valueColorClass = isPlayerCard || shouldUseCardColorBody
     ? defaultValueColor
     : modifier?.color
       ? TEXT_COLORS[modifier.color] || defaultValueColor
       : defaultValueColor;
+  const headerOnColoredBody = shouldUseCardColorBody;
   const leftMode = shapeModeForSide(card, 'left');
   const rightMode = shapeModeForSide(card, 'right');
+  const leftColorMode = colorModeForSide(card, 'left');
+  const rightColorMode = colorModeForSide(card, 'right');
+  const leftEdgeColor = edgeColorForSide(card, 'left');
+  const rightEdgeColor = edgeColorForSide(card, 'right');
 
   // Sizing tokens that swap together for the compact pitcher-hand variant.
   // `gap` = outer gutter when NOT connected.
@@ -491,9 +498,9 @@ export const CardItem = ({
   // the cards themselves overlapping.
   const sz = compact
     ? {
-        card: 'w-20 h-28 rounded-lg',
-        nameText: 'text-[7px]',
-        playerText: 'text-[6px]',
+        card: PLAY_CARD.compactCardClass,
+        nameText: 'text-[8px]',
+        playerText: 'text-[7px]',
         valueText: 'text-3xl',
         valueMargin: 'mt-2',
         gap: 4,
@@ -501,9 +508,9 @@ export const CardItem = ({
         topPad: 'top-1',
       }
     : {
-        card: 'w-32 h-44 rounded-xl',
-        nameText: 'text-[9px]',
-        playerText: 'text-[8px]',
+        card: PLAY_CARD.cardClass,
+        nameText: 'text-[10px]',
+        playerText: 'text-[9px]',
         valueText: 'text-5xl',
         valueMargin: 'mt-4',
         gap: 8,
@@ -629,7 +636,7 @@ export const CardItem = ({
   }, [abilityHoverOpen, syncAbilityAnchor]);
 
   const abilityTooltip =
-    !cardBrawlMode &&
+    cardIsAbility &&
     abilityHoverOpen &&
     abilityAnchor &&
     typeof document !== 'undefined' &&
@@ -687,10 +694,10 @@ export const CardItem = ({
         flex flex-col items-center justify-center
         ${readOnly ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'}
       `}
-        onPointerEnter={isPlayerCard || cardBrawlMode ? undefined : openAbilityHover}
-        onPointerLeave={isPlayerCard || cardBrawlMode ? undefined : scheduleCloseAbilityHover}
+        onPointerEnter={isPlayerCard || cardIsValue ? undefined : openAbilityHover}
+        onPointerLeave={isPlayerCard || cardIsValue ? undefined : scheduleCloseAbilityHover}
         onPointerMove={() => {
-          if (!cardBrawlMode && abilityHoverRef.current) syncAbilityAnchor();
+          if (!cardIsValue && abilityHoverRef.current) syncAbilityAnchor();
         }}
         animate={revealAnimate ?? baseAnimate}
         transition={revealAnimate ? revealTransition : baseTransition}
@@ -716,10 +723,12 @@ export const CardItem = ({
         ) : (
           <ShapeHalf
             shape={card.leftShape}
+            edgeColor={leftEdgeColor}
             side="left"
             isConnected={isConnectedLeft}
             compact={compact}
             mode={leftMode}
+            colorMode={leftColorMode}
             hint={leftHint}
             dragActive={dragActive}
           />
@@ -736,10 +745,12 @@ export const CardItem = ({
         ) : (
           <ShapeHalf
             shape={card.rightShape}
+            edgeColor={rightEdgeColor}
             side="right"
             isConnected={isConnectedRight}
             compact={compact}
             mode={rightMode}
+            colorMode={rightColorMode}
             hint={rightHint}
             dragActive={dragActive}
           />
@@ -781,7 +792,7 @@ export const CardItem = ({
             {/* Brawl Mode tagline directly below the player-card name.
                 Both sizes wrap to 2 lines for the same readability
                 reason as the non-player card variant. */}
-            {cardBrawlMode && card.brawlTagline && (
+            {cardBrawlMode && card.brawlTagline && !cardIsAbility && (
               <motion.span
                 key={`tagline-${highlightTone ?? 'idle'}`}
                 className={`${compact ? 'text-[7px] leading-[1.1]' : 'text-[9px] leading-[1.15]'} font-bold uppercase tracking-tight text-amber-900 bg-amber-200/95 rounded px-1 py-0.5 max-w-[92%] text-center border border-amber-400/60 shadow-sm line-clamp-2`}
@@ -819,80 +830,60 @@ export const CardItem = ({
           </div>
         </>
       ) : (
-        <div className={`absolute ${sz.topPad} left-0 right-0 flex flex-col items-center z-30 px-1 text-center w-full`}>
+        <div className={`absolute inset-x-0 top-0 z-30 flex flex-col items-center text-center w-full ${cardHeaderClassName(compact, headerOnColoredBody)}`}>
           {!hideCardPlayer && card.player && (
-            <div className={`${sz.playerText} font-extrabold text-slate-400 uppercase tracking-widest leading-none mb-0.5 truncate max-w-[80%]`}>
+            <div className={`w-full ${cardHeaderPlayerClassName(compact, headerOnColoredBody)}`}>
               {card.player.split(' (')[0]}
             </div>
           )}
-          <div className={`${sz.nameText} leading-tight font-bold text-slate-700 uppercase tracking-wide bg-white/95 rounded px-1 py-0.5 line-clamp-2 text-center border border-slate-200 shadow-sm`} style={{ maxWidth: '70%' }}>
+          <div className={`w-full ${cardHeaderNameClassName(compact, headerOnColoredBody)}`}>
             {card.name}
           </div>
-          {/* Brawl Mode: replace the hover tooltip with an inline tagline
-              rendered directly on the card face. Both card sizes wrap to
-              2 lines because the 15s snap timer punishes any moment the
-              user spends squinting at a truncated ability -- letting the
-              chip overflow to a second line keeps every brawl tagline
-              fully readable. Clamp at 2 so a malformed long tagline can't
-              push the value text out of position. */}
-          {cardBrawlMode && card.brawlTagline && (
-            <motion.div
-              key={`tagline-${highlightTone ?? 'idle'}`}
-              className={`${compact ? 'text-[7px] leading-[1.1]' : 'text-[9px] leading-[1.15]'} mt-0.5 font-bold uppercase tracking-tight text-amber-900 bg-amber-200/95 rounded px-1 py-0.5 text-center border border-amber-400/60 shadow-sm line-clamp-2`}
-              style={{ maxWidth: '92%' }}
-              animate={
-                highlightTone === 'source'
-                  ? {
-                      // Brawl reveal: tagline IS the ability. Pulse it gold
-                      // + shake + glow when the source-card beat triggers so
-                      // the user reads "this is the card that just fired"
-                      // straight from the chip without needing the spotlight
-                      // overlay to spell it out. ~500ms run keeps the visual
-                      // beat-locked to the existing RevealBeatSpotlight tween.
-                      backgroundColor: ['rgba(254,243,199,0.95)', 'rgba(250,204,21,0.98)', 'rgba(254,243,199,0.95)'],
-                      scale: [1, 1.18, 1.06],
-                      x: [0, -2, 2, -1, 1, 0],
-                      boxShadow: [
-                        '0 0 0 0 rgba(250,204,21,0)',
-                        '0 0 14px 4px rgba(250,204,21,0.85)',
-                        '0 0 4px 1px rgba(250,204,21,0.35)',
-                      ],
-                    }
-                  : { scale: 1, x: 0 }
-              }
-              transition={{ duration: 0.5, ease: 'easeOut' }}
-            >
-              {card.brawlTagline}
-            </motion.div>
-          )}
         </div>
       )}
-      {/* The value text used to be keyed by `displayValue`, which forced a
-          full remount + entry pop (scale 1.5 -> 1, opacity 0.5 -> 1) every
-          time the number changed. Reorder.Group recomputes scoring on every
-          drag move, so cards whose modifier value depended on hand position
-          (e.g. a +2 buff fluctuating with combination state) appeared to
-          "reload" mid-drag. We still pop on RevealOverride landings (the
-          orchestrator pins the value with a fresh key to celebrate beats),
-          but plain modifier changes during selection now update silently. */}
-      <motion.div
-        data-tutorial={tutorialRegions ? 'card-value' : undefined}
-        key={valueOverride !== undefined ? `override-${valueOverride}` : 'live'}
-        initial={
-          valueOverride !== undefined
-            ? { scale: 1.5, opacity: 0.5 }
-            : false
-        }
-        animate={
-          valueOverride !== undefined
-            ? { scale: 1, opacity: 1 }
-            : undefined
-        }
-        transition={{ type: 'spring', stiffness: 300, damping: 15 }}
-        className={`${sz.valueText} font-black z-30 drop-shadow-sm transition-colors duration-300 ${valueColorClass} ${sz.valueMargin}`}
-      >
-        {displayValue}
-      </motion.div>
+      {showCenterNumber && (
+        <motion.div
+          data-tutorial={tutorialRegions ? 'card-value' : undefined}
+          key={valueOverride !== undefined ? `override-${valueOverride}` : 'live'}
+          initial={
+            valueOverride !== undefined
+              ? { scale: 1.5, opacity: 0.5 }
+              : false
+          }
+          animate={
+            valueOverride !== undefined
+              ? { scale: 1, opacity: 1 }
+              : undefined
+          }
+          transition={{ type: 'spring', stiffness: 300, damping: 15 }}
+          className={`${cardCenterValueClass()} ${sz.valueText} font-black z-20 drop-shadow-sm transition-colors duration-300 ${valueColorClass}`}
+        >
+          {displayValue}
+        </motion.div>
+      )}
+      {abilityFooterText && (
+        <motion.div
+          key={cardBrawlMode && highlightTone === 'source' ? `footer-${highlightTone}` : 'footer-idle'}
+          className={`absolute inset-x-0 bottom-0 z-30 ${abilityFooterClassName(compact)}`}
+          animate={
+            cardBrawlMode && highlightTone === 'source'
+              ? {
+                  backgroundColor: ['rgba(255,255,255,0.95)', 'rgba(254,243,199,0.98)', 'rgba(255,255,255,0.95)'],
+                  scale: [1, 1.06, 1.02],
+                  x: [0, -2, 2, -1, 1, 0],
+                  boxShadow: [
+                    '0 1px 2px rgba(0,0,0,0.08)',
+                    '0 0 14px 4px rgba(250,204,21,0.55)',
+                    '0 1px 2px rgba(0,0,0,0.08)',
+                  ],
+                }
+              : { scale: 1, x: 0 }
+          }
+          transition={{ duration: 0.5, ease: 'easeOut' }}
+        >
+          {abilityFooterText}
+        </motion.div>
+      )}
     </motion.div>
     </>
   );
@@ -906,8 +897,10 @@ const BRAWL_SNAP_DURATION_MS = BRAWL_SNAP_DURATION_MS_STORE;
 const BRAWL_AI_REEVAL_MS = 2500;
 /** Delay between each opponent card shuffle / seam snap during selection. */
 const BRAWL_OPPONENT_ARRANGE_STEP_MS = 420;
-/** Show "snap to attack" nudge when timer drops below this threshold. */
-const BRAWL_SNAP_HINT_THRESHOLD_MS = 5000;
+/** Show "snap to attack" nudge when timer drops below this threshold (final third). */
+const BRAWL_SNAP_HINT_THRESHOLD_MS = BRAWL_SNAP_DURATION_MS / 3;
+/** Snap-timer tick SFX window — last ~10s of the countdown. */
+const BRAWL_SNAP_TICK_WINDOW_MS = 10_000;
 
 export const CardGameOverlay = () => {
   // SZN deck-footer height (the always-visible two-row decks rendered by
@@ -931,13 +924,13 @@ export const CardGameOverlay = () => {
   // to the run controller (advances to game 2/3 or ends the series).
   const sznRunActive = useGameStore((s) => s.gameMode === 'szn' && !!s.run);
   // Brawl Mode flag. Strips the at-bat down to its core combat loop:
-  // no Manager's Hand, no Quest strip, no Lock-In button (a 15-second
-  // timer auto-locks for both sides). The opponent's value pill flips
+  // no Manager's Hand, no Quest strip. Lock In carries a 60s countdown
+  // and auto-commits when it hits zero. The opponent's value pill flips
   // to sit BELOW their cards, and both PlayerHero rails are hidden so
   // the pills are the canonical HP readouts during the snap.
   const brawlMode = useGameStore((s) => s.gameMode === 'brawl');
   // True while the inning-start draft overlay is up. We unmount the
-  // snap timer in that case so the 15s countdown can't tick down
+  // lock-in timer in that case so the countdown can't tick down
   // behind the picker -- it re-anchors fresh once the user picks
   // (see `selectBrawlDraftCard` in gameStore).
   const brawlDraftActive = useGameStore((s) => s.brawlDraftChoice !== null);
@@ -1825,7 +1818,10 @@ export const CardGameOverlay = () => {
   // controller affordance.
   const gamepadPresent = useGamepadPresent();
   const screenCtaFocused =
-    sznRunActive && gamepadPresent && sznGamepadFocus === 'screen';
+    (sznRunActive || brawlMode) &&
+    gamepadPresent &&
+    sznGamepadFocus === 'screen' &&
+    isSelecting;
 
   /** SZN: flat team tag bonus folded into the matchup pill via `sznSideBonus`. */
   const userSznRosterSynergyAmount = useMemo(() => {
@@ -2328,19 +2324,17 @@ export const CardGameOverlay = () => {
                 className="flex flex-col items-center gap-2"
               >
                 {brawlMode ? (
-                  // Brawl Mode replaces the manual Lock In commit with the
-                  // snap timer. The countdown is the user's only
-                  // pre-resolution affordance: snap cards together until 0
-                  // and the engine commits whatever they've built. While
-                  // the inning-start draft overlay is up we UNMOUNT the
-                  // timer so it re-anchors fresh once the user picks --
-                  // otherwise the 15s would tick down behind the picker.
+                  // Brawl Lock In embeds the countdown inside the commit
+                  // button. Tap early or let it hit zero — both fire
+                  // lockIn. Unmount while the inning-start draft is up so
+                  // the 60s window re-anchors once the user picks.
                   brawlDraftActive ? null : (
-                    <BrawlSnapTimer
+                    <BrawlLockInButton
                       phase={phase}
                       atBatId={atBatId}
-                      onTimeout={lockIn}
+                      onLockIn={lockIn}
                       onRemainingMsChange={setBrawlSnapRemainingMs}
+                      focused={screenCtaFocused}
                     />
                   )
                 ) : (
@@ -2568,24 +2562,14 @@ const QuickResolveToggle = ({
 };
 
 /**
- * Brawl Mode snap timer. Replaces the manual Lock In button: the user has
- * exactly 15 seconds (BRAWL_SNAP_DURATION_MS) to snap cards together and
- * pump their HP pill before the at-bat auto-commits. Renders a chunky
- * countdown directly under the user's hand so the urgency is unmissable;
- * the bar drains left-to-right and the digit ticks down once per second.
+ * Brawl Mode Lock In button with an embedded countdown. The player can
+ * tap Lock In early or let the 60s window expire — both paths call
+ * `onLockIn` once and kick off the reveal sequence.
  *
  * Mounts only during `phase === "selecting"`. Resets every time the phase
- * re-enters selecting (next at-bat), so a 0s leftover from the previous
- * play can't auto-lock the fresh one. The timeout calls `onTimeout` once
- * and only once via a ref-guarded effect -- otherwise an `effect` re-run
- * could fire the auto-commit twice (which would silently re-run `lockIn`
- * after the engine already moved into `revealing`, no-op now but a tax on
- * future refactors).
- *
- * Visual tone: amber-orange to read as "decision pressure" rather than
- * the blue/emerald of the existing Lock In CTA -- a different vocabulary
- * for a different lane. Pulses the ring on the final 2 seconds so the
- * user feels the squeeze.
+ * re-enters selecting so a 0s leftover from the previous play can't
+ * auto-lock the fresh one. A ref-guard ensures `onLockIn` fires at most
+ * once (manual click OR timeout, never both).
  */
 function BrawlSnapAttackHint({
   remainingMs,
@@ -2596,7 +2580,7 @@ function BrawlSnapAttackHint({
 }) {
   const show =
     remainingMs <= BRAWL_SNAP_HINT_THRESHOLD_MS && remainingMs > 0 && !hasSnapChain;
-  const urgent = remainingMs <= 2000;
+  const urgent = remainingMs <= 10_000;
 
   return (
     <AnimatePresence>
@@ -2627,30 +2611,37 @@ function BrawlSnapAttackHint({
   );
 }
 
-function BrawlSnapTimer({
+function BrawlLockInButton({
   phase,
   atBatId,
-  onTimeout,
+  onLockIn,
   onRemainingMsChange,
+  focused = false,
 }: {
   phase: Phase;
-  /** Resets the countdown when a fresh at-bat deals in. */
   atBatId: number;
-  onTimeout: () => void;
-  /** Fires every animation frame while selecting so sibling UI (hints) can react. */
+  onLockIn: () => void;
   onRemainingMsChange?: (ms: number) => void;
+  focused?: boolean;
 }) {
   const prepareBrawlOpponent = useGameStore((s) => s.prepareBrawlOpponent);
   const [remainingMs, setRemainingMs] = useState(BRAWL_SNAP_DURATION_MS);
   const firedRef = useRef(false);
-  const onTimeoutRef = useRef(onTimeout);
+  const onLockInRef = useRef(onLockIn);
   const onRemainingMsChangeRef = useRef(onRemainingMsChange);
   useEffect(() => {
-    onTimeoutRef.current = onTimeout;
-  }, [onTimeout]);
+    onLockInRef.current = onLockIn;
+  }, [onLockIn]);
   useEffect(() => {
     onRemainingMsChangeRef.current = onRemainingMsChange;
   }, [onRemainingMsChange]);
+
+  const commitLockIn = useCallback((auto: boolean) => {
+    if (firedRef.current || phase !== 'selecting') return;
+    firedRef.current = true;
+    if (auto) playSfx('snapLock');
+    onLockInRef.current();
+  }, [phase]);
 
   // Re-run the brawl optimizer while the user rearranges cards so the
   // opponent adapts to the player's current order and forged seams.
@@ -2661,9 +2652,6 @@ function BrawlSnapTimer({
     return () => window.clearInterval(id);
   }, [phase, atBatId, prepareBrawlOpponent]);
 
-  // Drive the countdown off a fresh start time each time we (re)enter
-  // selecting. Without re-anchoring, the user could "save" leftover
-  // time between at-bats by ripping fast on the previous one.
   useEffect(() => {
     if (phase !== 'selecting') {
       onRemainingMsChangeRef.current?.(BRAWL_SNAP_DURATION_MS);
@@ -2673,9 +2661,6 @@ function BrawlSnapTimer({
     const startedAt = Date.now();
     setRemainingMs(BRAWL_SNAP_DURATION_MS);
     onRemainingMsChangeRef.current?.(BRAWL_SNAP_DURATION_MS);
-    // Track the last full-second the snap-tick SFX fired so the timer
-    // ticks exactly once per second across the final 5 seconds even
-    // though we drive the countdown off requestAnimationFrame.
     let lastTickSecond = -1;
     let raf = 0;
     const tick = () => {
@@ -2683,26 +2668,16 @@ function BrawlSnapTimer({
       const next = Math.max(0, BRAWL_SNAP_DURATION_MS - elapsed);
       setRemainingMs(next);
       onRemainingMsChangeRef.current?.(next);
-      // Snap-timer tick SFX: only fires inside the final 5s window so
-      // the audio cue tracks the visible urgency state (timer pulses
-      // amber → rose at the same threshold). The `> 0` guard keeps
-      // the auto-lock chime as the sole sound at 0s.
-      if (next > 0 && next <= 5000) {
+      if (next > 0 && next <= BRAWL_SNAP_TICK_WINDOW_MS) {
         const secondsLeft = Math.ceil(next / 1000);
         if (secondsLeft !== lastTickSecond) {
           lastTickSecond = secondsLeft;
-          playSfx("snapTick");
+          playSfx('snapTick');
         }
       }
       if (next <= 0) {
         if (!firedRef.current) {
-          firedRef.current = true;
-          // Auto-lock chime once, paired with the lockIn call.
-          playSfx("snapLock");
-          // Defer the lockIn call by a frame so React can finish the
-          // current render before the store mutates the phase out from
-          // under us. Same trick the reveal orchestrator uses.
-          raf = requestAnimationFrame(() => onTimeoutRef.current());
+          raf = requestAnimationFrame(() => commitLockIn(true));
         }
         return;
       }
@@ -2712,50 +2687,69 @@ function BrawlSnapTimer({
     return () => {
       cancelAnimationFrame(raf);
     };
-  }, [phase, atBatId]);
+  }, [phase, atBatId, commitLockIn]);
 
   if (phase !== 'selecting') return null;
 
   const seconds = Math.ceil(remainingMs / 1000);
   const fillPct = Math.max(0, Math.min(100, (remainingMs / BRAWL_SNAP_DURATION_MS) * 100));
   const fillScale = fillPct / 100;
-  const urgent = remainingMs <= 2000;
+  const urgent = remainingMs <= 10_000;
 
   return (
-    <div
-      className={`relative flex items-center gap-3 px-5 py-3 rounded-xl bg-slate-950/85 border-2 shadow-[0_4px_24px_rgba(0,0,0,0.55)] backdrop-blur-sm select-none ${
+    <motion.button
+      type="button"
+      data-tutorial="lock-in"
+      onClick={() => commitLockIn(false)}
+      animate={
+        focused
+          ? {
+              scale: [1.04, 1.08, 1.04],
+              transition: { duration: 1.2, repeat: Infinity, ease: 'easeInOut' },
+            }
+          : { scale: 1, transition: { duration: 0.2 } }
+      }
+      whileHover={{ scale: focused ? 1.1 : 1.05 }}
+      whileTap={{ scale: 0.95 }}
+      className={`relative px-10 py-3 min-w-[11rem] rounded-full shadow-lg uppercase tracking-wider font-bold text-white overflow-hidden ${
         urgent
-          ? 'border-rose-400/80 ring-2 ring-rose-400/40 animate-pulse'
-          : 'border-amber-400/70 ring-2 ring-amber-300/30'
+          ? 'bg-blue-700 hover:bg-blue-600 ring-2 ring-rose-400/50 animate-pulse shadow-blue-900/50'
+          : 'bg-blue-600 hover:bg-blue-500 shadow-blue-900/50'
+      } ${
+        focused
+          ? 'ring-4 ring-amber-300 ring-offset-2 ring-offset-transparent shadow-[0_0_28px_8px_rgba(252,211,77,0.7)]'
+          : ''
       }`}
       role="timer"
       aria-live="off"
-      aria-label={`Brawl snap timer: ${seconds} seconds remaining`}
+      aria-label={`Lock in: ${seconds} seconds remaining`}
     >
-      <div className="flex flex-col items-start gap-1">
-        <span className="text-[10px] font-black uppercase tracking-[0.25em] text-amber-200/90">
-          Snap Timer
+      <div
+        className={`absolute inset-y-0 left-0 origin-left bg-blue-400/25 pointer-events-none ${
+          urgent ? 'bg-rose-400/20' : ''
+        }`}
+        style={{ width: `${fillPct}%` }}
+        aria-hidden="true"
+      />
+      <div className="relative z-[1] flex flex-col items-center gap-0.5 leading-none">
+        <span className="text-sm tracking-[0.22em]">Lock In</span>
+        <span
+          className={`tabular-nums text-3xl font-black ${
+            urgent ? 'text-rose-100' : 'text-white'
+          }`}
+        >
+          {seconds}
         </span>
-        {/* Drains horizontally so the user reads "time slipping away"
-            without having to track the digit. Width is clamped to a
-            fixed 96px so the bar doesn't visually stretch the pill. */}
-        <div className="relative h-1.5 w-24 rounded-full bg-slate-800 overflow-hidden">
+        <div className="mt-1 h-1 w-20 rounded-full bg-blue-950/40 overflow-hidden">
           <div
             className={`h-full w-full origin-left rounded-full ${
-              urgent ? 'bg-rose-400' : 'bg-amber-300'
+              urgent ? 'bg-rose-300' : 'bg-blue-200/90'
             }`}
             style={{ transform: `scaleX(${fillScale})` }}
           />
         </div>
       </div>
-      <div
-        className={`tabular-nums font-black text-4xl leading-none ${
-          urgent ? 'text-rose-300 drop-shadow-[0_0_12px_rgba(251,113,133,0.6)]' : 'text-amber-200'
-        }`}
-      >
-        {seconds}
-      </div>
-    </div>
+    </motion.button>
   );
 }
 
@@ -5140,8 +5134,8 @@ const BrawlOpponentArrangeStrip = ({
   }, [dealComplete, atBatId, dealtHand, planHand, planSeams]);
 
   const sz = compact
-    ? { card: 'w-20 h-28 rounded-lg', gap: 4, connectedGap: 0 }
-    : { card: 'w-32 h-44 rounded-xl', gap: 8, connectedGap: 0 };
+    ? { card: PLAY_CARD.compactCardClass, gap: 4, connectedGap: 0 }
+    : { card: PLAY_CARD.cardClass, gap: 8, connectedGap: 0 };
   const fromY = -180;
   const fromRot = -12;
   const signatureCount = displayHand.filter((c) => c.abilityType !== 'General Draw').length;
@@ -5211,8 +5205,8 @@ const FlipPitcherStrip = ({
   affirmedSeams,
 }: FlipPitcherStripProps) => {
   const sz = compact
-    ? { card: 'w-20 h-28 rounded-lg', gap: 4, connectedGap: 0 }
-    : { card: 'w-32 h-44 rounded-xl', gap: 8, connectedGap: 0 };
+    ? { card: PLAY_CARD.compactCardClass, gap: 4, connectedGap: 0 }
+    : { card: PLAY_CARD.cardClass, gap: 8, connectedGap: 0 };
 
   // Deal-in matches the batter strip's vertical fly-in but mirrored on top.
   const fromY = -180;

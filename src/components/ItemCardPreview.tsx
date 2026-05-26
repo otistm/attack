@@ -12,7 +12,7 @@
  * the bag, and dealing it into combat are all the same object visually,
  * which dissolves the "where is this thing in the game?" question.
  *
- * The footprint matches `CardItem`'s 5:7 ratio (`w-32 h-44`) with a
+ * The footprint matches `CardItem` (`PLAY_CARD`: 200×176) with a
  * compact variant for tight grids.
  *
  * Hover-ability tooltip
@@ -40,14 +40,21 @@
 import { useId, type CSSProperties } from "react";
 import { motion } from "motion/react";
 import type { CardDefinition } from "../lib/cards";
+import { abilityFaceText, isAbilityCard, isValueCard } from "../lib/cardModel";
 import { ShapeHalf } from "./CardGameOverlay";
-import { shapeModeForSide } from "../lib/connect";
+import { colorModeForSide, edgeColorForSide, shapeModeForSide } from "../lib/connect";
 import { useGameStore } from "../lib/gameStore";
 import type { SznEdgeId } from "../lib/sznEdges";
 import { SznEdgeHalf } from "./SznEdgeHalf";
 import { useAbilityHover } from "./useAbilityHover";
 import {
-  ENCOUNTER_UTILITY_TAGS,
+  abilityFooterClassName,
+  cardCenterValueClass,
+  cardHeaderClassName,
+  cardHeaderNameClassName,
+  cardHeaderPlayerClassName,
+  displayValueFor,
+  PLAY_CARD,
   resolveCardEdges,
 } from "../lib/cardDisplay";
 
@@ -112,7 +119,7 @@ export function ItemCardPreview({
       }
     : compact
       ? {
-          card: "w-20 h-28 rounded-lg",
+          card: PLAY_CARD.compactCardClass,
           nameText: "text-[7px]",
           playerText: "text-[6px]",
           valueText: "text-3xl",
@@ -120,9 +127,9 @@ export function ItemCardPreview({
           topPad: "top-1",
         }
       : {
-          card: "w-32 h-44 rounded-xl",
-          nameText: "text-[9px]",
-          playerText: "text-[8px]",
+          card: PLAY_CARD.cardClass,
+          nameText: "text-[10px]",
+          playerText: "text-[9px]",
           valueText: "text-5xl",
           valueMargin: "mt-3",
           topPad: "top-2",
@@ -130,17 +137,18 @@ export function ItemCardPreview({
 
   const isGeneralDraw = card.abilityType === "General Draw";
   const isPlayerCard = card.abilityType === "Player";
-  // General Draw cards take their label color as the body fill so they
-  // stand out in a strip; signature cards stay white.
-  const bgClass = isGeneralDraw && card.color ? card.color : "bg-white";
-  const valueColor = isGeneralDraw ? "text-white" : "text-slate-800";
-  const playerNameColor = isGeneralDraw ? "text-white/80" : "text-slate-400";
-  const cardNameClass = isGeneralDraw
-    ? "text-white bg-black/20 border-white/30"
-    : "text-slate-700 bg-white/95 border-slate-200";
+  const cardIsAbility = isAbilityCard(card);
+  const cardIsValue = isValueCard(card);
+  const onColoredBody = isGeneralDraw && cardIsValue && !!card.color;
+  const bgClass = onColoredBody ? card.color! : "bg-white";
+  const valueColor = onColoredBody ? "text-white" : "text-slate-800";
 
   const leftMode = shapeModeForSide(card, "left");
   const rightMode = shapeModeForSide(card, "right");
+  const leftColorMode = colorModeForSide(card, "left");
+  const rightColorMode = colorModeForSide(card, "right");
+  const leftEdgeColor = edgeColorForSide(card, "left");
+  const rightEdgeColor = edgeColorForSide(card, "right");
 
   // SZN edge resolution flows through the shared `resolveCardEdges`
   // helper so the merchant preview, the bag picker, the focused
@@ -152,17 +160,9 @@ export function ItemCardPreview({
     rightEdge: SznEdgeId | null;
   } = resolveCardEdges(card);
 
-  const displayValue = valueOverride ?? card.baseValue;
-  // Encounter "utility" items intentionally have baseValue 0 -- their
-  // effect lives in the snap/aura/instant logic, not the per-card
-  // score. Rendering "0" in the big value slot mis-reads as "this
-  // does nothing". We map known utility cards to a readable mini-tag
-  // (AURA / INTEL / SNAP) so the user sees the card has a job; falls
-  // back to an em-dash for any unmapped 0-value encounter card.
-  const utilityTag: string | null =
-    valueOverride == null && card.baseValue === 0 && card.abilityType === "EncounterItem"
-      ? ENCOUNTER_UTILITY_TAGS[card.id] ?? "—"
-      : null;
+  const displayValue = valueOverride ?? displayValueFor(card);
+  const abilityFooterText = cardIsAbility && !isPlayerCard ? abilityFaceText(card) : null;
+  const showCenterNumber = !isPlayerCard && (cardIsValue || cardIsAbility);
 
   // SZN-mode strips the legacy real-world player attribution from item
   // cards (it's flavor that has nothing to do with the user's signed
@@ -193,7 +193,7 @@ export function ItemCardPreview({
         ref={surfaceRef}
         whileHover={interactive ? { scale: 1.04, y: -2 } : undefined}
         whileTap={interactive ? { scale: 0.98 } : undefined}
-        className={`${sz.card} ${bgClass} relative border-2 border-slate-200 overflow-visible flex flex-col items-center justify-center shadow-md ${
+        className={`${sz.card} ${bgClass} relative border-2 border-slate-200 overflow-hidden flex flex-col shadow-md ${
           dimmed ? "opacity-50 grayscale" : ""
         }`}
         style={
@@ -223,62 +223,50 @@ export function ItemCardPreview({
           <>
             <ShapeHalf
               shape={card.leftShape}
+              edgeColor={leftEdgeColor}
               side="left"
               isConnected={false}
               compact={compact}
               mode={leftMode}
+              colorMode={leftColorMode}
             />
             <ShapeHalf
               shape={card.rightShape}
+              edgeColor={rightEdgeColor}
               side="right"
               isConnected={false}
               compact={compact}
               mode={rightMode}
+              colorMode={rightColorMode}
             />
           </>
         )}
 
-        {/* Player + card name plate (stacked) -- mirrors CardItem signature
-            layout. Player name is the small uppercase header; card name
-            is the larger plate sitting just below. The player line is
-            suppressed in SZN mode (see `hidePlayerName` comment above). */}
+        {/* Full-width header: player name + card title. */}
         <div
-          className={`absolute ${sz.topPad} left-0 right-0 flex flex-col items-center z-30 px-1 text-center w-full`}
+          className={`absolute inset-x-0 top-0 z-30 flex flex-col items-center text-center w-full ${cardHeaderClassName(compact, onColoredBody)}`}
         >
           {!hidePlayerName && card.player && (
-            <div
-              className={`${sz.playerText} font-extrabold uppercase tracking-widest leading-none mb-0.5 truncate max-w-[80%] ${playerNameColor}`}
-            >
+            <div className={`w-full ${cardHeaderPlayerClassName(compact, onColoredBody)}`}>
               {card.player.split(" (")[0]}
             </div>
           )}
-          <div
-            className={`${sz.nameText} leading-tight font-bold uppercase tracking-wide rounded px-1 py-0.5 line-clamp-2 text-center border shadow-sm ${cardNameClass}`}
-            style={{ maxWidth: "78%" }}
-          >
+          <div className={`w-full ${cardHeaderNameClassName(compact, onColoredBody)}`}>
             {card.name}
           </div>
         </div>
 
-        {/* Big numeric value -- THE single number that travels with the
-            card across every UI surface (in-hand, bag, merchant). Matches
-            the in-game CardItem position so the user reads the same
-            thing everywhere. Utility cards (encounter items with
-            baseValue 0) render their effect tag here instead of "0". */}
-        {utilityTag !== null ? (
+        {/* Value cards: big centered number. Ability cards: full-width footer. */}
+        {showCenterNumber && (
           <div
-            className={`font-black z-20 drop-shadow-sm tracking-widest ${valueColor} ${sz.valueMargin} ${
-              large ? "text-xl" : compact ? "text-[10px]" : "text-base"
-            }`}
-            title="Utility item -- effect is in the snap/aura/instant logic, not a per-card score."
-          >
-            {utilityTag}
-          </div>
-        ) : (
-          <div
-            className={`${sz.valueText} font-black z-20 drop-shadow-sm ${valueColor} ${sz.valueMargin}`}
+            className={`${cardCenterValueClass()} ${sz.valueText} font-black z-20 drop-shadow-sm ${valueColor}`}
           >
             {displayValue}
+          </div>
+        )}
+        {abilityFooterText && (
+          <div className={`absolute inset-x-0 bottom-0 z-30 ${abilityFooterClassName(compact)}`}>
+            {abilityFooterText}
           </div>
         )}
 

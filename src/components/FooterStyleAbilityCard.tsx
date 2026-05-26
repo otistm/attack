@@ -16,6 +16,7 @@
 import { useGameStore } from "../lib/gameStore";
 import { useAbilityHover } from "./useAbilityHover";
 import type { CardDefinition } from "../lib/cards";
+import { abilityFaceText, isAbilityCard } from "../lib/cardModel";
 import { SznCard } from "./SznCard";
 import {
   displayValueFor,
@@ -30,8 +31,8 @@ import {
  * for backwards compatibility with `MerchantView.ListingCard` and
  * any other consumer.
  */
-export function valueForAbilityCard(def: CardDefinition): number | string {
-  return displayValueFor(def);
+export function valueForAbilityCard(def: CardDefinition): string {
+  return abilityFaceText(def);
 }
 
 export interface FooterStyleAbilityCardProps {
@@ -63,6 +64,7 @@ export function FooterStyleAbilityCard({
   ariaLabel,
   showDescriptionTooltip = true,
 }: FooterStyleAbilityCardProps) {
+  const descriptionFooter = isAbilityCard(card) ? abilityFaceText(card) : null;
   const value = displayValueFor(card);
   const { leftEdge, rightEdge } = resolveCardEdges(card);
   const sznMode = useGameStore((s) => s.gameMode === "szn");
@@ -94,6 +96,7 @@ export function FooterStyleAbilityCard({
           size="chip"
           state={state}
           value={value}
+          descriptionFooter={descriptionFooter}
           label={card.name}
           itemTier={itemTier}
           abilityType={card.abilityType}

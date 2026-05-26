@@ -32,6 +32,7 @@ import {
 } from "../lib/run";
 import { SESSION_CARDS, SZN_ENCOUNTER_ITEMS_BY_ID, type CardDefinition } from "../lib/cards";
 import { SznCard } from "./SznCard";
+import { abilityFaceText, isAbilityCard } from "../lib/cardModel";
 import { displayValueFor, resolveCardEdges } from "../lib/cardDisplay";
 import { useChoiceHover } from "./useAbilityHover";
 import { useSznGamepad, useFocusIndex } from "../lib/useSznGamepad";
@@ -662,6 +663,9 @@ function ChoiceCard({
             size="chip"
             state={focused ? "focused" : "default"}
             value={displayValueFor(grantedCard)}
+            descriptionFooter={
+              isAbilityCard(grantedCard) ? abilityFaceText(grantedCard) : null
+            }
             label={grantedCard.name}
             abilityType={grantedCard.abilityType}
             edges={grantedEdges ?? undefined}

@@ -1,4 +1,12 @@
 import { ShapeType } from "../components/cardShapes";
+import {
+  type CardKind,
+  type EdgeColor,
+  normalizeCardCatalog,
+  normalizeCardDefinition,
+  shapeToDefaultColor,
+  isRetiredCard,
+} from "./cardModel";
 // Type-only import: cards.ts stores SZN edges as `string` to avoid a
 // cyclic runtime dependency, but the per-run randomizer below needs
 // to pull from the typed `SznEdgeId` union so the chosen edges stay
@@ -13,9 +21,14 @@ export type CardType = "Batting" | "Pitching";
 export type CardAbilityType = string;
 export type Handedness = "L" | "R" | "S";
 
+export type { CardKind, EdgeColor } from "./cardModel";
+export { EDGE_COLORS, EDGE_COLOR_LABEL, isValueCard, isAbilityCard, abilityFaceText, printedNumericValue, RETIRED_CARD_IDS, isRetiredCard } from "./cardModel";
+
 export interface CombineConstraint {
   // If set, this card can only combine when the OTHER side's shape is in this list.
   allowedShapes?: ShapeType[];
+  /** If set, the OTHER side's color must be in this list. */
+  allowedColors?: EdgeColor[];
   // Card cannot be combined at all (overrides shape matching).
   noCombine?: boolean;
   // Card's left side cannot be combined (right side may still combine).
@@ -26,6 +39,10 @@ export interface CombineConstraint {
   leftWildcard?: boolean;
   // Treat the right side as a wildcard for matching.
   rightWildcard?: boolean;
+  /** Treat the left edge color as wildcard for color matching. */
+  leftColorWildcard?: boolean;
+  /** Treat the right edge color as wildcard for color matching. */
+  rightColorWildcard?: boolean;
   /**
    * Hard floor on the chain length this card needs to score. When the card is
    * scored as part of a chain shorter than `requireChainLength`, the scoring
@@ -47,10 +64,18 @@ export interface CardDefinition {
   player?: string;
   type: CardType;
   abilityType: CardAbilityType;
+  /** Value cards only — ability cards must keep this at 0. */
   baseValue: number;
+  /** Value vs ability split (inferred from abilityType when omitted). */
+  kind?: CardKind;
   leftShape: ShapeType;
   rightShape: ShapeType;
+  /** Edge fill color — independent of shape geometry. */
+  leftColor?: EdgeColor;
+  rightColor?: EdgeColor;
   description: string;
+  /** Short rules text on ability card faces. */
+  faceText?: string;
   /**
    * Brawl-only one-line ability text rendered DIRECTLY on the card face
    * (between the name and the value) instead of in the hover tooltip. The
@@ -150,7 +175,7 @@ export type TagLiteral = (typeof TAGS)[keyof typeof TAGS];
 /** Convenience: full set of tag values, ordered. */
 export const ALL_TAGS: TagLiteral[] = Object.values(TAGS);
 
-export const ALL_CARDS: CardDefinition[] = [
+const RAW_ALL_CARDS: CardDefinition[] = [
   {
     "id": "b-1",
     "name": "All Rise",
@@ -2428,8 +2453,10 @@ export const ALL_CARDS: CardDefinition[] = [
   }
 ];
 
+export const ALL_CARDS: CardDefinition[] = normalizeCardCatalog(RAW_ALL_CARDS);
+
 // ============================================================================
-// Per-session shape randomization
+// Per-session shape + color randomization
 //
 // `ALL_CARDS` above is the CANONICAL definition of every card -- used by the
 // engine tests (`__effects_check.ts`, `__connect_check.ts`, `__copy_check.ts`,
@@ -2498,13 +2525,19 @@ export function randomizeCardShapes(
   seed: number,
 ): CardDefinition[] {
   const rng = makeShapeRng(seed);
-  const pick = (): ShapeType =>
+  const pickShape = (): ShapeType =>
     RANDOMIZABLE_SHAPES[Math.floor(rng() * RANDOMIZABLE_SHAPES.length)];
-  return cards.map((c) => ({
-    ...c,
-    leftShape: isRandomizableShape(c.leftShape) ? pick() : c.leftShape,
-    rightShape: isRandomizableShape(c.rightShape) ? pick() : c.rightShape,
-  }));
+  return cards.map((c) => {
+    const leftShape = isRandomizableShape(c.leftShape) ? pickShape() : c.leftShape;
+    const rightShape = isRandomizableShape(c.rightShape) ? pickShape() : c.rightShape;
+    return {
+      ...c,
+      leftShape,
+      rightShape,
+      leftColor: shapeToDefaultColor(leftShape),
+      rightColor: shapeToDefaultColor(rightShape),
+    };
+  });
 }
 
 /**
@@ -2619,7 +2652,7 @@ export function randomizeCardEdges(
 // only touches the legacy entries; the encounter cards keep their
 // declared (always wildcard) shapes.
 
-export const SZN_ENCOUNTER_ITEM_CARDS: CardDefinition[] = [
+const RAW_SZN_ENCOUNTER_ITEM_CARDS: CardDefinition[] = [
   {
     id: "enc-sticky-stuff",
     name: "Sticky Stuff",
@@ -2778,6 +2811,10 @@ export const SZN_ENCOUNTER_ITEM_CARDS: CardDefinition[] = [
   },
 ];
 
+export const SZN_ENCOUNTER_ITEM_CARDS: CardDefinition[] = normalizeCardCatalog(
+  RAW_SZN_ENCOUNTER_ITEM_CARDS,
+);
+
 /**
  * Registry lookup for encounter items. Used by the encounter dispatcher
  * to grant items by id without searching SESSION_CARDS.
@@ -2800,7 +2837,7 @@ for (const c of SZN_ENCOUNTER_ITEM_CARDS) SZN_ENCOUNTER_ITEMS_BY_ID[c.id] = c;
  * into something restrictive.
  */
 export const SESSION_CARDS: CardDefinition[] = [
-  ...randomizeCardShapes(ALL_CARDS, SESSION_SEED),
+  ...randomizeCardShapes(ALL_CARDS, SESSION_SEED).filter((c) => !isRetiredCard(c.id)),
   ...SZN_ENCOUNTER_ITEM_CARDS,
 ];
 
@@ -2813,6 +2850,9 @@ for (const c of SESSION_CARDS) {
   const entry = (BRAWL_TAGLINE_DRAFT as Record<string, { tagline?: string }>)[c.id];
   if (entry?.tagline && entry.tagline !== "—") {
     c.brawlTagline = entry.tagline;
+    if (c.kind === "ability" || c.abilityType === "Signature") {
+      c.faceText = c.faceText ?? entry.tagline;
+    }
   }
 }
 

@@ -1,9 +1,17 @@
-import { CardDefinition } from "./cards";
+import { CardDefinition, EdgeColor } from "./cards";
 import type { MlbPlayer } from "./players";
 import { isSznPlayer, type SznPlayer } from "./sznPlayers";
 import { canSznSnap, type SznEdgeId } from "./sznEdges";
 import { teamLogoEdge, type MlbTeamId } from "./sznTeams";
+import { shapeToDefaultColor } from "./cardModel";
 import { ShapeMode, ShapeType } from "../components/cardShapes";
+
+export type ColorMode = "normal" | "wildcard" | "blocked" | "picky";
+
+function edgeColor(card: CardDefinition, side: "left" | "right"): EdgeColor {
+  const shape = side === "left" ? card.leftShape : card.rightShape;
+  return shapeToDefaultColor(shape);
+}
 
 /**
  * SZN Mode adapter: turn a player (legacy `MlbPlayer` OR new `SznPlayer`)
@@ -56,10 +64,6 @@ export function playerAsCard(
   overrides?: PlayerCardOverrides,
 ): CardDefinition {
   if (isSznPlayer(player)) {
-    // Apply overrides ahead of the static edges. `team-logo` syntheticas
-    // (set when an item stamped "the player's team logo" on an edge)
-    // resolve into the actual franchise edge via the resolver above
-    // so downstream consumers can compare ids directly.
     const rawLeft = overrides?.leftEdgeOverride ?? player.leftEdge;
     const rawRight = overrides?.rightEdgeOverride ?? player.rightEdge;
     const teamCtx = overrides?.teamLogoFor ?? player.teamId;
@@ -71,24 +75,32 @@ export function playerAsCard(
       player: player.name,
       type: player.role === "Batter" ? "Batting" : "Pitching",
       abilityType: "Player",
+      kind: "value",
       baseValue: 0,
       leftShape: "wildcard",
       rightShape: "wildcard",
+      leftColor: "emerald",
+      rightColor: "emerald",
       description: "",
       handedness: player.handedness,
       sznLeftEdge: left,
       sznRightEdge: right,
     };
   }
+  const leftColor = shapeToDefaultColor(player.leftShape);
+  const rightColor = shapeToDefaultColor(player.rightShape);
   return {
     id: `player:${player.id}`,
     name: player.name,
     player: player.name,
     type: player.role === "Batter" ? "Batting" : "Pitching",
     abilityType: "Player",
+    kind: "value",
     baseValue: 0,
     leftShape: player.leftShape,
     rightShape: player.rightShape,
+    leftColor,
+    rightColor,
     description: "",
     handedness: player.handedness,
   };
@@ -106,9 +118,7 @@ export function canConnectToPlayer(
 ): { left: boolean; right: boolean } {
   const playerCard = playerAsCard(player);
   return {
-    // Item sits to the LEFT of the player => itemCard's right meets player's left.
     left: canConnectAny(itemCard, playerCard),
-    // Item sits to the RIGHT of the player => player's right meets item's left.
     right: canConnectAny(playerCard, itemCard),
   };
 }
@@ -147,39 +157,39 @@ export function seamKey(idA: string, idB: string): string {
   return idA < idB ? `${idA}|${idB}` : `${idB}|${idA}`;
 }
 
-/**
- * Determine whether the right side of `leftCard` can connect to the left side of `rightCard`.
- *
- * Rules (in evaluation order):
- *   1. Either side flagged `noCombine` -> never connect.
- *   2. The participating side flagged `*NoCombine` -> never connect (e.g. b-28 left).
- *   3. `none` shape on either participating side -> never connect.
- *   4. Either participating side is a wildcard (shape OR `*Wildcard` constraint) -> connect.
- *   5. If a card has `allowedShapes`, the OTHER side's shape must be in that list.
- *   6. Otherwise: shapes must match.
- */
-export function canConnect(leftCard: CardDefinition, rightCard: CardDefinition): boolean {
+function isShapeAllowed(shape: ShapeType, allowed: ShapeType[], isWild: boolean): boolean {
+  if (isWild) return true;
+  return allowed.includes(shape);
+}
+
+function isColorAllowed(color: EdgeColor, allowed: EdgeColor[], isWild: boolean): boolean {
+  if (isWild) return true;
+  return allowed.includes(color);
+}
+
+function shapeCompatible(
+  leftCard: CardDefinition,
+  rightCard: CardDefinition,
+): boolean {
   const lc = leftCard.combineConstraint;
   const rc = rightCard.combineConstraint;
-
-  if (lc?.noCombine || rc?.noCombine) return false;
-  if (lc?.rightNoCombine) return false;
-  if (rc?.leftNoCombine) return false;
 
   const leftShape = leftCard.rightShape;
   const rightShape = rightCard.leftShape;
 
   if (leftShape === "none" || rightShape === "none") return false;
 
-  const leftIsWild = leftShape === "wildcard" || lc?.rightWildcard === true;
-  const rightIsWild = rightShape === "wildcard" || rc?.leftWildcard === true;
+  const leftShapeWild =
+    leftShape === "wildcard" || lc?.rightWildcard === true;
+  const rightShapeWild =
+    rightShape === "wildcard" || rc?.leftWildcard === true;
 
-  if (leftIsWild || rightIsWild) {
-    if (lc?.allowedShapes && !leftIsWild) {
-      if (!isShapeAllowed(rightShape, lc.allowedShapes, rightIsWild)) return false;
+  if (leftShapeWild || rightShapeWild) {
+    if (lc?.allowedShapes && !leftShapeWild) {
+      if (!isShapeAllowed(rightShape, lc.allowedShapes, rightShapeWild)) return false;
     }
-    if (rc?.allowedShapes && !rightIsWild) {
-      if (!isShapeAllowed(leftShape, rc.allowedShapes, leftIsWild)) return false;
+    if (rc?.allowedShapes && !rightShapeWild) {
+      if (!isShapeAllowed(leftShape, rc.allowedShapes, leftShapeWild)) return false;
     }
     return true;
   }
@@ -190,9 +200,63 @@ export function canConnect(leftCard: CardDefinition, rightCard: CardDefinition):
   return leftShape === rightShape;
 }
 
-function isShapeAllowed(shape: ShapeType, allowed: ShapeType[], isWild: boolean): boolean {
-  if (isWild) return true;
-  return allowed.includes(shape);
+function colorCompatible(
+  leftCard: CardDefinition,
+  rightCard: CardDefinition,
+): boolean {
+  const lc = leftCard.combineConstraint;
+  const rc = rightCard.combineConstraint;
+
+  const leftColor = edgeColor(leftCard, "right");
+  const rightColor = edgeColor(rightCard, "left");
+
+  if (leftColor === "none" || rightColor === "none") return false;
+
+  const leftShapeWild =
+    leftCard.rightShape === "wildcard" || lc?.rightWildcard === true;
+  const rightShapeWild =
+    rightCard.leftShape === "wildcard" || rc?.leftWildcard === true;
+
+  const leftIsWild =
+    leftColor === "wildcard" ||
+    leftColor === "emerald" ||
+    lc?.rightColorWildcard === true ||
+    leftShapeWild;
+  const rightIsWild =
+    rightColor === "wildcard" ||
+    rightColor === "emerald" ||
+    rc?.leftColorWildcard === true ||
+    rightShapeWild;
+
+  if (leftIsWild || rightIsWild) {
+    if (lc?.allowedColors && !leftIsWild) {
+      if (!isColorAllowed(rightColor, lc.allowedColors, rightIsWild)) return false;
+    }
+    if (rc?.allowedColors && !rightIsWild) {
+      if (!isColorAllowed(leftColor, rc.allowedColors, leftIsWild)) return false;
+    }
+    return true;
+  }
+
+  if (lc?.allowedColors && !isColorAllowed(rightColor, lc.allowedColors, false)) return false;
+  if (rc?.allowedColors && !isColorAllowed(leftColor, rc.allowedColors, false)) return false;
+
+  return leftColor === rightColor;
+}
+
+/**
+ * Determine whether the right side of `leftCard` can connect to the left side of `rightCard`.
+ * Shape AND color must both match (each dimension has its own wildcard / picky rules).
+ */
+export function canConnect(leftCard: CardDefinition, rightCard: CardDefinition): boolean {
+  const lc = leftCard.combineConstraint;
+  const rc = rightCard.combineConstraint;
+
+  if (lc?.noCombine || rc?.noCombine) return false;
+  if (lc?.rightNoCombine) return false;
+  if (rc?.leftNoCombine) return false;
+
+  return shapeCompatible(leftCard, rightCard) && colorCompatible(leftCard, rightCard);
 }
 
 /**
@@ -200,25 +264,34 @@ function isShapeAllowed(shape: ShapeType, allowed: ShapeType[], isWild: boolean)
  * constraints. The UI uses this to render wildcard/blocked/picky indicators on
  * the matching edge so what the player SEES on the card matches the rule the
  * connection engine actually enforces.
- *
- *   - `noCombine`              -> both sides 'blocked'
- *   - `leftNoCombine`          -> left side 'blocked'
- *   - `rightNoCombine`         -> right side 'blocked'
- *   - `leftWildcard` (+ shape) -> left side 'wildcard' (renders emerald hexagon)
- *   - `rightWildcard`          -> right side 'wildcard'
- *   - shape === 'wildcard'     -> 'wildcard'
- *   - `allowedShapes` (with no wildcard/blocked override) -> 'picky'
- *   - otherwise                -> 'normal'
  */
-export function shapeModeForSide(card: CardDefinition, side: 'left' | 'right'): ShapeMode {
+export function shapeModeForSide(card: CardDefinition, side: "left" | "right"): ShapeMode {
   const c = card.combineConstraint;
-  if (c?.noCombine) return 'blocked';
-  if (side === 'left' && c?.leftNoCombine) return 'blocked';
-  if (side === 'right' && c?.rightNoCombine) return 'blocked';
-  if (side === 'left' && c?.leftWildcard) return 'wildcard';
-  if (side === 'right' && c?.rightWildcard) return 'wildcard';
-  const shape = side === 'left' ? card.leftShape : card.rightShape;
-  if (shape === 'wildcard') return 'wildcard';
-  if (c?.allowedShapes && c.allowedShapes.length > 0) return 'picky';
-  return 'normal';
+  if (c?.noCombine) return "blocked";
+  if (side === "left" && c?.leftNoCombine) return "blocked";
+  if (side === "right" && c?.rightNoCombine) return "blocked";
+  if (side === "left" && c?.leftWildcard) return "wildcard";
+  if (side === "right" && c?.rightWildcard) return "wildcard";
+  const shape = side === "left" ? card.leftShape : card.rightShape;
+  if (shape === "wildcard") return "wildcard";
+  if (c?.allowedShapes && c.allowedShapes.length > 0) return "picky";
+  return "normal";
+}
+
+export function colorModeForSide(card: CardDefinition, side: "left" | "right"): ColorMode {
+  const c = card.combineConstraint;
+  if (c?.noCombine) return "blocked";
+  if (side === "left" && c?.leftNoCombine) return "blocked";
+  if (side === "right" && c?.rightNoCombine) return "blocked";
+  if (side === "left" && c?.leftColorWildcard) return "wildcard";
+  if (side === "right" && c?.rightColorWildcard) return "wildcard";
+  const color = edgeColor(card, side);
+  if (color === "wildcard" || color === "emerald") return "wildcard";
+  if (c?.allowedColors && c.allowedColors.length > 0) return "picky";
+  return "normal";
+}
+
+/** Exported for rendering — read the resolved edge color on a card side. */
+export function edgeColorForSide(card: CardDefinition, side: "left" | "right"): EdgeColor {
+  return edgeColor(card, side);
 }

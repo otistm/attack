@@ -20,6 +20,7 @@
  * overspending without ever leaving the player softlocked at the menu.
  */
 import { CardDefinition, SESSION_CARDS, TagLiteral } from "./cards";
+import { printedNumericValue } from "./cardModel";
 import { BATTERS, MlbPlayer, PITCHERS } from "./players";
 
 export type DraftSide = "user" | "ai";
@@ -143,7 +144,7 @@ export function playerSignatureValue(player: MlbPlayer): number {
   let sum = 0;
   for (const id of player.signatureCardIds) {
     const c = CARD_BY_ID[id];
-    if (c) sum += c.baseValue;
+    if (c) sum += printedNumericValue(c);
   }
   return sum;
 }

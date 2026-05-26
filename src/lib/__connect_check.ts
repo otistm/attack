@@ -8,7 +8,8 @@
  */
 
 import { ALL_CARDS, CardDefinition, CombineConstraint } from "./cards";
-import { canConnect, shapeModeForSide } from "./connect";
+import { canConnect, colorModeForSide, shapeModeForSide } from "./connect";
+import { shapeToDefaultColor } from "./cardModel";
 import { ShapeType } from "../components/cardShapes";
 
 let failures = 0;
@@ -33,9 +34,12 @@ function makeCard(left: ShapeType, right: ShapeType, constraint?: CombineConstra
     name: `Test ${cardCounter}`,
     type: "Batting",
     abilityType: "Test",
-    baseValue: 0,
+    kind: "value",
+    baseValue: 5,
     leftShape: left,
     rightShape: right,
+    leftColor: shapeToDefaultColor(left),
+    rightColor: shapeToDefaultColor(right),
     description: "",
     combineConstraint: constraint,
   };
@@ -308,6 +312,33 @@ function makeCard(left: ShapeType, right: ShapeType, constraint?: CombineConstra
     walk?.leftShape === "none" && walk?.rightShape === "none",
     "p-79 Intentional Walk should have both shapes set to 'none'",
     walk,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Color follows shape (dedicated palette per geometry).
+// ---------------------------------------------------------------------------
+{
+  const squareA = makeCard("circle", "square");
+  const squareB = makeCard("square", "circle");
+  assert(canConnect(squareA, squareB) === true, "same shape implies same color connects");
+
+  const squareRed = makeCard("circle", "square");
+  const diamondYellow = makeCard("diamond", "circle");
+  assert(
+    canConnect(squareRed, diamondYellow) === false,
+    "different shapes (and colors) do not connect",
+  );
+
+  // Stored color overrides are ignored — shape is the source of truth.
+  const redOverride = {
+    ...makeCard("circle", "square"),
+    rightColor: "blue" as const,
+  };
+  const squareB2 = makeCard("square", "circle");
+  assert(
+    canConnect(redOverride, squareB2) === true,
+    "rightColor override ignored; square/red still connects to square/red",
   );
 }
 

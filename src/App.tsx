@@ -29,7 +29,7 @@ export default function App() {
 
   // Brawl Mode strips every pre-game / between-day interstitial -- no
   // Shop, no Front Office, no pack rip. The lane drops straight into
-  // a 15-second-timer at-bat and stays there. We hoist the flag here
+  // a 60-second lock-in window per at-bat and stays there. We hoist the flag here
   // so the screen gates below stay explicit at the App level instead
   // of relying on each child to self-suppress.
   const inBrawl = gameMode === 'brawl';

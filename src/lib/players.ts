@@ -1,4 +1,5 @@
 import { CardDefinition, Handedness, SESSION_CARDS } from "./cards";
+import { isAbilityCard, isRetiredCard, isValueCard } from "./cardModel";
 import type { ShapeType } from "../components/cardShapes";
 import type { ClassTag } from "./run";
 import { BRAWL_EXCLUSIVE_IDS } from "./brawlTaglines";
@@ -165,7 +166,7 @@ const BRAWL_FLAVOR_PITCHING_POOL: Record<BrawlFlavor, string[]> = {
             "p-100", "p-101", "p-103", "p-104"],
   // guile: anti-chain reads and snap counters. Seam Snare and Ace Anchor
   // both reward reading the opponent's snap intent.
-  guile: ["p-72", "p-76", "p-83", "p-87", "p-97", "p-99"],
+  guile: ["p-72", "p-76", "p-83", "p-87", "p-97"],
   power: [],
   speed: [],
 };
@@ -181,23 +182,23 @@ interface PlayerSeed {
 
 const PLAYER_SEEDS: PlayerSeed[] = [
   // ===== Batters =====
-  { id: "judge", name: "Aaron Judge", team: "NYY", role: "Batter", handedness: "R", signatureCardIds: ["b-1", "b-2", "b-3"] },
+  { id: "judge", name: "Aaron Judge", team: "NYY", role: "Batter", handedness: "R", signatureCardIds: ["b-1", "b-3"] },
   { id: "ohtani-bat", name: "Shohei Ohtani", team: "LAD", role: "Batter", handedness: "L", signatureCardIds: ["b-4", "b-5", "b-6"] },
   { id: "soto", name: "Juan Soto", team: "NYY", role: "Batter", handedness: "L", signatureCardIds: ["b-7", "b-8", "b-9"] },
   { id: "delacruz", name: "Elly De La Cruz", team: "CIN", role: "Batter", handedness: "S", signatureCardIds: ["b-10", "b-11", "b-12"] },
   { id: "betts", name: "Mookie Betts", team: "LAD", role: "Batter", handedness: "R", signatureCardIds: ["b-13", "b-14", "b-15"] },
-  { id: "witt", name: "Bobby Witt Jr.", team: "KCR", role: "Batter", handedness: "R", signatureCardIds: ["b-16", "b-17", "b-18"] },
-  { id: "harper", name: "Bryce Harper", team: "PHI", role: "Batter", handedness: "L", signatureCardIds: ["b-19", "b-20", "b-21"] },
-  { id: "acuna", name: "Ronald Acuña Jr.", team: "ATL", role: "Batter", handedness: "R", signatureCardIds: ["b-22", "b-23", "b-24"] },
+  { id: "witt", name: "Bobby Witt Jr.", team: "KCR", role: "Batter", handedness: "R", signatureCardIds: ["b-16", "b-18"] },
+  { id: "harper", name: "Bryce Harper", team: "PHI", role: "Batter", handedness: "L", signatureCardIds: ["b-19", "b-20"] },
+  { id: "acuna", name: "Ronald Acuña Jr.", team: "ATL", role: "Batter", handedness: "R", signatureCardIds: ["b-22", "b-24"] },
   { id: "henderson", name: "Gunnar Henderson", team: "BAL", role: "Batter", handedness: "L", signatureCardIds: ["b-25", "b-26", "b-27"] },
-  { id: "vlad", name: "Vladimir Guerrero Jr.", team: "TOR", role: "Batter", handedness: "R", signatureCardIds: ["b-28", "b-29", "b-30"] },
+  { id: "vlad", name: "Vladimir Guerrero Jr.", team: "TOR", role: "Batter", handedness: "R", signatureCardIds: ["b-28", "b-29"] },
   { id: "trout", name: "Mike Trout", team: "LAA", role: "Batter", handedness: "R", signatureCardIds: ["b-100", "b-101", "b-102"] },
   { id: "freeman", name: "Freddie Freeman", team: "LAD", role: "Batter", handedness: "L", signatureCardIds: ["b-103", "b-104", "b-105"] },
   { id: "alvarez", name: "Yordan Alvarez", team: "HOU", role: "Batter", handedness: "L", signatureCardIds: ["b-106", "b-107", "b-108"] },
   { id: "seager", name: "Corey Seager", team: "TEX", role: "Batter", handedness: "L", signatureCardIds: ["b-109", "b-110", "b-111"] },
   { id: "jramirez", name: "Jose Ramirez", team: "CLE", role: "Batter", handedness: "S", signatureCardIds: ["b-112", "b-113", "b-114"] },
   { id: "alonso", name: "Pete Alonso", team: "NYM", role: "Batter", handedness: "R", signatureCardIds: ["b-115", "b-116", "b-117"] },
-  { id: "tturner", name: "Trea Turner", team: "PHI", role: "Batter", handedness: "R", signatureCardIds: ["b-118", "b-119", "b-120"] },
+  { id: "tturner", name: "Trea Turner", team: "PHI", role: "Batter", handedness: "R", signatureCardIds: ["b-118", "b-120"] },
   { id: "rutschman", name: "Adley Rutschman", team: "BAL", role: "Batter", handedness: "S", signatureCardIds: ["b-121", "b-122", "b-123"] },
   { id: "devers", name: "Rafael Devers", team: "BOS", role: "Batter", handedness: "L", signatureCardIds: ["b-124", "b-125", "b-126"] },
   { id: "lindor", name: "Francisco Lindor", team: "NYM", role: "Batter", handedness: "S", signatureCardIds: ["b-127", "b-128", "b-129"] },
@@ -208,11 +209,11 @@ const PLAYER_SEEDS: PlayerSeed[] = [
   { id: "skenes", name: "Paul Skenes", team: "PIT", role: "Pitcher", handedness: "R", signatureCardIds: ["p-31", "p-32", "p-33"] },
   { id: "cole", name: "Gerrit Cole", team: "NYY", role: "Pitcher", handedness: "R", signatureCardIds: ["p-34", "p-35", "p-36"] },
   { id: "skubal", name: "Tarik Skubal", team: "DET", role: "Pitcher", handedness: "L", signatureCardIds: ["p-37", "p-38", "p-39"] },
-  { id: "wheeler", name: "Zack Wheeler", team: "PHI", role: "Pitcher", handedness: "R", signatureCardIds: ["p-40", "p-41", "p-42"] },
+  { id: "wheeler", name: "Zack Wheeler", team: "PHI", role: "Pitcher", handedness: "R", signatureCardIds: ["p-40", "p-41"] },
   { id: "clase", name: "Emmanuel Clase", team: "CLE", role: "Pitcher", handedness: "R", signatureCardIds: ["p-43", "p-44", "p-45"] },
   { id: "miller", name: "Mason Miller", team: "OAK", role: "Pitcher", handedness: "R", signatureCardIds: ["p-46", "p-47", "p-48"] },
   { id: "sale", name: "Chris Sale", team: "ATL", role: "Pitcher", handedness: "L", signatureCardIds: ["p-49", "p-50", "p-51"] },
-  { id: "ohtani-pit", name: "Shohei Ohtani", team: "LAD", role: "Pitcher", handedness: "R", signatureCardIds: ["p-52", "p-53", "p-54"] },
+  { id: "ohtani-pit", name: "Shohei Ohtani", team: "LAD", role: "Pitcher", handedness: "R", signatureCardIds: ["p-53", "p-54"] },
   { id: "yamamoto", name: "Yoshinobu Yamamoto", team: "LAD", role: "Pitcher", handedness: "R", signatureCardIds: ["p-55", "p-56", "p-57"] },
   { id: "cease", name: "Dylan Cease", team: "SDP", role: "Pitcher", handedness: "R", signatureCardIds: ["p-58", "p-59", "p-60"] },
 ];
@@ -281,10 +282,17 @@ for (const p of PLAYERS) {
       );
     }
   }
-  if (p.signatureCardIds.length !== 3) {
+  if (p.signatureCardIds.length < 2 || p.signatureCardIds.length > 3) {
     throw new Error(
-      `players.ts: ${p.id} must have exactly 3 signatureCardIds, got ${p.signatureCardIds.length}.`,
+      `players.ts: ${p.id} must have 2–3 signatureCardIds, got ${p.signatureCardIds.length}.`,
     );
+  }
+  for (const id of p.signatureCardIds) {
+    if (isRetiredCard(id)) {
+      throw new Error(
+        `players.ts: ${p.id} (${p.name}) references retired signatureCardId "${id}".`,
+      );
+    }
   }
 }
 
@@ -300,13 +308,17 @@ const GENERAL_BATTING = SESSION_CARDS.filter(
   (c) =>
     c.type === "Batting" &&
     c.abilityType === "General Draw" &&
-    !BRAWL_EXCLUSIVE_IDS.has(c.id),
+    isValueCard(c) &&
+    !BRAWL_EXCLUSIVE_IDS.has(c.id) &&
+    !isRetiredCard(c.id),
 );
 const GENERAL_PITCHING = SESSION_CARDS.filter(
   (c) =>
     c.type === "Pitching" &&
     c.abilityType === "General Draw" &&
-    !BRAWL_EXCLUSIVE_IDS.has(c.id),
+    isValueCard(c) &&
+    !BRAWL_EXCLUSIVE_IDS.has(c.id) &&
+    !isRetiredCard(c.id),
 );
 
 // Brawl Mode general pools: curated subset that pulls only cards whose
@@ -321,12 +333,10 @@ const GENERAL_PITCHING = SESSION_CARDS.filter(
 // instead of starting from `GENERAL_BATTING` (which strips them) so the
 // brawl pool keeps its full size.
 const BRAWL_GENERAL_BATTING = SESSION_CARDS.filter(
-  (c) =>
-    c.type === "Batting" && c.abilityType === "General Draw" && !!c.brawlTagline,
+  (c) => c.type === "Batting" && c.abilityType === "General Draw" && isValueCard(c),
 );
 const BRAWL_GENERAL_PITCHING = SESSION_CARDS.filter(
-  (c) =>
-    c.type === "Pitching" && c.abilityType === "General Draw" && !!c.brawlTagline,
+  (c) => c.type === "Pitching" && c.abilityType === "General Draw" && isValueCard(c),
 );
 
 // Resolve curated brawl flavor pools to live CardDefinitions on
@@ -396,11 +406,18 @@ export function dealHand(
   seed = Math.floor(Math.random() * 1_000_000),
   opts?: { brawlMode?: boolean; restrictGeneralPoolTo?: ReadonlySet<string> | null },
 ): CardDefinition[] {
-  const signatures = player.signatureCardIds.map((id) => cardsById[id]);
-  if (signatures.some((c) => !c)) {
-    const missing = player.signatureCardIds.filter((id) => !cardsById[id]);
+  const signatures = player.signatureCardIds
+    .map((id) => cardsById[id])
+    .filter((c): c is CardDefinition => !!c && isAbilityCard(c) && !isRetiredCard(c.id));
+  if (signatures.length === 0) {
     throw new Error(
-      `dealHand: ${player.id} (${player.name}) has unresolved signatureCardIds [${missing.join(", ")}].`,
+      `dealHand: ${player.id} (${player.name}) has no playable signature cards.`,
+    );
+  }
+  const generalCount = EXPECTED_HAND_SIZE - signatures.length;
+  if (generalCount < 1) {
+    throw new Error(
+      `dealHand: ${player.id} has ${signatures.length} signatures (max ${EXPECTED_HAND_SIZE - 1}).`,
     );
   }
   // Brawl swaps in a curated general pool so every dealt general carries
@@ -445,20 +462,16 @@ export function dealHand(
       const allow = opts.restrictGeneralPoolTo;
       flavorPool = flavorPool.filter((c) => allow.has(c.id));
     }
-    if (flavorPool.length > 0) {
-      const [flavored] = pickRandomTwo(flavorPool, seed);
-      // Draw the second general from the wide pool, but EXCLUDE the
-      // flavor card we already picked so duplicates can't co-occur.
-      const widePoolMinusFlavored = generalPool.filter(
-        (c) => c.id !== flavored.id,
-      );
-      const [wide] = pickRandomTwo(widePoolMinusFlavored, seed + 1);
-      generals = [flavored, wide];
+    if (flavorPool.length > 0 && generalCount >= 1) {
+      const [flavored] = pickRandomN(flavorPool, seed, 1);
+      const widePoolMinusFlavored = generalPool.filter((c) => c.id !== flavored.id);
+      const wide = pickRandomN(widePoolMinusFlavored, seed + 1, generalCount - 1);
+      generals = [flavored, ...wide];
     } else {
-      generals = pickRandomTwo(generalPool, seed);
+      generals = pickRandomN(generalPool, seed, generalCount);
     }
   } else {
-    generals = pickRandomTwo(generalPool, seed);
+    generals = pickRandomN(generalPool, seed, generalCount);
   }
   const hand = [...signatures, ...generals];
   if (hand.length !== EXPECTED_HAND_SIZE) {
@@ -469,12 +482,17 @@ export function dealHand(
   return hand;
 }
 
-function pickRandomTwo<T>(pool: T[], seed: number): T[] {
-  if (pool.length <= 2) return [...pool];
+function pickRandomN<T>(pool: T[], seed: number, n: number): T[] {
+  if (n <= 0) return [];
+  if (pool.length <= n) return [...pool];
   const rng = mulberry32(seed);
   const indices = new Set<number>();
-  while (indices.size < 2) indices.add(Math.floor(rng() * pool.length));
+  while (indices.size < n) indices.add(Math.floor(rng() * pool.length));
   return [...indices].map((i) => pool[i]);
+}
+
+function pickRandomTwo<T>(pool: T[], seed: number): T[] {
+  return pickRandomN(pool, seed, 2);
 }
 
 // Small deterministic PRNG so a given seed reproducibly deals the same hand.

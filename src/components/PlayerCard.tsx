@@ -10,7 +10,7 @@
  * combat lineup strip.
  *
  * Visual contract:
- *   - 5:7 ratio (`w-32 h-44` standard, `w-24 h-32` compact).
+ *   - 200×176 standard (`PLAY_CARD`), 125×112 compact.
  *   - Team-color gradient body so the user reads the team at a glance.
  *   - Tier badge in the top-right; class tag chip at the bottom.
  *   - Big numeric readout in the lower-center is the player's combat value
@@ -30,10 +30,10 @@ import {
   totalPotentialSlots,
   triggerGlyph,
 } from "../lib/sznPlayerAbilities";
+import { PLAY_CARD } from "../lib/cardDisplay";
 import { teamPalette } from "../lib/teamColors";
 import { ShapeHalf } from "./CardGameOverlay";
-import { shapeModeForSide } from "../lib/connect";
-import { playerAsCard } from "../lib/connect";
+import { colorModeForSide, edgeColorForSide, playerAsCard, shapeModeForSide } from "../lib/connect";
 import { SznEdgeHalf } from "./SznEdgeHalf";
 import {
   RARITY_TEXT,
@@ -59,7 +59,7 @@ export interface PlayerCardProps {
    * Larger variant for hero reveals (e.g. the pack-rip grid). Overrides
    * `compact` when both are passed — large always wins so a future
    * caller passing both can't accidentally collapse to the small size.
-   * Footprint: 176x240 (`w-44 h-60`).
+   * Footprint: 220×176.
    */
   large?: boolean;
   /** When true, render with `cursor-grab`. The drag handler lives on the parent. */
@@ -143,6 +143,10 @@ export function PlayerCard({
   const playerCard = !isSzn ? playerAsCard(player) : null;
   const leftMode = playerCard ? shapeModeForSide(playerCard, "left") : "normal";
   const rightMode = playerCard ? shapeModeForSide(playerCard, "right") : "normal";
+  const leftColorMode = playerCard ? colorModeForSide(playerCard, "left") : "normal";
+  const rightColorMode = playerCard ? colorModeForSide(playerCard, "right") : "normal";
+  const leftEdgeColor = playerCard ? edgeColorForSide(playerCard, "left") : undefined;
+  const rightEdgeColor = playerCard ? edgeColorForSide(playerCard, "right") : undefined;
 
   // `large` wins over `compact` if both are set — defensive against a
   // caller passing both (probably accidentally) and getting the wrong
@@ -151,7 +155,7 @@ export function PlayerCard({
   // (compact + default), so `large` reuses the default sockets.
   const sz = large
     ? {
-        card: "w-44 h-60 rounded-xl",
+        card: "w-[220px] h-[176px] rounded-xl",
         nameText: "text-xs",
         teamText: "text-[10px]",
         valueText: "text-6xl",
@@ -162,7 +166,7 @@ export function PlayerCard({
       }
     : compact
       ? {
-          card: "w-24 h-32 rounded-lg",
+          card: PLAY_CARD.compactCardClass,
           nameText: "text-[8px]",
           teamText: "text-[7px]",
           valueText: "text-3xl",
@@ -172,7 +176,7 @@ export function PlayerCard({
           tagText: "text-[7px]",
         }
       : {
-          card: "w-32 h-44 rounded-xl",
+          card: PLAY_CARD.cardClass,
           nameText: "text-[10px]",
           teamText: "text-[8px]",
           valueText: "text-5xl",
@@ -215,17 +219,21 @@ export function PlayerCard({
         <>
           <ShapeHalf
             shape={player.leftShape}
+            edgeColor={leftEdgeColor}
             side="left"
             isConnected={isConnectedLeft}
             compact={compact}
             mode={leftMode}
+            colorMode={leftColorMode}
           />
           <ShapeHalf
             shape={player.rightShape}
+            edgeColor={rightEdgeColor}
             side="right"
             isConnected={isConnectedRight}
             compact={compact}
             mode={rightMode}
+            colorMode={rightColorMode}
           />
         </>
       )}

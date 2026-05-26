@@ -1,4 +1,5 @@
 import { CardDefinition, TagLiteral } from "./cards";
+import { isAbilityCard, isValueCard, LEGACY_PRINTED_VALUE, printedNumericValue } from "./cardModel";
 import { ShapeType } from "../components/cardShapes";
 import { canConnect, canConnectAny, seamKey } from "./connect";
 import type { ScoringContext } from "./scoring";
@@ -171,13 +172,13 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-13 Leadoff Magic: +4 if first at-bat of inning.
   "b-13": (ctx) => (ctx.isFirstAtBatOfInning ? r({ selfValueDelta: 4 }) : NOOP),
 
-  // b-14 Bowling Strike: +3 if combined with a SQUARE neighbor (Phase 4
-  // tighten -- previously a flat +3 on any combine, which made it an auto-
-  // include in any 2+ card combo).
+  // b-14 Bowling Strike: +3 if combined with a SQUARE neighbor; +1 per
+  // adjacent value card in the chain (v2 mixed-chain synergy).
   "b-14": (ctx) => {
     if (!ctx.isCombined) return NOOP;
-    if (groupHasNeighborWithShape(ctx, "square")) return r({ selfValueDelta: 3 });
-    return NOOP;
+    let delta = adjacentValueCardsInGroup(ctx).length;
+    if (groupHasNeighborWithShape(ctx, "square")) delta += 3;
+    return delta > 0 ? r({ selfValueDelta: delta }) : NOOP;
   },
 
   // b-15 Mookie's Hustle: per-side wildcard handled in canConnect.
@@ -227,7 +228,7 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // b-20 Showman: if combined on BOTH sides, base value becomes 12.
   "b-20": (ctx) => {
     if (ctx.indexInGroup > 0 && ctx.indexInGroup < ctx.group.length - 1) {
-      return r({ selfValueDelta: 12 - ctx.group[ctx.indexInGroup].baseValue });
+      return r({ selfValueDelta: 12 - printedNumericValue(ctx.group[ctx.indexInGroup]) });
     }
     return NOOP;
   },
@@ -300,8 +301,9 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // base card) -- there's no resolve-step hook for this card.
   "b-30": (ctx) => {
     if (!ctx.opponentBaseCard) return NOOP;
-    const half = Math.floor(ctx.opponentBaseCard.baseValue / 2);
-    const reduction = ctx.opponentBaseCard.baseValue - half;
+    const base = printedNumericValue(ctx.opponentBaseCard);
+    const half = Math.floor(base / 2);
+    const reduction = base - half;
     return r({
       opponentValueDelta: -reduction,
       opponentTargetCardId: ctx.opponentBaseCard.id,
@@ -476,7 +478,7 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     const oppResult = scoreHand(ctx.opponentHand, oppCtx);
     const oppMax = Math.max(0, oppResult.maxValue);
     const card = ctx.group[ctx.indexInGroup];
-    let delta = oppMax - card.baseValue;
+    let delta = oppMax - printedNumericValue(card);
     // Brawl cap: an unbounded copy effect can swing HP by ±20 in a single
     // card, which dwarfs every other tagline. Cap the spike at +8 over
     // base so p-53 stays exciting but not match-deciding inside a 3-inning
@@ -962,7 +964,7 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
     if (!ctx.isCombined) return NOOP;
     const card = ctx.group[ctx.indexInGroup];
     const cap = ctx.gameMode === "brawl" ? 10 : 14;
-    return r({ selfValueDelta: cap - card.baseValue });
+    return r({ selfValueDelta: cap - printedNumericValue(card) });
   },
 
   // b-107 Crawford Boxes: +2 per OTHER POWER-HITTER card in your hand.
@@ -1497,6 +1499,7 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
 };
 
 export function applyCardEffect(card: CardDefinition, ctx: EffectContext): EffectResult {
+  if (isValueCard(card)) return NOOP;
   const fn = CARD_EFFECTS[card.id];
   if (!fn) return NOOP;
   return fn(ctx);
@@ -1619,8 +1622,10 @@ function buildGroupsFor(
 export function highestValueCard(cards: CardDefinition[]): CardDefinition | undefined {
   if (cards.length === 0) return undefined;
   return cards.reduce((a, b) => {
-    if (b.baseValue > a.baseValue) return b;
-    if (b.baseValue === a.baseValue && b.id < a.id) return b;
+    const av = printedNumericValue(a);
+    const bv = printedNumericValue(b);
+    if (bv > av) return b;
+    if (bv === av && b.id < a.id) return b;
     return a;
   });
 }
@@ -1716,6 +1721,19 @@ function neighborsInGroup(ctx: EffectContext): CardDefinition[] {
   if (left) out.push(left);
   if (right) out.push(right);
   return out;
+}
+
+/** Adjacent value cards in the scored chain (v2 mixed-chain model). */
+function adjacentValueCardsInGroup(ctx: EffectContext): CardDefinition[] {
+  return neighborsInGroup(ctx).filter(isValueCard);
+}
+
+/** Sum of printed values on adjacent value cards in the chain. */
+function adjacentValueTotal(ctx: EffectContext): number {
+  return adjacentValueCardsInGroup(ctx).reduce(
+    (sum, c) => sum + c.baseValue,
+    0,
+  );
 }
 
 // ============ Phase A pattern / position helpers ============

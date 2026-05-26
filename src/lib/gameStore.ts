@@ -1674,11 +1674,20 @@ const RECENT_PITCHER_LIMIT = 5;
 
 /**
  * Brawl Mode snap-timer duration (ms). Shared with the
- * `BrawlSnapTimer` UI component -- exporting from the store keeps the
+ * `BrawlLockInButton` UI component -- exporting from the store keeps the
  * gameplay layer (snap-speed bonus computation) and the presentation
  * layer (countdown bar) on the exact same wall-clock budget.
  */
-export const BRAWL_SNAP_DURATION_MS = 15_000;
+export const BRAWL_SNAP_DURATION_MS = 60_000;
+
+/** Snap-speed HP tiers scale with the snap window (same ratios as the old 15s lane). */
+export function brawlSnapSpeedBonus(remainingMs: number): number {
+  const high = (BRAWL_SNAP_DURATION_MS * 2) / 3;
+  const mid = BRAWL_SNAP_DURATION_MS / 3;
+  if (remainingMs >= high) return 3;
+  if (remainingMs >= mid) return 1;
+  return 0;
+}
 
 /**
  * Brawl Mode chain-length HP bonus ladder. Tuned so a 3-chain is the
@@ -3191,7 +3200,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       if (s.brawlSnapStartedAt != null) {
         const elapsedMs = Date.now() - s.brawlSnapStartedAt;
         const remainingMs = Math.max(0, BRAWL_SNAP_DURATION_MS - elapsedMs);
-        const speedBonus = remainingMs >= 10_000 ? 3 : remainingMs >= 5_000 ? 1 : 0;
+        const speedBonus = brawlSnapSpeedBonus(remainingMs);
         if (humanSide === "Batting") batterSnapBonus = speedBonus;
         else pitcherSnapBonus = speedBonus;
       }

@@ -1,4 +1,6 @@
-import { CardDefinition, SESSION_CARDS } from '../lib/cards';
+import { CardDefinition, SESSION_CARDS, abilityFaceText, isAbilityCard } from '../lib/cards';
+import { colorModeForSide, edgeColorForSide, shapeModeForSide } from '../lib/connect';
+import { PLAY_CARD, abilityFooterClassName, cardHeaderClassName, cardHeaderNameClassName, cardHeaderPlayerClassName, cardCenterValueClass, displayValueFor } from '../lib/cardDisplay';
 import { BATTERS, PITCHERS, MlbPlayer } from '../lib/players';
 import { ShapeHalf } from './CardGameOverlay';
 import { motion, AnimatePresence } from 'motion/react';
@@ -6,23 +8,49 @@ import { X, Search, Users } from 'lucide-react';
 import { useMemo, useState } from 'react';
 
 const CollectionCard = ({ card }: { card: CardDefinition }) => {
+  const ability = isAbilityCard(card);
+  const leftMode = shapeModeForSide(card, 'left');
+  const rightMode = shapeModeForSide(card, 'right');
+  const leftColorMode = colorModeForSide(card, 'left');
+  const rightColorMode = colorModeForSide(card, 'right');
+  const leftEdgeColor = edgeColorForSide(card, 'left');
+  const rightEdgeColor = edgeColorForSide(card, 'right');
+
   return (
     <div className="flex flex-col items-center gap-4 group cursor-pointer transition-transform hover:scale-105">
       <div 
-        className={`relative w-32 h-44 bg-white rounded-xl border-2 flex flex-col items-center justify-center transition-all duration-300 shadow-md ${card.color ? card.color.replace('bg-', 'border-') : 'border-slate-200'}`}
+        className={`relative ${PLAY_CARD.cardClass} bg-white rounded-xl border-2 overflow-hidden transition-all duration-300 shadow-md ${card.color ? card.color.replace('bg-', 'border-') : 'border-slate-200'}`}
       >
-        <ShapeHalf shape={card.leftShape} side="left" isConnected={false} />
-        <ShapeHalf shape={card.rightShape} side="right" isConnected={false} />
+        <ShapeHalf shape={card.leftShape} edgeColor={leftEdgeColor} side="left" isConnected={false} mode={leftMode} colorMode={leftColorMode} />
+        <ShapeHalf shape={card.rightShape} edgeColor={rightEdgeColor} side="right" isConnected={false} mode={rightMode} colorMode={rightColorMode} />
         
-        <div className="text-[10px] leading-tight text-center font-bold text-slate-400 uppercase tracking-widest mb-2 z-30 bg-white/90 px-2 rounded">
-          {card.name}
+        <div className={`absolute inset-x-0 top-0 z-30 flex flex-col items-center text-center w-full ${cardHeaderClassName(false)}`}>
+          {card.player && (
+            <div className={`w-full ${cardHeaderPlayerClassName(false)}`}>
+              {card.player.split(' (')[0]}
+            </div>
+          )}
+          <div className={`w-full ${cardHeaderNameClassName(false)}`}>
+            {card.name}
+          </div>
         </div>
-        <div className="text-5xl font-black text-slate-800 z-30 drop-shadow-sm">
-          {card.baseValue}
-        </div>
+        {ability ? (
+          <>
+            <div className={`${cardCenterValueClass()} text-5xl font-black text-slate-800 z-20 drop-shadow-sm`}>
+              {displayValueFor(card)}
+            </div>
+            <div className={`absolute inset-x-0 bottom-0 z-30 ${abilityFooterClassName(false)}`}>
+              {abilityFaceText(card)}
+            </div>
+          </>
+        ) : (
+          <div className={`${cardCenterValueClass()} text-5xl font-black text-slate-800 z-20 drop-shadow-sm`}>
+            {card.baseValue}
+          </div>
+        )}
       </div>
       
-      <div className="w-32 text-center flex flex-col items-center">
+      <div className="w-[200px] text-center flex flex-col items-center">
         <span className={`text-[9px] font-bold text-white uppercase tracking-wider mb-1 px-2 py-0.5 rounded ${card.color || 'bg-slate-700'}`}>
           {card.abilityType}
         </span>

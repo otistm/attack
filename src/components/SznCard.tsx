@@ -37,6 +37,7 @@ import React from "react";
 import { SznEdgeHalf } from "./SznEdgeHalf";
 import { ShapeHalf } from "./CardGameOverlay";
 import type { ShapeMode, ShapeType } from "./cardShapes";
+import type { EdgeColor } from "../lib/cardModel";
 import type { SznEdgeId } from "../lib/sznEdges";
 import {
   SZN_CARD_SIZES,
@@ -152,10 +153,14 @@ export interface SznCardProps {
   legacyShapes?: {
     leftShape: ShapeType;
     rightShape: ShapeType;
+    leftColor?: EdgeColor;
+    rightColor?: EdgeColor;
     isConnectedLeft?: boolean;
     isConnectedRight?: boolean;
     leftMode?: ShapeMode;
     rightMode?: ShapeMode;
+    leftColorMode?: ShapeMode;
+    rightColorMode?: ShapeMode;
   };
   /** True if the player's leftEdge is currently connected to a partner. */
   isConnectedLeft?: boolean;
@@ -173,6 +178,12 @@ export interface SznCardProps {
   hideLabel?: boolean;
   /** Hide the big body value (e.g. the hero rail paints the value beside the card). */
   hideValue?: boolean;
+  /**
+   * Ability rules text in a white footer strip (ability variant). When
+   * set, the center value slot stays empty and this copy anchors the
+   * bottom of the card above the name strip.
+   */
+  descriptionFooter?: string | null;
   /** Render in a "ghosted" / dimmed style without disabling pointer events. */
   dimmed?: boolean;
   /**
@@ -219,6 +230,7 @@ export function SznCard({
   topLeftSlot,
   hideLabel = false,
   hideValue = false,
+  descriptionFooter = null,
   dimmed = false,
   containerRef,
   ariaLabel,
@@ -229,6 +241,7 @@ export function SznCard({
   const stateTokens = SZN_CARD_STATE[visualState];
   const gradient = bodyGradient(variant, teamCode, role, rarity, abilityType, itemTier);
   const isUtility = isUtilityValue(value);
+  const showCenterValue = !hideValue;
   // Border width: standard/large cards stay at 2px (Topps look);
   // chip / compact cards use the 3px footer rail border so the
   // focus state pops on a smaller surface without competing with
@@ -333,10 +346,12 @@ export function SznCard({
       ) : legacyShapes ? (
         <ShapeHalf
           shape={legacyShapes.leftShape}
+          edgeColor={legacyShapes.leftColor}
           side="left"
           isConnected={!!legacyShapes.isConnectedLeft}
           compact={size === "chip" || size === "compact"}
           mode={legacyShapes.leftMode ?? "normal"}
+          colorMode={legacyShapes.leftColorMode ?? "normal"}
         />
       ) : null}
       {edges?.right ? (
@@ -349,10 +364,12 @@ export function SznCard({
       ) : legacyShapes ? (
         <ShapeHalf
           shape={legacyShapes.rightShape}
+          edgeColor={legacyShapes.rightColor}
           side="right"
           isConnected={!!legacyShapes.isConnectedRight}
           compact={size === "chip" || size === "compact"}
           mode={legacyShapes.rightMode ?? "normal"}
+          colorMode={legacyShapes.rightColorMode ?? "normal"}
         />
       ) : null}
 
@@ -376,8 +393,8 @@ export function SznCard({
         </span>
       )}
 
-      {/* Big body value. Numeric → big font; utility tag → small. */}
-      {!hideValue && (
+      {/* Big body value — value cards only; ability cards use descriptionFooter. */}
+      {showCenterValue && (
         <span
           className="relative z-20 font-black leading-none"
           style={{
@@ -387,6 +404,25 @@ export function SznCard({
           }}
         >
           {value}
+        </span>
+      )}
+
+      {descriptionFooter && (
+        <span
+          className={`absolute inset-x-0 z-30 line-clamp-3 bg-white/95 px-1.5 py-1 text-center font-semibold normal-case tracking-normal leading-snug text-slate-700 border-t border-white/80 ${
+            size === "chip" ? "text-[9px]" : size === "compact" ? "text-[10px]" : "text-[11px]"
+          }`}
+          style={{
+            bottom: hideLabel
+              ? 0
+              : size === "large"
+                ? "2.25rem"
+                : size === "standard"
+                  ? "2rem"
+                  : "1.35rem",
+          }}
+        >
+          {descriptionFooter}
         </span>
       )}
 
