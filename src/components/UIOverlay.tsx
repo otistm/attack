@@ -6,7 +6,7 @@ import { QuestCompleteOverlay } from './QuestCompleteOverlay';
 import { ScreenShake } from './effects/ScreenShake';
 import { useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Calendar, Layers, LogOut, RotateCcw, ChevronDown, Trophy, Zap, Swords } from 'lucide-react';
+import { Calendar, Layers, LogOut, RotateCcw, ChevronDown, Trophy, Zap } from 'lucide-react';
 import { useGameStore, getUserSide, type Team, type GameMode } from '../lib/gameStore';
 
 const SPLASH_DURATION_MS = 3000;
@@ -124,7 +124,7 @@ export function UIOverlay() {
             and the top-of-screen real estate is better spent labelling
             which lane (Quick Match / Victory Mode) the player is in. */}
         <div className="flex items-center" data-tutorial="game-mode">
-          <GameModeBadge gameMode={gameMode} />
+          {gameMode !== 'brawl' && <GameModeBadge gameMode={gameMode} />}
         </div>
 
         {/* Center: scoreboard */}
@@ -567,13 +567,6 @@ function GameModeBadge({ gameMode }: { gameMode: GameMode }) {
           icon: <Calendar className="w-4 h-4" />,
           accent: 'from-emerald-600/90 to-emerald-700/90',
           iconColor: 'text-emerald-300',
-        }
-      : gameMode === 'brawl'
-      ? {
-          label: 'Brawl Mode',
-          icon: <Swords className="w-4 h-4" />,
-          accent: 'from-violet-600/90 to-fuchsia-700/90',
-          iconColor: 'text-violet-300',
         }
       : {
           label: 'Match',
