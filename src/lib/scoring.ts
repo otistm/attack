@@ -327,62 +327,91 @@ export function scoreHand(cards: CardDefinition[], ctx: ScoringContext): Scoring
     homerun: 2,
     single: 1,
   };
-  let bestRank: {
+  type GroupRank = {
     totalValue: number;
     hitScaleBonus: number;
     opponentDebuff: number;
     forcedRank: number;
     length: number;
-  } | null = null;
+  };
+
+  const groupRankBeats = (candidate: GroupRank, best: GroupRank | null): boolean =>
+    best === null ||
+    candidate.totalValue > best.totalValue ||
+    (candidate.totalValue === best.totalValue && candidate.hitScaleBonus > best.hitScaleBonus) ||
+    (candidate.totalValue === best.totalValue &&
+      candidate.hitScaleBonus === best.hitScaleBonus &&
+      candidate.opponentDebuff > best.opponentDebuff) ||
+    (candidate.totalValue === best.totalValue &&
+      candidate.hitScaleBonus === best.hitScaleBonus &&
+      candidate.opponentDebuff === best.opponentDebuff &&
+      candidate.forcedRank > best.forcedRank) ||
+    (candidate.totalValue === best.totalValue &&
+      candidate.hitScaleBonus === best.hitScaleBonus &&
+      candidate.opponentDebuff === best.opponentDebuff &&
+      candidate.forcedRank === best.forcedRank &&
+      candidate.length > best.length);
+
+  type ScoredGroup = {
+    group: CardDefinition[];
+    result: GroupResult;
+    rank: GroupRank;
+  };
+
+  const scored: ScoredGroup[] = [];
 
   for (const group of groups) {
     const groupResult = scoreGroup(group, ctx, cards);
 
     Object.assign(cardModifiers, groupResult.cardModifiers);
 
-    const candidate = {
-      totalValue: groupResult.totalValue,
-      hitScaleBonus: groupResult.hitScaleBonus,
-      // opponentModifier is signed (negative = bigger debuff = better).
-      // Compare on the magnitude of damage to the opponent.
-      opponentDebuff: -groupResult.opponentModifier,
-      forcedRank: groupResult.forcedOutcome ? FORCED_RANK[groupResult.forcedOutcome] : 0,
-      length: group.length,
-    };
-
-    const beats =
-      bestRank === null ||
-      candidate.totalValue > bestRank.totalValue ||
-      (candidate.totalValue === bestRank.totalValue && candidate.hitScaleBonus > bestRank.hitScaleBonus) ||
-      (candidate.totalValue === bestRank.totalValue &&
-        candidate.hitScaleBonus === bestRank.hitScaleBonus &&
-        candidate.opponentDebuff > bestRank.opponentDebuff) ||
-      (candidate.totalValue === bestRank.totalValue &&
-        candidate.hitScaleBonus === bestRank.hitScaleBonus &&
-        candidate.opponentDebuff === bestRank.opponentDebuff &&
-        candidate.forcedRank > bestRank.forcedRank) ||
-      (candidate.totalValue === bestRank.totalValue &&
-        candidate.hitScaleBonus === bestRank.hitScaleBonus &&
-        candidate.opponentDebuff === bestRank.opponentDebuff &&
-        candidate.forcedRank === bestRank.forcedRank &&
-        candidate.length > bestRank.length);
-
-    if (beats) {
-      maxValue = groupResult.totalValue;
-      bestGroup = group;
-      opponentModifier = groupResult.opponentModifier;
-      hitScaleBonus = groupResult.hitScaleBonus;
-      forcedOutcome = groupResult.forcedOutcome;
-      pitcherWinsTies = groupResult.pitcherWinsTies;
-      pitcherCombinedDelta = groupResult.pitcherCombinedDelta;
-      // Attribution mirrors the opponentModifier / pitcherCombinedDelta
-      // contract: only the BEST group's effects fire, so only its targeted
-      // debuffs survive into the public ScoringResult.
-      targetedOpponentDebuffs = groupResult.targetedOpponentDebuffs;
-      bestRank = candidate;
-    }
+    scored.push({
+      group,
+      result: groupResult,
+      rank: {
+        totalValue: groupResult.totalValue,
+        hitScaleBonus: groupResult.hitScaleBonus,
+        // opponentModifier is signed (negative = bigger debuff = better).
+        // Compare on the magnitude of damage to the opponent.
+        opponentDebuff: -groupResult.opponentModifier,
+        forcedRank: groupResult.forcedOutcome ? FORCED_RANK[groupResult.forcedOutcome] : 0,
+        length: group.length,
+      },
+    });
 
     log.push(...groupResult.log);
+  }
+
+  const pickBest = (candidates: ScoredGroup[]): ScoredGroup | null => {
+    if (candidates.length === 0) return null;
+    return candidates.reduce((best, cur) =>
+      groupRankBeats(cur.rank, best.rank) ? cur : best,
+    );
+  };
+
+  // Brawl manual-chain seats: once the player has snapped a multi-card
+  // chain, score against THAT chain instead of a higher solo card. The
+  // pill, card faces, and chain-length bonus all key off `bestGroup`, so
+  // letting a lone card steal the group made snapped chains look inert.
+  let winner = pickBest(scored);
+  if (ctx.gameMode === "brawl" && ctx.affirmedSeams != null) {
+    const chained = scored.filter((entry) => entry.group.length >= 2);
+    const chainedWinner = pickBest(chained);
+    if (chainedWinner) winner = chainedWinner;
+  }
+
+  if (winner) {
+    maxValue = winner.result.totalValue;
+    bestGroup = winner.group;
+    opponentModifier = winner.result.opponentModifier;
+    hitScaleBonus = winner.result.hitScaleBonus;
+    forcedOutcome = winner.result.forcedOutcome;
+    pitcherWinsTies = winner.result.pitcherWinsTies;
+    pitcherCombinedDelta = winner.result.pitcherCombinedDelta;
+    // Attribution mirrors the opponentModifier / pitcherCombinedDelta
+    // contract: only the BEST group's effects fire, so only its targeted
+    // debuffs survive into the public ScoringResult.
+    targetedOpponentDebuffs = winner.result.targetedOpponentDebuffs;
   }
 
   // Per-hand effects that adjust the opponent total based on the WHOLE hand
@@ -769,7 +798,37 @@ function scoreGroup(rawGroup: CardDefinition[], ctx: ScoringContext, hand: CardD
   // target-type requirement isn't satisfied.
   applySznItemGroupScoringEffects(group, cardModifiers);
 
-  const totalValue = Object.values(cardModifiers).reduce((acc, m) => acc + m.value, 0);
+  let totalValue = Object.values(cardModifiers).reduce((acc, m) => acc + m.value, 0);
+
+  // p-58 Brawl Dominance: +3 when this group's locked total leads the
+  // opponent batter's best chain by 6+. Evaluated after the group is fully
+  // scored so chained buffs count toward the margin (the inline hook used
+  // raw baseValues only, which desynced card modifiers from the pill).
+  if (
+    ctx.gameMode === "brawl" &&
+    ctx.opponentHand &&
+    group.some((c) => c.id === "p-58")
+  ) {
+    const oppCtx: ScoringContext = {
+      ...ctx,
+      side: "Batting",
+      opponentHand: hand,
+      opponentBaseCard: highestValueCard(hand) ?? null,
+      affirmedSeams: ctx.opponentAffirmedSeams ?? null,
+      opponentAffirmedSeams: ctx.affirmedSeams ?? null,
+      nullifiedCardIds: undefined,
+      nullifyOpponentBaseMechanic: undefined,
+      nullifyOpponentTagMechanics: undefined,
+    };
+    const oppResult = scoreHand(ctx.opponentHand, oppCtx);
+    if (totalValue - oppResult.maxValue >= 6) {
+      const mod = cardModifiers["p-58"];
+      if (mod) {
+        cardModifiers["p-58"] = { ...mod, value: mod.value + 3 };
+        totalValue += 3;
+      }
+    }
+  }
 
   return {
     totalValue,

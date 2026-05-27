@@ -611,6 +611,8 @@ export interface RevealMathSnapshot {
     pitcherDelta: number;
     carryoverDelta: number;
     guessDelta: number;
+    hitScaleDelta: number;
+    extraDelta: number;
     total: number;
     ignoresDebuffs: boolean;
     chainOf: number;
@@ -620,6 +622,7 @@ export interface RevealMathSnapshot {
     chainSum: number;
     batterDelta: number;
     carryoverDelta: number;
+    extraDelta: number;
     total: number;
     chainOf: number;
     handSize: number;
@@ -1609,11 +1612,9 @@ export interface MatchupPreview {
   /** Whether the batter would win the head-to-head if locked in right now. */
   batterWinning: boolean;
   /**
-   * Net Hit Scale ladder bonus the batter would currently apply ON TOP of the
-   * head-to-head score, IF they win. Already accounts for the pitcher's
-   * `hitScaleBonus` wall and b-9 immunity. Surfaced as a "+N HIT SCALE"
-   * badge near the batter pill so the player sees the bonus is in play
-   * without the pill itself silently jumping by N once they actually win.
+   * Net Hit Scale modifier (batter bonus minus pitcher wall, after
+   * b-9 immunity). Also exposed as `batterHitScaleDelta` when folded into
+   * `batterDisplay` for the selection-phase pill.
    */
   batterHitScaleBonus: number;
 
@@ -1631,12 +1632,8 @@ export interface MatchupPreview {
   pitcherScoringResult: ScoringResult;
 
   // ============ Components of `batterDisplay` =============================
-  // pillTotal === chainSum + pitcherDelta + carryoverDelta + guessDelta.
-  // When any of the cross-side deltas is non-zero, the UI shows a math
-  // breakdown so the player can see WHY their visible card sum doesn't
-  // match the pill -- previously these effects (p-38 / p-50 / p-60 / p-72 /
-  // p-90 aggregate debuffs, cross-at-bat carryover, b-65 guess bonus) only
-  // moved the pill, never the per-card numbers.
+  // pillTotal === chainSum + cross-side + carryover + guess + hitScale (when
+  // winning) + brawl chain/streak (shown in-pill as "+N" during selection).
 
   /** Sum of the batter's best-chain card values (the visible chain total). */
   batterChainSum: number;
@@ -1646,6 +1643,11 @@ export interface MatchupPreview {
   batterCarryoverDelta: number;
   /** b-65 Guess Pitch bonus applied at lock-in (0/1/4). */
   batterGuessDelta: number;
+  /**
+   * Hit Scale net folded into `batterDisplay` when the batter is winning
+   * (non-brawl). Zero when losing or in brawl mode.
+   */
+  batterHitScaleDelta: number;
   /** True when b-9 Generational Discipline is in play (debuffs zeroed). */
   batterIgnoresDebuffs: boolean;
 
@@ -1655,6 +1657,15 @@ export interface MatchupPreview {
   pitcherBatterDelta: number;
   /** Pitcher pill: cross-at-bat carryover on pitching side. */
   pitcherCarryoverDelta: number;
+  /**
+   * Residual pill bonus not attributed to chain / cross-side / carryover /
+   * guess (SZN synergy+badges+abilities, brawl chain+hot-streak, etc.).
+   */
+  batterExtraDelta: number;
+  pitcherExtraDelta: number;
+  /** Brawl chain + hot-streak bonus included in the pill during selection. */
+  batterBrawlBonusDelta: number;
+  pitcherBrawlBonusDelta: number;
 }
 
 function pickRandom<T>(arr: T[]): T {
@@ -1700,6 +1711,35 @@ function chainBonusFor(chainLen: number): number {
   if (chainLen >= 4) return 8;
   if (chainLen >= 3) return 5;
   return 0;
+}
+
+/** Strip highlight for flat brawl HP folded onto the chain anchor card. */
+const BRAWL_FLAT_BONUS_HIGHLIGHT = "bg-emerald-500";
+
+/**
+ * Brawl flat bonuses (chain length / snap-speed / hot streak) land on the
+ * pill total but aren't per-card effects. Fold them onto the last card in
+ * `bestGroup` so the hand strip sums to the same number the pill shows.
+ */
+function applyBrawlFlatBonusToScoringResult(
+  result: ScoringResult,
+  bonus: number,
+): ScoringResult {
+  if (bonus <= 0 || result.bestGroup.length === 0) return result;
+  const anchor = result.bestGroup[result.bestGroup.length - 1];
+  const mod = result.cardModifiers[anchor.id];
+  if (!mod) return result;
+  return {
+    ...result,
+    cardModifiers: {
+      ...result.cardModifiers,
+      [anchor.id]: {
+        ...mod,
+        value: mod.value + bonus,
+        color: mod.color ?? BRAWL_FLAT_BONUS_HIGHLIGHT,
+      },
+    },
+  };
 }
 
 /**
@@ -2973,32 +3013,56 @@ export const useGameStore = create<GameState>((set, get) => ({
     // can still rearrange their hand, but they can't reverse-engineer their
     // way out of the seam break.
     const workingBatter = applySweepingSliderMutation(s);
-    const batterResult =
-      workingBatter === s.batterHand
-        ? s.scoreBatter()
-        : scoreHandFor(s, workingBatter, "Batting");
-    const pitcherResult = s.scorePitcher();
+    // Always route through `scoreHandFor` so brawl opponent seams
+    // (`brawlOpponentSeams`) and the user's `affirmedSeams` thread the
+    // same way they do at lockIn. The legacy `scoreBatter` /
+    // `scorePitcher` shortcuts omit opponent seams in brawl and made
+    // cross-side effects (p-58, combo readers, ...) drift from the pill.
+    let batterResult = scoreHandFor(s, workingBatter, "Batting");
+    let pitcherResult = scoreHandFor(s, s.pitcherHand, "Pitching");
     // Selection-phase preview: hide the guess-pitch bonus from the pill so
     // the player doesn't get a free "did I guess right?" tell from the
     // pitcher's still-face-down hand. lockIn calls computeMatchup with the
     // default `revealsGuess: true` so the final score still reflects it.
     const m = computeMatchup(s, batterResult, pitcherResult, /* revealsGuess */ false);
-    // Brawl Mode preview: fold the deterministic chain + hot-streak HP
-    // bonuses into the displayed totals so the selection-phase pill
-    // matches what lockIn will land on. Snap-speed is INTENTIONALLY
-    // omitted -- it depends on real-time clock and would make the
-    // pill jitter every frame as the snap timer drains, which reads
-    // as flicker rather than feedback. Players still get the actual
-    // snap-speed reward at lock-in via `lastBrawlBonusBreakdown`.
+    // Brawl Mode preview: fold chain + hot-streak + snap-speed HP bonuses
+    // into the displayed totals so the selection-phase pill tracks live
+    // snaps and the countdown tier the user is currently sitting in.
     let batterDisplay = m.batterDisplay;
     let pitcherDisplay = m.pitcherDisplay;
+    let batterBrawlBonusDelta = 0;
+    let pitcherBrawlBonusDelta = 0;
     if (s.gameMode === "brawl") {
+      const humanSide = getUserSide(s);
+      let batterSnapBonus = 0;
+      let pitcherSnapBonus = 0;
+      if (s.brawlSnapStartedAt != null) {
+        const elapsedMs = Date.now() - s.brawlSnapStartedAt;
+        const remainingMs = Math.max(0, BRAWL_SNAP_DURATION_MS - elapsedMs);
+        const speedBonus = brawlSnapSpeedBonus(remainingMs);
+        if (humanSide === "Batting") batterSnapBonus = speedBonus;
+        else pitcherSnapBonus = speedBonus;
+      }
       const batterChainBonus = chainBonusFor(batterResult.bestGroup?.length ?? 0);
       const pitcherChainBonus = chainBonusFor(pitcherResult.bestGroup?.length ?? 0);
       const batterStreakBonus = s.brawlStreakBatter >= 2 ? 3 : 0;
       const pitcherStreakBonus = s.brawlStreakPitcher >= 2 ? 3 : 0;
-      batterDisplay = m.batterDisplay + batterChainBonus + batterStreakBonus;
-      pitcherDisplay = m.pitcherDisplay + pitcherChainBonus + pitcherStreakBonus;
+      batterBrawlBonusDelta = batterChainBonus + batterStreakBonus + batterSnapBonus;
+      pitcherBrawlBonusDelta = pitcherChainBonus + pitcherStreakBonus + pitcherSnapBonus;
+      batterDisplay = m.batterDisplay + batterBrawlBonusDelta;
+      pitcherDisplay = m.pitcherDisplay + pitcherBrawlBonusDelta;
+      if (batterBrawlBonusDelta > 0) {
+        batterResult = applyBrawlFlatBonusToScoringResult(
+          batterResult,
+          batterBrawlBonusDelta,
+        );
+      }
+      if (pitcherBrawlBonusDelta > 0) {
+        pitcherResult = applyBrawlFlatBonusToScoringResult(
+          pitcherResult,
+          pitcherBrawlBonusDelta,
+        );
+      }
     }
     // In brawl mode the win indicator should reflect the post-bonus
     // totals so the green/red tone of the pill stays consistent with
@@ -3023,10 +3087,25 @@ export const useGameStore = create<GameState>((set, get) => ({
       batterPitcherDelta: m.batterPitcherDelta,
       batterCarryoverDelta: m.batterCarryoverDelta,
       batterGuessDelta: m.batterGuessDelta,
+      batterHitScaleDelta: m.batterHitScaleDelta,
       batterIgnoresDebuffs: m.batterIgnoresDebuffs,
       pitcherChainSum: m.pitcherChainSum,
       pitcherBatterDelta: m.pitcherBatterDelta,
       pitcherCarryoverDelta: m.pitcherCarryoverDelta,
+      batterExtraDelta:
+        batterDisplay -
+        m.batterChainSum -
+        m.batterPitcherDelta -
+        m.batterCarryoverDelta -
+        m.batterGuessDelta -
+        m.batterHitScaleDelta,
+      pitcherExtraDelta:
+        pitcherDisplay -
+        m.pitcherChainSum -
+        m.pitcherBatterDelta -
+        m.pitcherCarryoverDelta,
+      batterBrawlBonusDelta,
+      pitcherBrawlBonusDelta,
     };
   },
 
@@ -3119,16 +3198,18 @@ export const useGameStore = create<GameState>((set, get) => ({
     }
 
     const rawBatterResult = scoreHandFor(s, s.batterHand, "Batting");
-    const pitcherResult = scoreHandFor(s, s.pitcherHand, "Pitching");
+    let pitcherResult = scoreHandFor(s, s.pitcherHand, "Pitching");
 
     // SZN Deception edge: 25% chance per Deception snap on the defender's
     // chain to shatter the opposing chain. We roll once at lock-in so the
     // preview pill doesn't leak the outcome (random per-render rolls would
     // also be unfair). Non-SZN paths return the raw batterResult intact.
-    const { batterResult, shattered: deceptionShattered } =
+    const deceptionRoll =
       s.gameMode === "szn"
         ? maybeApplyDeception(s, rawBatterResult, pitcherResult)
         : { batterResult: rawBatterResult, shattered: false };
+    let batterResult = deceptionRoll.batterResult;
+    const deceptionShattered = deceptionRoll.shattered;
     void deceptionShattered;
 
     const m = computeMatchup(s, batterResult, pitcherResult);
@@ -3218,6 +3299,14 @@ export const useGameStore = create<GameState>((set, get) => ({
       if (pitcherAtStreak) pitcherStreakBonus = 3;
       batterDisplay = m.batterDisplay + batterSnapBonus + batterChainBonus + batterStreakBonus;
       pitcherDisplay = m.pitcherDisplay + pitcherSnapBonus + pitcherChainBonus + pitcherStreakBonus;
+      const batterFlat = batterSnapBonus + batterChainBonus + batterStreakBonus;
+      const pitcherFlat = pitcherSnapBonus + pitcherChainBonus + pitcherStreakBonus;
+      if (batterFlat > 0) {
+        batterResult = applyBrawlFlatBonusToScoringResult(batterResult, batterFlat);
+      }
+      if (pitcherFlat > 0) {
+        pitcherResult = applyBrawlFlatBonusToScoringResult(pitcherResult, pitcherFlat);
+      }
     }
 
     const brawlResolution: BrawlOutcomeResolution | null = isBrawl
@@ -3358,6 +3447,8 @@ export const useGameStore = create<GameState>((set, get) => ({
         pitcherDelta: m.batterPitcherDelta,
         carryoverDelta: m.batterCarryoverDelta,
         guessDelta: m.batterGuessDelta,
+        hitScaleDelta: m.batterHitScaleDelta,
+        extraDelta: m.batterExtraDelta,
         total: m.batterDisplay,
         ignoresDebuffs: m.batterIgnoresDebuffs,
         chainOf: batterResult.bestGroup.length,
@@ -3367,6 +3458,7 @@ export const useGameStore = create<GameState>((set, get) => ({
         chainSum: m.pitcherChainSum,
         batterDelta: m.pitcherBatterDelta,
         carryoverDelta: m.pitcherCarryoverDelta,
+        extraDelta: m.pitcherExtraDelta,
         total: m.pitcherDisplay,
         chainOf: pitcherResult.bestGroup.length,
         handSize: s.pitcherHand.length,
@@ -6385,11 +6477,9 @@ interface ComputedMatchup {
   batterDisplay: number;
   pitcherDisplay: number;
   /**
-   * Signed net Hit Scale modifier (batter bonus minus pitcher wall, after
-   * b-9 immunity). Lives separately from `batterDisplay` so the UI can
-   * render a "+N HIT SCALE" badge instead of silently folding the bonus
-   * into the pill -- avoiding the playtest "score jumps from 24 to 28
-   * between preview and final" surprise.
+   * Net Hit Scale modifier (batter bonus minus pitcher wall, after
+   * b-9 immunity). Folded into `batterDisplay` when the batter is winning
+   * (non-brawl) so the pill shows the full offensive total at a glance.
    */
   batterHitScaleNet: number;
   // Per-component breakdown of `batterTotal` so the UI can surface
@@ -6403,6 +6493,8 @@ interface ComputedMatchup {
   batterCarryoverDelta: number;
   batterGuessDelta: number;
   batterIgnoresDebuffs: boolean;
+  /** Hit Scale net included in `batterDisplay` when winning (non-brawl). */
+  batterHitScaleDelta: number;
   /** Best-chain value sum for the pitcher's pill (head-to-head total). */
   pitcherChainSum: number;
   /**
@@ -6412,6 +6504,8 @@ interface ComputedMatchup {
   pitcherBatterDelta: number;
   /** Cross-at-bat carryover applied to the pitcher's pill. */
   pitcherCarryoverDelta: number;
+  batterExtraDelta: number;
+  pitcherExtraDelta: number;
 }
 
 /**
@@ -7481,21 +7575,32 @@ function computeMatchup(
     batterResult.hitScaleBonus + sznBatterHitScale - effPitcherHitScaleWall - sznPitcherHitScale;
   const hitScaleValue = batterTotal + batterHitScaleNet;
 
-  // The displayed pill is now ALWAYS the head-to-head total -- the hit-scale
-  // modifier rides as a separate badge in the UI. Previously the pill silently
-  // folded in `batterHitScaleNet` only when the batter was winning, which
-  // produced the playtest "score jumps from 24 to 28 between preview and
-  // final" surprise whenever an at-bat flipped from losing to winning at
-  // lock-in (e.g. b-22 coin flip resolving). Keeping the pill in one
-  // arithmetic universe means lockIn and previewMatchup always return the
-  // same number for the same hand state -- the badge tells the player what
-  // additional bonus is in play if they win.
-  const batterDisplay = batterTotal;
+  // Pill shows the full offensive total when the batter is winning: chain +
+  // cross-side pressure + carryover + guess + SZN/brawl extras + Hit Scale.
+  // Hit Scale is omitted when losing (doesn't affect the at-bat) and in brawl
+  // (HP ladder, not hit-scale ladder). Win comparison still uses `batterTotal`
+  // without Hit Scale so tie-break semantics stay unchanged.
+  const batterHitScaleInDisplay =
+    s.gameMode !== "brawl" && batterWins ? batterHitScaleNet : 0;
+  const batterDisplay = batterTotal + batterHitScaleInDisplay;
 
   const pitcherChainSum = pitcherResult.maxValue;
   const pitcherBatterDelta =
     batterResult.opponentModifier + batterResult.pitcherCombinedDelta;
   const pitcherCarryoverDelta = pitcherDebuffDelta;
+
+  const batterExtraDelta =
+    batterDisplay -
+    batterResult.maxValue -
+    effPitcherOpponentMod -
+    effBatterDebuffDelta -
+    guessPitchBonus -
+    batterHitScaleInDisplay;
+  const pitcherExtraDelta =
+    pitcherTotal -
+    pitcherResult.maxValue -
+    (batterResult.opponentModifier + batterResult.pitcherCombinedDelta) -
+    pitcherDebuffDelta;
 
   return {
     batterTotal,
@@ -7510,9 +7615,12 @@ function computeMatchup(
     batterCarryoverDelta: effBatterDebuffDelta,
     batterGuessDelta: guessPitchBonus,
     batterIgnoresDebuffs,
+    batterHitScaleDelta: batterHitScaleInDisplay,
     pitcherChainSum,
     pitcherBatterDelta,
     pitcherCarryoverDelta,
+    batterExtraDelta,
+    pitcherExtraDelta,
   };
 }
 

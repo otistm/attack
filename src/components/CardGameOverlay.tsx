@@ -20,7 +20,6 @@ import { useGameStore, getUiUserSide, isLowLeverageAtBat, ResolutionBeat, Reveal
 import { HitOutcome, type BrawlOutcomeResolution } from '../lib/scoring';
 import {
   playBatSuccess,
-  playCardBoost,
   playCardPickup,
   playCardSwap,
   playHit,
@@ -45,7 +44,6 @@ import { BrawlDraftOverlay } from './brawl/BrawlDraftOverlay';
 import type { BrawlAura } from './brawl/BrawlImpactCanvas';
 import { teamPalette } from '../lib/teamColors';
 import { RARITY_BASE_VALUE } from '../lib/run';
-import { activeSynergies, teamBatterBonus, teamPitcherBonus } from '../lib/synergies';
 import { PLAYERS } from '../lib/players';
 import { ALL_SZN_PLAYERS, isSznPlayer } from '../lib/sznPlayers';
 import { useSznGamepad, useGamepadPresent } from '../lib/useSznGamepad';
@@ -451,19 +449,16 @@ export const CardItem = ({
     isPlayerCard && modifier ? modifier.value - card.baseValue : 0;
   const cardIsAbility = isAbilityCard(card);
   const cardIsValue = isValueCard(card);
-  // Combat display: player cards use rarity floor + delta; value cards
-  // use the live scored modifier when present; ability cards show their
-  // printed number in the center (footer holds the rules text).
+  // Combat display: player cards use rarity floor + delta; catalog cards
+  // prefer the live scored modifier (same source as the pill chain) and
+  // fall back to the printed face value only when the card isn't in the
+  // active best chain yet.
   const displayValue: number = valueOverride ?? (
     isPlayerCard && playerBaseValue != null
       ? playerBaseValue + playerDelta
-      : cardIsValue
-        ? modifier?.value !== undefined && modifier.value !== 0
-          ? modifier.value
-          : displayValueFor(card)
-        : cardIsAbility
-          ? displayValueFor(card)
-          : 0
+      : modifier?.value !== undefined
+        ? modifier.value
+        : displayValueFor(card)
   );
   const abilityFooterText = cardIsAbility && !isPlayerCard ? abilityFaceText(card) : null;
   const showCenterNumber = !isPlayerCard && (cardIsValue || cardIsAbility);
@@ -976,6 +971,16 @@ export const CardGameOverlay = () => {
   const totalInnings = useGameStore((s) => s.totalInnings);
   const outs = useGameStore((s) => s.outs);
   const gameMode = useGameStore((s) => s.gameMode);
+  const isFirstAtBatOfInning = useGameStore((s) => s.isFirstAtBatOfInning);
+  const equippedItems = useGameStore((s) => s.equippedItems);
+  const batterHandedness = useGameStore((s) => s.batter.handedness);
+  const pitcherHandedness = useGameStore((s) => s.pitcher.handedness);
+  const questPendingBattingHitScale = useGameStore(
+    (s) => s.questPendingBattingHitScale,
+  );
+  const brawlStreakBatter = useGameStore((s) => s.brawlStreakBatter);
+  const brawlStreakPitcher = useGameStore((s) => s.brawlStreakPitcher);
+  const rallyFireWeeksLeft = useGameStore((s) => s.run?.rallyFireWeeksLeft ?? 0);
   // Which seat is the human in this half? When pitching, the bottom strip
   // becomes the pitcher hand (drag, lock-in, status chips on the user's
   // side) and the top strip becomes the AI batter (face-down -> revealed).
@@ -1067,37 +1072,10 @@ export const CardGameOverlay = () => {
   // Live preview. Single source of truth: `previewMatchup` runs both sides
   // through the same scoring pass that feeds the pill (including p-41's
   // Sweeping Slider seam-break on the working batter hand), then exposes
-  // both ScoringResults plus the per-component breakdown. The strip's
-  // per-card values and the BATTER pill all read from this one matchup --
-  // they can never desync from each other or from what locks in.
-  //
-  // CRITICAL: the memo dep list MUST include every slice that
-  // `previewMatchup` reads from the store. An incomplete dep list silently
-  // froze the pill on stale values until lockIn re-ran the engine -- the
-  // playtest "pill jumped +1 between preview and final" symptom that
-  // looked like an engine discrepancy was actually this stale memo (b-65
-  // Guess Pitch's +1/+4 bonus depended on `resolvedChoices`, which wasn't
-  // in deps).
-  const matchup = useMemo(
-    () => previewMatchupFn(),
-    [
-      previewMatchupFn,
-      batterHand,
-      pitcherHand,
-      phase,
-      resolvedChoices,
-      coinFlips,
-      pendingDebuffs,
-      bases,
-      half,
-      homeScore,
-      awayScore,
-      inning,
-      affirmedSeams,
-      brawlOpponentSeams,
-      brawlOpponentPlanHand,
-    ],
-  );
+  // both ScoringResults plus the per-component breakdown. Call it every
+  // render so brawl seam snaps and snap-speed tiers land on the pill
+  // immediately instead of freezing behind a memo with missing deps.
+  const matchup = previewMatchupFn();
   const batterPreview = matchup.batterScoringResult;
   const pitcherPreview = matchup.pitcherScoringResult;
   // Reference scoreBatterFn / scorePitcherFn so swap-in alternatives during
@@ -1140,18 +1118,19 @@ export const CardGameOverlay = () => {
 
   // Decide which per-card modifier set the strips render against. While the
   // player is selecting we want LIVE previews so the numbers update as cards
-  // get rearranged. The moment we leave selecting (revealing -> resolved) we
-  // freeze on the lock-in snapshot so post-resolution state changes (bases
-  // cleared, score changed, half flipped) can't silently mutate the displayed
-  // values out from under the player. Falls back to the live preview if the
-  // snapshot hasn't been populated yet (game start, manual reset).
+  // get rearranged. Only cards in the winning best chain get scored modifiers
+  // — other chains still populate cardModifiers internally but must not paint
+  // inflated values on cards that do not feed the pill. The moment we leave
+  // selecting (revealing -> resolved) we freeze on the lock-in snapshot so
+  // post-resolution state changes (bases cleared, score changed, half flipped)
+  // can't silently mutate the displayed values out from under the player.
   const batterModifiersForStrip = isSelecting
-    ? batterPreview.cardModifiers
+    ? modifiersForBestChain(batterPreview.cardModifiers, batterPreview.bestGroup)
     : Object.keys(lastBatterCardModifiers).length > 0
       ? lastBatterCardModifiers
       : batterPreview.cardModifiers;
   const pitcherModifiersForStrip = isSelecting
-    ? pitcherPreview.cardModifiers
+    ? modifiersForBestChain(pitcherPreview.cardModifiers, pitcherPreview.bestGroup)
     : Object.keys(lastPitcherCardModifiers).length > 0
       ? lastPitcherCardModifiers
       : pitcherPreview.cardModifiers;
@@ -1421,8 +1400,14 @@ export const CardGameOverlay = () => {
   const aiHighlights = userIsBatting ? reveal.pitcherHighlights : reveal.batterHighlights;
   const userBanner = userIsBatting ? reveal.batterBanner : reveal.pitcherBanner;
   const aiBanner = userIsBatting ? reveal.pitcherBanner : reveal.batterBanner;
-  const userPillValue = userIsBatting ? batterDisplayValue : pitcherDisplayValue;
-  const aiPillValue = userIsBatting ? pitcherDisplayValue : batterDisplayValue;
+  const userPillValue =
+    userIsBatting ? batterDisplayValue : pitcherDisplayValue;
+  const aiPillValue =
+    userIsBatting ? pitcherDisplayValue : batterDisplayValue;
+  const userPillDisplay =
+    userPillValue == null ? null : Math.round(userPillValue);
+  const aiPillDisplay =
+    aiPillValue == null ? null : Math.round(aiPillValue);
   // Brawl pill fill: always on in brawl mode. During selection the bar
   // tracks the live preview (full). During reveal it drains against the
   // locked-in shield. After the result it stays visible showing
@@ -1431,7 +1416,7 @@ export const CardGameOverlay = () => {
     !brawlMode
       ? null
       : isSelecting
-        ? Math.max(1, userPillValue ?? 0)
+        ? Math.max(1, userPillDisplay ?? 0)
         : lastBrawlResolution
           ? userIsBatting
             ? lastBrawlResolution.batterStartingHP
@@ -1440,14 +1425,14 @@ export const CardGameOverlay = () => {
             ? userIsBatting
               ? lastBatterScore
               : lastPitcherScore
-            : Math.max(1, userPillValue ?? 0);
+            : Math.max(1, userPillDisplay ?? 0);
   const opponentBrawlHpMax =
     !brawlMode
       ? null
       : isSelecting && hideOpponentTotals
         ? null
         : isSelecting
-          ? Math.max(1, aiPillValue ?? 0)
+          ? Math.max(1, aiPillDisplay ?? 0)
           : lastBrawlResolution
             ? userIsBatting
               ? lastBrawlResolution.pitcherStartingHP
@@ -1456,7 +1441,7 @@ export const CardGameOverlay = () => {
               ? userIsBatting
                 ? lastPitcherScore
                 : lastBatterScore
-              : Math.max(1, aiPillValue ?? 0);
+              : Math.max(1, aiPillDisplay ?? 0);
   const userBrawlHpFill = brawlMode && userBrawlHpMax != null;
   const opponentBrawlHpFill = brawlMode && opponentBrawlHpMax != null;
   const userLabel = userIsBatting ? 'Batter' : 'Pitcher';
@@ -1464,8 +1449,10 @@ export const CardGameOverlay = () => {
   const userTone = userIsBatting ? 'batter' : 'pitcher';
   const aiTone = userIsBatting ? 'pitcher' : 'batter';
 
-  const showFrozenMatchupMath =
-    lastRevealMathSnapshot !== null && (isRevealing || isResolved);
+  // Brawl selection: the pill shows one green HP total (chain + bonuses
+  // already folded into `previewMatchup`, no separate "+N" suffix).
+  const userPillHighlight = brawlMode && isSelecting;
+  const aiPillHighlight = brawlMode && isSelecting && !hideOpponentTotals;
 
   // Set of cardIds in the user's hand that have an unresolved player-choice
   // prompt. The HandStrip uses this to render the "USE" pill on the
@@ -1823,24 +1810,6 @@ export const CardGameOverlay = () => {
     sznGamepadFocus === 'screen' &&
     isSelecting;
 
-  /** SZN: flat team tag bonus folded into the matchup pill via `sznSideBonus`. */
-  const userSznRosterSynergyAmount = useMemo(() => {
-    if (!sznRunActive || !run) return null;
-    const amt = userIsBatting ? teamBatterBonus(run.roster) : teamPitcherBonus(run.roster);
-    return amt > 0 ? amt : null;
-  }, [sznRunActive, run, userIsBatting]);
-
-  const userSznRosterSynergyTitle = useMemo(() => {
-    if (!run || userSznRosterSynergyAmount == null) return undefined;
-    const lines = activeSynergies(run.roster)
-      .filter((s) =>
-        userIsBatting ? s.threshold.batterBonus > 0 : s.threshold.pitcherBonus > 0,
-      )
-      .map((s) => s.threshold.label);
-    if (lines.length === 0) return 'Adjacent roster tag synergy — added to your matchup total.';
-    return `${lines.join(' · ')} — counted in your matchup total.`;
-  }, [run, userIsBatting, userSznRosterSynergyAmount]);
-
   // ---- Quick Resolve auto-chain --------------------------------------------
   // Cheap recompute on every render -- the helper is a few branches over
   // primitive store fields, so a memo would cost more than it saves.
@@ -2089,18 +2058,16 @@ export const CardGameOverlay = () => {
             <ScorePill
               label={aiLabel}
               tone={aiTone}
-              value={hideOpponentTotals ? null : aiPillValue}
+              value={hideOpponentTotals ? null : aiPillDisplay}
               outcomeStyle={outcomeBadgeStyle}
               compact
               banner={hideOpponentTotals ? null : aiBanner}
               heroHasValue={false}
+              highlightValue={aiPillHighlight}
               brawlHpMax={opponentBrawlHpMax}
               brawlHpSide="opponent"
               brawlHpFill={opponentBrawlHpFill}
             />
-            {brawlMode && (
-              <BrawlBonusToast side={userIsBatting ? 'pitcher' : 'batter'} />
-            )}
           </div>
           <div data-tutorial="opponent-hand" data-brawl-hand="opponent">
             {brawlMode && isSelecting && !brawlDraftActive ? (
@@ -2158,85 +2125,18 @@ export const CardGameOverlay = () => {
             <ScorePill
               label={userLabel}
               tone={userTone}
-              value={userPillValue}
+              value={userPillDisplay}
               outcome={isResolved && !brawlMode ? lastResultMessage : undefined}
               outcomeStyle={outcomeBadgeStyle}
               atBatId={atBatId}
               banner={userBanner}
-              // SZN hides the bottom PlayerHero rail; keep the matchup total in
-              // the pill at md+. Brawl Mode also hides the rail (the pill IS
-              // the HP readout) so it's likewise canonical there.
               heroHasValue={!sznRunActive && !brawlMode}
-              // Hit Scale hint is a batter-only concept ("if you win, +N to
-              // your hit"). Only show it when the user IS the batter.
-              hitScaleHint={
-                userIsBatting && isSelecting && matchup.batterWinning && matchup.batterHitScaleBonus !== 0
-                  ? matchup.batterHitScaleBonus
-                  : null
-              }
-              rosterSynergyHint={userSznRosterSynergyAmount}
-              rosterSynergyTitle={userSznRosterSynergyTitle}
+              highlightValue={userPillHighlight}
               brawlHpMax={userBrawlHpMax}
               brawlHpSide="user"
               brawlHpFill={userBrawlHpFill}
             />
-            {brawlMode && (
-              <BrawlBonusToast side={userIsBatting ? 'batter' : 'pitcher'} />
-            )}
           </div>
-
-          {/* Math breakdown: explains why the pill differs from the visible
-              chain sum when an opponent debuff (p-38 / p-50 / p-60 / p-72 /
-              p-90 etc.), a cross-at-bat carryover, or a b-65 guess bonus is
-              moving the pill. Hides itself entirely when the chain sum IS
-              the pill so we don't pollute the UI in vanilla matchups.
-              Batter-side concept: skip it when the user is pitching --
-              showing the AI batter's chain breakdown during selection
-              would leak their face-down hand. */}
-          {userIsBatting && isSelecting && (
-            <MatchupMath
-              chainSum={matchup.batterChainSum}
-              pitcherDelta={matchup.batterPitcherDelta}
-              carryoverDelta={matchup.batterCarryoverDelta}
-              guessDelta={matchup.batterGuessDelta}
-              total={matchup.batterDisplay}
-              ignoresDebuffs={matchup.batterIgnoresDebuffs}
-              chainOf={batterPreview.bestGroup.length}
-              handSize={batterHand.length}
-            />
-          )}
-
-          {showFrozenMatchupMath && lastRevealMathSnapshot && userIsBatting && (
-            <MatchupMath
-              caption={isRevealing ? 'Locked-in math (reveal)' : 'Locked-in math'}
-              chainSum={lastRevealMathSnapshot.batter.chainSum}
-              pitcherDelta={lastRevealMathSnapshot.batter.pitcherDelta}
-              carryoverDelta={lastRevealMathSnapshot.batter.carryoverDelta}
-              guessDelta={lastRevealMathSnapshot.batter.guessDelta}
-              total={lastRevealMathSnapshot.batter.total}
-              ignoresDebuffs={lastRevealMathSnapshot.batter.ignoresDebuffs}
-              chainOf={lastRevealMathSnapshot.batter.chainOf}
-              handSize={lastRevealMathSnapshot.batter.handSize}
-            />
-          )}
-
-          {showFrozenMatchupMath && lastRevealMathSnapshot && !userIsBatting && (
-            <MatchupMath
-              caption={
-                isRevealing ? 'Your pitching total (locked in)' : 'Your pitching total — how it was built'
-              }
-              chainSum={lastRevealMathSnapshot.pitcher.chainSum}
-              pitcherDelta={lastRevealMathSnapshot.pitcher.batterDelta}
-              carryoverDelta={lastRevealMathSnapshot.pitcher.carryoverDelta}
-              guessDelta={0}
-              total={lastRevealMathSnapshot.pitcher.total}
-              ignoresDebuffs={false}
-              chainOf={lastRevealMathSnapshot.pitcher.chainOf}
-              handSize={lastRevealMathSnapshot.pitcher.handSize}
-              crossSideLabel="Batter"
-              crossSideTitle="Aggregate pressure from the batter's side on your pitching total. Individual batter cards stay hidden; this row is the credited modifier total only."
-            />
-          )}
 
           {/* Anonymous status chips for any pitcher debuff currently affecting
               the batter. Surfaces hidden hand-transforms (shape mirror, value
@@ -2764,144 +2664,6 @@ function BrawlLockInButton({
  * at-bat -- the AnimatePresence enter/exit takes care of the pop + fade.
  * Auto-hides after the timeout so it never blocks the Next At-Bat button.
  */
-/**
- * Brawl bonus toast — a tight strip of badges that floats beside each
- * HP pill after lock-in, surfacing the snap-speed / chain / hot-streak
- * HP rewards that `lockIn` actually applied. Reads `lastBrawlBonusBreakdown`
- * from the store (kept alive across the next at-bat by design so the player
- * sees their reward for the previous snap until the next deal settles).
- *
- * Hidden during `selecting` (the bonuses for the upcoming at-bat haven't
- * been resolved yet) and during non-brawl modes. Self-mutes when the
- * breakdown is null OR every component is zero so we don't render an
- * empty pill on at-bats where nothing notable happened.
- */
-const BrawlBonusToast = ({
-  side,
-}: {
-  /** Which seat this toast attaches to — drives both color polarity
-   *  and which sub-fields of the breakdown to read. */
-  side: 'batter' | 'pitcher';
-}) => {
-  const breakdown = useGameStore((s) => s.lastBrawlBonusBreakdown);
-  const phase = useGameStore((s) => s.phase);
-  const gameMode = useGameStore((s) => s.gameMode);
-  const atBatId = useGameStore((s) => s.atBatId);
-  const userSide = useGameStore(getUiUserSide);
-  const userSeat: 'batter' | 'pitcher' =
-    userSide === 'Batting' ? 'batter' : 'pitcher';
-  // Toast lifetime: pop in at reveal-start, hold through the resolve
-  // pause, fade after BONUS_TOAST_LIFETIME_MS. Keyed on atBatId so a
-  // fresh at-bat re-triggers the entry animation cleanly even though
-  // lastBrawlBonusBreakdown persists across the deal.
-  const [visible, setVisible] = useState(true);
-  const inWindow =
-    gameMode === 'brawl' &&
-    !!breakdown &&
-    (phase === 'revealing' ||
-      phase === 'between-at-bats' ||
-      phase === 'game-over');
-  useEffect(() => {
-    if (!inWindow) {
-      setVisible(false);
-      return;
-    }
-    setVisible(true);
-    const BONUS_TOAST_LIFETIME_MS = 2800;
-    const t = window.setTimeout(() => setVisible(false), BONUS_TOAST_LIFETIME_MS);
-    return () => window.clearTimeout(t);
-  }, [atBatId, inWindow]);
-
-  const snap =
-    breakdown == null
-      ? 0
-      : side === 'batter'
-        ? breakdown.batterSnapBonus
-        : breakdown.pitcherSnapBonus;
-  const chain =
-    breakdown == null
-      ? 0
-      : side === 'batter'
-        ? breakdown.batterChainBonus
-        : breakdown.pitcherChainBonus;
-  const streak =
-    breakdown == null
-      ? 0
-      : side === 'batter'
-        ? breakdown.batterStreakBonus
-        : breakdown.pitcherStreakBonus;
-
-  useEffect(() => {
-    if (!visible || !inWindow || snap <= 0) return;
-    if (side !== userSeat) return;
-    playCardBoost();
-  }, [atBatId, visible, inWindow, snap, side, userSeat]);
-
-  if (gameMode !== 'brawl') return null;
-  if (!breakdown) return null;
-  if (!inWindow) return null;
-  if (snap === 0 && chain === 0 && streak === 0) return null;
-
-  const badges: Array<{ key: string; label: string; tone: string }> = [];
-  if (snap > 0) {
-    badges.push({
-      key: 'snap',
-      label: `SNAP +${snap}`,
-      tone: 'bg-sky-500/30 border-sky-300/70 text-sky-100',
-    });
-  }
-  if (chain > 0) {
-    badges.push({
-      key: 'chain',
-      label: `CHAIN +${chain}`,
-      tone: 'bg-emerald-500/30 border-emerald-300/70 text-emerald-100',
-    });
-  }
-  if (streak > 0) {
-    badges.push({
-      key: 'streak',
-      label: `HOT STREAK +${streak}`,
-      tone: 'bg-amber-500/30 border-amber-300/70 text-amber-100',
-    });
-  }
-  return (
-    <AnimatePresence>
-      {visible && (
-        <motion.div
-          key={`brawl-bonus-${side}-${atBatId}`}
-          initial={{ opacity: 0, y: -8, scale: 0.7 }}
-          animate={{ opacity: 1, y: 0, scale: 1 }}
-          exit={{ opacity: 0, y: -6, scale: 0.92, transition: { duration: 0.32 } }}
-          transition={{ type: 'spring', stiffness: 360, damping: 22 }}
-          className="flex flex-wrap items-center justify-center gap-1 pointer-events-none"
-        >
-          {badges.map((b, i) => (
-            <motion.span
-              key={b.key}
-              initial={{ opacity: 0, y: -4, scale: 0.6 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              transition={{
-                type: 'spring',
-                stiffness: 420,
-                damping: 18,
-                // Cascade so multiple bonuses read sequentially rather
-                // than as one indistinct blob — the player wants to
-                // register each reward (e.g. "Snap... then Chain...
-                // then Hot Streak").
-                delay: 0.05 + i * 0.12,
-              }}
-              className={`px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-[0.18em] leading-none border shadow-sm ${b.tone}`}
-              style={{ textShadow: '0 1px 3px rgba(0,0,0,0.6)' }}
-            >
-              {b.label}
-            </motion.span>
-          ))}
-        </motion.div>
-      )}
-    </AnimatePresence>
-  );
-};
-
 const HitResultBanner = ({
   outcome,
   phase,
@@ -3543,21 +3305,6 @@ interface ScorePillProps {
   /** Reveal-sequence banner shown beneath the pill while a beat plays. */
   banner?: ScoreBanner | null;
   /**
-   * Optional Hit-Scale ladder modifier (signed) the player would apply on
-   * top of the pill value if they win the play. Rendered as a small badge
-   * tucked beside the pill (only when non-zero) so the player sees the
-   * ladder bonus without it silently changing the pill's number on lock-in.
-   */
-  hitScaleHint?: number | null;
-  /**
-   * SZN Mode: roster tag synergy bonus included in `value`. Shown as a small
-   * "+N ROSTER" chip when non-zero so the pill gap vs chain MLB card(s) reads
-   * intentionally.
-   */
-  rosterSynergyHint?: number | null;
-  /** Tooltip / a11y title for `rosterSynergyHint` (active synergy labels). */
-  rosterSynergyTitle?: string;
-  /**
    * Current at-bat id. Used to scope the outcome chip's exit-animation key so
    * that when `Next At-Bat` is clicked the prior chip ("ELLY DE LA CRUZ: OUT
    * (17 vs 24)") force-unmounts crisply instead of bleeding 200-300ms of
@@ -3569,7 +3316,7 @@ interface ScorePillProps {
    * left-rail PlayerHero (md-and-up only). The pill's label+value span is
    * then hidden at the `md` breakpoint so the user isn't reading the same
    * number twice; the pill bg itself collapses too when there's nothing
-   * else to anchor (no outcome chip, no hit-scale hint). Below `md` -- where
+   * else to anchor (no outcome chip). Below `md` -- where
    * the hero rail is hidden -- the pill stays the canonical readout.
    */
   heroHasValue?: boolean;
@@ -3583,6 +3330,8 @@ interface ScorePillProps {
   brawlHpSide?: 'user' | 'opponent';
   /** When true the pill always renders as an HP bar (track + fill). */
   brawlHpFill?: boolean;
+  /** When true the score renders as a single green total (brawl HP preview). */
+  highlightValue?: boolean;
 }
 
 /**
@@ -3607,14 +3356,12 @@ const ScorePill = ({
   outcomeStyle,
   compact = false,
   banner = null,
-  hitScaleHint = null,
-  rosterSynergyHint = null,
-  rosterSynergyTitle,
   atBatId,
   heroHasValue = false,
   brawlHpMax = null,
   brawlHpSide = 'user',
   brawlHpFill = false,
+  highlightValue = false,
 }: ScorePillProps) => {
   const showBrawlFill = brawlHpFill && value != null && value >= 0;
   const safeMax = Math.max(1, brawlHpMax ?? value ?? 1);
@@ -3633,10 +3380,14 @@ const ScorePill = ({
       : '0 0 16px rgba(244,63,94,0.45)';
 
   const valueColor = showBrawlFill
-    ? 'text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.75)]'
-    : tone === 'batter'
-      ? 'text-blue-600'
-      : 'text-rose-600';
+    ? highlightValue
+      ? 'text-emerald-300 drop-shadow-[0_1px_2px_rgba(0,0,0,0.65)]'
+      : 'text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.75)]'
+    : highlightValue
+      ? 'text-emerald-500'
+      : tone === 'batter'
+        ? 'text-blue-600'
+        : 'text-rose-600';
   const labelColor = showBrawlFill
     ? 'text-white/85 drop-shadow-[0_1px_2px_rgba(0,0,0,0.65)]'
     : 'text-slate-500';
@@ -3654,11 +3405,8 @@ const ScorePill = ({
   // wrappers above -- otherwise either the pill collapses while no hero
   // shows (no readout at all) or both render and the value is duplicated.
   const hasOutcomeChip = !!outcome;
-  const hasRosterSynergyBadge = rosterSynergyHint !== null && rosterSynergyHint > 0;
-  const hasHintBadge =
-    (hitScaleHint !== null && hitScaleHint !== 0) || hasRosterSynergyBadge;
   const valueGroupClass = heroHasValue ? 'md:hidden' : '';
-  const pillBgHiddenAtMd = heroHasValue && !hasOutcomeChip && !hasHintBadge;
+  const pillBgHiddenAtMd = heroHasValue && !hasOutcomeChip;
 
   return (
     // `z-30` lifts the pill (and the BeatBanner anchored absolute below it)
@@ -3735,44 +3483,6 @@ const ScorePill = ({
           </motion.span>
         </span>
 
-        <AnimatePresence>
-          {hitScaleHint !== null && hitScaleHint !== 0 && (
-            <motion.span
-              key={`hsh-${hitScaleHint}`}
-              initial={{ opacity: 0, scale: 0.7 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.7 }}
-              transition={{ type: 'spring', stiffness: 340, damping: 22 }}
-              className={`font-black uppercase tracking-widest rounded-full ring-1 ${
-                hitScaleHint > 0
-                  ? 'bg-amber-400/95 text-slate-900 ring-amber-200/60'
-                  : 'bg-rose-500/95 text-white ring-rose-200/60'
-              } ${compact ? 'text-[9px] px-2 py-0.5' : 'text-[11px] px-2.5 py-0.5'}`}
-              title="Hit Scale ladder bonus -- applies to your hit if you win"
-            >
-              {hitScaleHint > 0 ? `+${hitScaleHint}` : `${hitScaleHint}`} HIT
-            </motion.span>
-          )}
-        </AnimatePresence>
-
-        <AnimatePresence>
-          {hasRosterSynergyBadge && (
-            <motion.span
-              key={`rsy-${rosterSynergyHint}`}
-              initial={{ opacity: 0, scale: 0.7 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.7 }}
-              transition={{ type: 'spring', stiffness: 340, damping: 22 }}
-              className={`font-black uppercase tracking-widest rounded-full ring-1 bg-emerald-600/95 text-white ring-emerald-300/50 ${
-                compact ? 'text-[9px] px-2 py-0.5' : 'text-[11px] px-2.5 py-0.5'
-              }`}
-              title={rosterSynergyTitle}
-            >
-              +{rosterSynergyHint} roster
-            </motion.span>
-          )}
-        </AnimatePresence>
-
         {/* AnimatePresence keyed by atBatId in addition to the outcome string
             so that `Next At-Bat` (which flips phase out of `between-at-bats`,
             making `outcome` undefined) drops the chip immediately rather than
@@ -3830,157 +3540,6 @@ const BeatBanner = ({ banner }: { banner: ScoreBanner }) => {
         {sign}
         {banner.delta}
       </span>
-    </motion.div>
-  );
-};
-
-interface MatchupMathProps {
-  /** Sum of card values in the player's current best chain. */
-  chainSum: number;
-  /** Aggregate pitcher pressure (typically negative). */
-  pitcherDelta: number;
-  /** Cross-at-bat carryover debuff (typically negative). */
-  carryoverDelta: number;
-  /** b-65 Guess Pitch bonus at lock-in (0/1/4). */
-  guessDelta: number;
-  /** chainSum + pitcherDelta + carryoverDelta + guessDelta -- mirrors the pill. */
-  total: number;
-  /** True when b-9 Generational Discipline is in play (debuffs zeroed). */
-  ignoresDebuffs: boolean;
-  /** How many cards form the best chain. */
-  chainOf: number;
-  /** Total cards in hand (for the X of Y caption). */
-  handSize: number;
-  /**
-   * Label for the aggregate cross-side pressure row. Defaults to
-   * "Pitcher" (batter selection); use "Batter" when showing the pitcher's
-   * locked-in breakdown from defense.
-   */
-  crossSideLabel?: string;
-  /** Tooltip for the cross-side pressure row. */
-  crossSideTitle?: string;
-  /** Optional caption above the chips (e.g. reveal / result context). */
-  caption?: string;
-}
-
-/**
- * Math breakdown rendered directly under the BATTER score pill during card
- * selection. Decomposes the pill into its components so the player can see
- * WHY the visible card sum doesn't always match the pill total -- previously
- * cross-side effects (p-38 / p-50 / p-52 / p-60 / p-72 / p-90 aggregate
- * debuffs, cross-at-bat carryover, b-65 guess bonus) silently moved the pill
- * without ever touching the per-card numbers, which playtesters read as the
- * pill being broken.
- *
- * Hides itself entirely when no cross-side delta applies (i.e. the chain sum
- * IS the pill) so vanilla matchups stay uncluttered. Always shows when ANY
- * delta is non-zero, even if it's just guess +1.
- */
-const MatchupMath = ({
-  chainSum,
-  pitcherDelta,
-  carryoverDelta,
-  guessDelta,
-  total,
-  ignoresDebuffs,
-  chainOf,
-  handSize,
-  crossSideLabel = 'Pitcher',
-  crossSideTitle = "Aggregate pressure from the pitcher's ability cards (e.g. Wipeout Changeup, Devastating Slider, Filthy Stuff).",
-  caption,
-}: MatchupMathProps) => {
-  const hasDelta = pitcherDelta !== 0 || carryoverDelta !== 0 || guessDelta !== 0;
-  if (!hasDelta && !ignoresDebuffs) return null;
-  const components: Array<{ label: string; value: number; tone: 'neutral' | 'pos' | 'neg'; title?: string }> = [
-    {
-      label: handSize > chainOf ? `Chain ${chainOf}/${handSize}` : 'Chain',
-      value: chainSum,
-      tone: 'neutral',
-      title: handSize > chainOf
-        ? `${chainOf} of ${handSize} cards form your best combined chain. Drag cards together to build a longer chain.`
-        : 'All cards combine into a single chain that feeds the pill.',
-    },
-  ];
-  if (pitcherDelta !== 0) {
-    components.push({
-      label: crossSideLabel,
-      value: pitcherDelta,
-      tone: pitcherDelta < 0 ? 'neg' : 'pos',
-      title: crossSideTitle,
-    });
-  }
-  if (carryoverDelta !== 0) {
-    components.push({
-      label: 'Carryover',
-      value: carryoverDelta,
-      tone: carryoverDelta < 0 ? 'neg' : 'pos',
-      title: 'Debuffs queued by a previous at-bat that bleed into this one (e.g. Strikeout Artist hangover).',
-    });
-  }
-  if (guessDelta !== 0) {
-    components.push({
-      label: 'Guess',
-      value: guessDelta,
-      tone: 'pos',
-      title:
-        guessDelta >= 4
-          ? 'Guess Pitch: pitcher used the shape you named (+4).'
-          : 'Guess Pitch: pitcher did not use the shape you named (+1 consolation).',
-    });
-  }
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: -4 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.22, ease: 'easeOut' }}
-      className="flex flex-col items-center gap-0.5 max-w-[420px]"
-    >
-      {caption ? (
-        <p className="text-[9px] font-bold uppercase tracking-widest text-slate-500 text-center px-1 leading-tight">
-          {caption}
-        </p>
-      ) : null}
-      <div className="flex flex-row items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-900/85 backdrop-blur border border-white/10 shadow-lg flex-wrap justify-center w-full">
-      {components.map((c, idx) => {
-        const sign = c.value > 0 ? '+' : c.value < 0 ? '−' : '';
-        const magnitude = Math.abs(c.value);
-        const valueColor =
-          c.tone === 'pos' ? 'text-emerald-300' : c.tone === 'neg' ? 'text-rose-300' : 'text-slate-100';
-        return (
-          <div key={c.label} className="flex items-center gap-1.5">
-            {idx > 0 && (
-              <span className="text-slate-600 text-[10px] font-bold select-none">·</span>
-            )}
-            <span
-              className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-widest"
-              title={c.title}
-            >
-              <span className="text-slate-400">{c.label}</span>
-              <span className={`${valueColor} font-mono tabular-nums`}>
-                {sign}
-                {magnitude}
-              </span>
-            </span>
-          </div>
-        );
-      })}
-      {hasDelta && (
-        <>
-          <span className="text-slate-600 text-[10px] font-bold select-none">=</span>
-          <span className="text-[11px] font-extrabold uppercase tracking-widest text-amber-300 font-mono tabular-nums">
-            {total}
-          </span>
-        </>
-      )}
-      {ignoresDebuffs && (
-        <span
-          className="ml-1 px-1.5 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-400/40 text-[9px] font-bold uppercase tracking-widest text-emerald-300"
-          title="Generational Discipline: pitcher debuffs are zeroed for this at-bat."
-        >
-          Discipline
-        </span>
-      )}
-      </div>
     </motion.div>
   );
 };
@@ -5394,6 +4953,24 @@ const PitcherCard = ({
   );
 };
 
+/**
+ * During selection only the best chain feeds the pill. Strip modifiers are
+ * filtered so cards in losing chains fall back to printed face values instead
+ * of showing scored numbers that do not count toward the matchup total.
+ */
+function modifiersForBestChain(
+  modifiers: Record<string, { value: number; color?: string }>,
+  bestGroup: readonly CardDefinition[],
+): Record<string, { value: number; color?: string }> {
+  if (bestGroup.length === 0) return {};
+  const ids = new Set(bestGroup.map((c) => c.id));
+  const filtered: Record<string, { value: number; color?: string }> = {};
+  for (const id of ids) {
+    if (modifiers[id] !== undefined) filtered[id] = modifiers[id];
+  }
+  return filtered;
+}
+
 interface HandStripProps {
   hand: CardDefinition[];
   onReorder: (cards: CardDefinition[]) => void;
@@ -5531,7 +5108,14 @@ const HandStrip = ({
     // affirmedSeams against the fresh hand order. Re-affirms the dropped
     // card's new left/right seams (if mechanically connectable) and prunes
     // any seams the reorder broke.
-    if (id && onAffirmConnections) onAffirmConnections(id);
+    //
+    // Defer one frame so Framer's final `onReorder` lands in the store
+    // before we derive seams -- otherwise drag-end can affirm against the
+    // pre-drop layout and the pill/card totals stay stale even though the
+    // cards visually snapped together.
+    if (id && onAffirmConnections) {
+      requestAnimationFrame(() => onAffirmConnections(id));
+    }
   }, [onAffirmConnections]);
 
   // Treat the controller "grabbed" card as a synthetic drag for hint /
@@ -6449,7 +6033,9 @@ function applyBeatStart(beat: ResolutionBeat, ctx: ApplyBeatStartCtx) {
       // already pinned that card (e.g. b-2 + b-2 stack visually).
       targetOverride((prev) => {
         const card = ctx.cardLookup.get(beat.targetCardId);
-        const baseline = prev[beat.targetCardId] ?? card?.baseValue ?? 0;
+        const baseline =
+          prev[beat.targetCardId] ??
+          (card ? displayValueFor(card) : 0);
         return { ...prev, [beat.targetCardId]: baseline + beat.delta };
       });
       break;

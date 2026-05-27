@@ -527,31 +527,9 @@ export const CARD_EFFECTS: Record<string, EffectFn> = {
   // Brawl: the "next batter starts at -2" carryover is meaningless inside
   // a 3-inning arena (the matchup is HP only). The tagline "+3 if win by
   // 6+" is implemented as a flat selfValueDelta only when the pitcher's
-  // current locked total leads the batter's by 6+ via the opponent hand
-  // (preview during selection); when no preview is available we no-op.
-  "p-58": (ctx) => {
-    if (ctx.gameMode !== "brawl") return NOOP;
-    if (!ctx.opponentHand) return NOOP;
-    // Best-effort: re-score the opponent (batter) hand under their own
-    // seam set and compare to our current group total. Recursion safe:
-    // p-58 doesn't appear in batter hands.
-    const oppCtx: ScoringContext = {
-      ...ctx,
-      side: "Batting",
-      opponentHand: ctx.hand,
-      opponentBaseCard: highestValueCard(ctx.hand) ?? null,
-      affirmedSeams: ctx.opponentAffirmedSeams ?? null,
-      opponentAffirmedSeams: ctx.affirmedSeams ?? null,
-      nullifiedCardIds: undefined,
-      nullifyOpponentBaseMechanic: undefined,
-      nullifyOpponentTagMechanics: undefined,
-    };
-    const oppResult = scoreHand(ctx.opponentHand, oppCtx);
-    const myGroupTotal = ctx.group.reduce((sum, c) => sum + c.baseValue, 0);
-    return myGroupTotal - oppResult.maxValue >= 6
-      ? r({ selfValueDelta: 3 })
-      : NOOP;
-  },
+  // p-58 Brawl Dominance: +3 when locked chain leads batter by 6+ HP.
+  // Scored in `scoreGroup` after the full chain total is known (see post-pass).
+  "p-58": () => NOOP,
 
   // p-59 Nasty Slider: information-only. Queues an opponentLayout reveal
   // request shown by InfoRevealOverlay.
