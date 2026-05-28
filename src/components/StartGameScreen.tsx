@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { useGameStore } from '../lib/gameStore';
 import { playButtonSelect } from '../lib/gameAudio';
@@ -5,21 +6,31 @@ import { useSznGamepad } from '../lib/useSznGamepad';
 
 const START_BG = '/images/start.png';
 
+type StartLane = 'brawl' | 'szn';
+
 /**
- * Brawl-only entry screen. Full-bleed start art with a single animated
- * PLAY control that opens the Brawl scoring primer, then the field.
+ * Entry screen: Brawl opens the rules primer, SZN opens the team picker.
  */
 export function StartGameScreen() {
   const showStartScreen = useGameStore((s) => s.showStartScreen);
   const phase = useGameStore((s) => s.phase);
   const setShowStartScreen = useGameStore((s) => s.setShowStartScreen);
   const setShowBrawlRules = useGameStore((s) => s.setShowBrawlRules);
+  const setShowSznTeamSelect = useGameStore((s) => s.setShowSznTeamSelect);
+
+  const [focus, setFocus] = useState<StartLane>('brawl');
 
   const visible = showStartScreen && phase !== 'drafting';
 
-  const play = () => {
+  const startBrawl = () => {
     playButtonSelect();
     setShowBrawlRules(true);
+    setShowStartScreen(false);
+  };
+
+  const startSzn = () => {
+    playButtonSelect();
+    setShowSznTeamSelect(true);
     setShowStartScreen(false);
   };
 
@@ -28,7 +39,12 @@ export function StartGameScreen() {
     priority: 10,
     enabled: visible,
     handler: (btn) => {
-      if (btn === 'CROSS') play();
+      if (btn === 'DPAD_LEFT' || btn === 'DPAD_UP') setFocus('brawl');
+      else if (btn === 'DPAD_RIGHT' || btn === 'DPAD_DOWN') setFocus('szn');
+      else if (btn === 'CROSS') {
+        if (focus === 'brawl') startBrawl();
+        else startSzn();
+      }
     },
   });
 
@@ -43,7 +59,7 @@ export function StartGameScreen() {
           className="fixed inset-0 z-30 overflow-hidden pointer-events-auto dugout-font-base"
           aria-modal="true"
           role="dialog"
-          aria-label="Play Dugout Brawl"
+          aria-label="Choose a game mode"
         >
           <img
             src={START_BG}
@@ -57,33 +73,80 @@ export function StartGameScreen() {
           />
 
           <div className="relative z-10 flex h-full w-full flex-col items-center justify-end pb-10 sm:pb-14 px-6">
-            <motion.button
-              type="button"
-              onClick={play}
+            <motion.div
               initial={{ opacity: 0, y: 16 }}
               animate={{
                 opacity: 1,
                 y: 0,
                 transition: { delay: 0.2, duration: 0.5, ease: [0.22, 1, 0.36, 1] },
               }}
-              whileHover={{ scale: 1.03, y: -1 }}
-              whileTap={{ scale: 0.97 }}
-              className="group relative"
-              aria-label="Play Brawl Mode"
+              className="flex flex-col sm:flex-row items-center gap-3 sm:gap-4"
             >
-              <span
-                aria-hidden="true"
-                className="absolute inset-0 rounded-xl bg-amber-400/30 blur-lg scale-110"
+              <StartModeButton
+                label="Brawl"
+                tone="brawl"
+                focused={focus === 'brawl'}
+                onClick={startBrawl}
+                onFocus={() => setFocus('brawl')}
               />
-              <span className="dugout-play-btn-shine relative flex min-w-[9.5rem] items-center justify-center rounded-xl border-2 border-amber-200/90 bg-gradient-to-b from-amber-300 via-amber-500 to-amber-700 px-8 py-3 shadow-[0_8px_28px_rgba(0,0,0,0.5)] transition-shadow group-hover:shadow-[0_10px_32px_rgba(251,191,36,0.4)]">
-                <span className="relative z-[1] dugout-font-sport text-2xl sm:text-3xl font-black uppercase tracking-[0.22em] text-slate-950">
-                  PLAY
-                </span>
-              </span>
-            </motion.button>
+              <StartModeButton
+                label="SZN"
+                tone="szn"
+                focused={focus === 'szn'}
+                onClick={startSzn}
+                onFocus={() => setFocus('szn')}
+              />
+            </motion.div>
           </div>
         </motion.div>
       )}
     </AnimatePresence>
+  );
+}
+
+function StartModeButton({
+  label,
+  tone,
+  focused,
+  onClick,
+  onFocus,
+}: {
+  label: string;
+  tone: 'brawl' | 'szn';
+  focused: boolean;
+  onClick: () => void;
+  onFocus: () => void;
+}) {
+  const isBrawl = tone === 'brawl';
+  const glowClass = isBrawl ? 'bg-amber-400/30' : 'bg-emerald-400/30';
+  const shellClass = isBrawl
+    ? 'border-amber-200/90 bg-gradient-to-b from-amber-300 via-amber-500 to-amber-700 group-hover:shadow-[0_10px_32px_rgba(251,191,36,0.4)]'
+    : 'border-emerald-200/90 bg-gradient-to-b from-emerald-300 via-emerald-500 to-emerald-700 group-hover:shadow-[0_10px_32px_rgba(52,211,153,0.4)]';
+  const focusRing = focused
+    ? isBrawl
+      ? 'ring-4 ring-amber-200/90 ring-offset-2 ring-offset-black/40'
+      : 'ring-4 ring-emerald-200/90 ring-offset-2 ring-offset-black/40'
+    : '';
+
+  return (
+    <motion.button
+      type="button"
+      onClick={onClick}
+      onMouseEnter={onFocus}
+      onFocus={onFocus}
+      whileHover={{ scale: 1.03, y: -1 }}
+      whileTap={{ scale: 0.97 }}
+      className={`group relative ${focusRing}`}
+      aria-label={isBrawl ? 'Play Brawl Mode' : 'Play SZN Mode'}
+    >
+      <span aria-hidden="true" className={`absolute inset-0 rounded-xl blur-lg scale-110 ${glowClass}`} />
+      <span
+        className={`dugout-play-btn-shine relative flex min-w-[9.5rem] items-center justify-center rounded-xl border-2 px-8 py-3 shadow-[0_8px_28px_rgba(0,0,0,0.5)] transition-shadow ${shellClass}`}
+      >
+        <span className="relative z-[1] dugout-font-sport text-2xl sm:text-3xl font-black uppercase tracking-[0.22em] text-slate-950">
+          {label}
+        </span>
+      </span>
+    </motion.button>
   );
 }

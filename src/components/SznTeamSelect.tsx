@@ -64,8 +64,15 @@ const SLOT_OFFSETS: SlotOffset[] = [-2, -1, 0, 1, 2];
 
 export function SznTeamSelect() {
   const open = useGameStore((s) => s.showSznTeamSelect);
+  const run = useGameStore((s) => s.run);
   const setOpen = useGameStore((s) => s.setShowSznTeamSelect);
+  const setShowStartScreen = useGameStore((s) => s.setShowStartScreen);
   const startSznRun = useGameStore((s) => s.startSznRun);
+
+  const close = useCallback(() => {
+    setOpen(false);
+    if (!run) setShowStartScreen(true);
+  }, [run, setOpen, setShowStartScreen]);
 
   // Stable flat order: division-grouped (AL East -> NL West) so the
   // carousel sequence mirrors the standings sidebar most baseball fans
@@ -118,14 +125,14 @@ export function SznTeamSelect() {
       } else if (e.key === "Enter") {
         e.preventDefault();
         commit();
-      } else if (e.key === "Escape") {
+      } else if (e.key === 'Escape') {
         e.preventDefault();
-        setOpen(false);
+        close();
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, goPrev, goNext, commit, setOpen]);
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, goPrev, goNext, commit, close]);
 
   useSznGamepad({
     id: "szn-team-select",
@@ -136,7 +143,7 @@ export function SznTeamSelect() {
     handler: (btn) => {
       if (!open) return;
       if (btn === "CIRCLE") {
-        setOpen(false);
+        close();
         return;
       }
       if (btn === "DPAD_LEFT" || btn === "L1") {
@@ -187,7 +194,7 @@ export function SznTeamSelect() {
           <header className="relative z-20 flex items-center justify-between px-6 py-4 border-b border-white/10 bg-slate-950/40 backdrop-blur-sm">
             <button
               type="button"
-              onClick={() => setOpen(false)}
+              onClick={close}
               className="flex items-center gap-2 text-slate-300 hover:text-white transition-colors text-sm font-bold uppercase tracking-widest"
             >
               <ArrowLeft className="w-4 h-4" />
