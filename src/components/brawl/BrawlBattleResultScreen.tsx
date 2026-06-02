@@ -1,0 +1,341 @@
+/**
+ * Post-combat win/lose screen with optional battle breakdown.
+ */
+import { useEffect, useState } from "react";
+import { AnimatePresence, motion } from "motion/react";
+import type { BrawlCombatReport } from "../../lib/brawlCombatLog";
+import {
+  aggregateCardBreakdown,
+  formatCardBreakdownSummary,
+  type BrawlCardBreakdown,
+  type BrawlEnvironmentalBreakdown,
+} from "../../lib/brawlCombatLog";
+import { ELEMENT_LABEL } from "../../lib/brawlElements";
+import type { Element } from "../../lib/brawlElements";
+
+export interface BrawlBattleResultScreenProps {
+  report: BrawlCombatReport;
+  phase: "between-at-bats" | "game-over";
+  onContinue: () => void;
+}
+
+type ResultView = "summary" | "breakdown";
+
+function headline(report: BrawlCombatReport): {
+  title: string;
+  tone: "win" | "lose" | "neutral";
+} {
+  const { endPlayerHp, endCpuHp } = report;
+  if (endPlayerHp <= 0 && endCpuHp <= 0) {
+    return { title: "Draw", tone: "neutral" };
+  }
+  if (report.userWon) {
+    return { title: "You Win", tone: "win" };
+  }
+  if (endPlayerHp <= 0) {
+    return { title: "You Lose", tone: "lose" };
+  }
+  return { title: "Combat Ended", tone: "neutral" };
+}
+
+const ELEMENT_CHIP: Record<Element, string> = {
+  fire: "bg-orange-500/20 text-orange-100 ring-orange-400/40",
+  poison: "bg-lime-500/20 text-lime-100 ring-lime-400/40",
+  freeze: "bg-sky-500/20 text-sky-100 ring-sky-400/40",
+  shield: "bg-slate-400/20 text-slate-100 ring-slate-300/40",
+  heal: "bg-emerald-500/20 text-emerald-100 ring-emerald-400/40",
+};
+
+function CardBreakdownRow({ row }: { row: BrawlCardBreakdown }) {
+  const elementChip =
+    row.element != null
+      ? ELEMENT_CHIP[row.element]
+      : "bg-white/10 text-white/80 ring-white/20";
+
+  return (
+    <li className="rounded-lg bg-black/25 px-3 py-2.5 ring-1 ring-white/10">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="truncate text-sm font-semibold text-white">
+              {row.cardName}
+            </span>
+            {row.element && (
+              <span
+                className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ring-1 ${elementChip}`}
+              >
+                {ELEMENT_LABEL[row.element]}
+              </span>
+            )}
+          </div>
+          <p className="mt-1 text-xs leading-relaxed text-white/70">
+            {formatCardBreakdownSummary(row)}
+          </p>
+        </div>
+        {row.totalHpDamage > 0 && (
+          <span className="shrink-0 text-sm font-bold tabular-nums text-rose-300">
+            −{row.totalHpDamage}
+          </span>
+        )}
+      </div>
+    </li>
+  );
+}
+
+function EnvironmentalRow({ row }: { row: BrawlEnvironmentalBreakdown }) {
+  const chipClass =
+    row.kind === "sandstorm"
+      ? "bg-orange-500/20 text-orange-100 ring-orange-400/30"
+      : "bg-amber-500/20 text-amber-100 ring-amber-400/30";
+
+  return (
+    <li className="rounded-lg bg-black/20 px-3 py-2.5 ring-1 ring-white/10">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <span
+            className={`inline-block rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ring-1 ${chipClass}`}
+          >
+            {row.label}
+          </span>
+          <p className="mt-1 text-xs leading-relaxed text-white/65">
+            {row.detail}
+          </p>
+        </div>
+        {row.totalDamage > 0 && (
+          <span className="shrink-0 text-sm font-bold tabular-nums text-rose-300">
+            −{row.totalDamage}
+          </span>
+        )}
+      </div>
+    </li>
+  );
+}
+
+function HpSummary({ report }: { report: BrawlCombatReport }) {
+  return (
+    <div className="flex justify-center gap-8 text-sm">
+      <div className="text-center">
+        <p className="text-[10px] font-semibold uppercase tracking-wide text-emerald-300/80">
+          You
+        </p>
+        <p className="mt-0.5 font-bold tabular-nums text-white">
+          {report.startPlayerHp}
+          <span className="mx-1 text-white/35">→</span>
+          <span
+            className={
+              report.endPlayerHp <= 0 ? "text-rose-400" : "text-emerald-200"
+            }
+          >
+            {report.endPlayerHp}
+          </span>
+        </p>
+      </div>
+      <div className="text-center">
+        <p className="text-[10px] font-semibold uppercase tracking-wide text-rose-300/80">
+          Opponent
+        </p>
+        <p className="mt-0.5 font-bold tabular-nums text-white">
+          {report.startCpuHp}
+          <span className="mx-1 text-white/35">→</span>
+          <span
+            className={
+              report.endCpuHp <= 0 ? "text-rose-400" : "text-rose-200/90"
+            }
+          >
+            {report.endCpuHp}
+          </span>
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function BreakdownPanel({ report }: { report: BrawlCombatReport }) {
+  const { cards, environmental } = aggregateCardBreakdown(
+    report.events,
+    report.sandstormTicks,
+  );
+  const yourCards = cards.filter((c) => c.actorSide === "user");
+  const theirCards = cards.filter((c) => c.actorSide === "opponent");
+  const isEmpty =
+    yourCards.length === 0 && theirCards.length === 0 && environmental.length === 0;
+
+  return (
+    <div
+      className="mx-4 mb-4 mt-3 max-h-[min(52vh,420px)] overflow-y-auto overscroll-contain rounded-xl bg-black/20 px-1 py-1 ring-1 ring-white/10 touch-pan-y"
+      style={{ WebkitOverflowScrolling: "touch" }}
+    >
+      {isEmpty ? (
+        <p className="px-3 py-6 text-center text-sm text-white/50">
+          No card activity recorded.
+        </p>
+      ) : (
+        <div className="space-y-4 px-2 py-2">
+          {yourCards.length > 0 && (
+            <section>
+              <h3 className="mb-2 px-1 text-[10px] font-bold uppercase tracking-widest text-emerald-300/70">
+                Your cards
+              </h3>
+              <ul className="space-y-2">
+                {yourCards.map((row) => (
+                  <CardBreakdownRow key={`user-${row.catalogId}`} row={row} />
+                ))}
+              </ul>
+            </section>
+          )}
+          {theirCards.length > 0 && (
+            <section>
+              <h3 className="mb-2 px-1 text-[10px] font-bold uppercase tracking-widest text-rose-300/70">
+                Opponent cards
+              </h3>
+              <ul className="space-y-2">
+                {theirCards.map((row) => (
+                  <CardBreakdownRow
+                    key={`opp-${row.catalogId}`}
+                    row={row}
+                  />
+                ))}
+              </ul>
+            </section>
+          )}
+          {environmental.length > 0 && (
+            <section>
+              <h3 className="mb-2 px-1 text-[10px] font-bold uppercase tracking-widest text-white/40">
+                Other effects
+              </h3>
+              <ul className="space-y-2">
+                {environmental.map((row) => (
+                  <EnvironmentalRow key={row.kind} row={row} />
+                ))}
+              </ul>
+            </section>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function BrawlBattleResultScreen({
+  report,
+  phase,
+  onContinue,
+}: BrawlBattleResultScreenProps) {
+  const [view, setView] = useState<ResultView>("summary");
+  const { title, tone } = headline(report);
+
+  useEffect(() => {
+    setView("summary");
+  }, [report]);
+
+  const titleClass =
+    tone === "win"
+      ? "text-emerald-300"
+      : tone === "lose"
+        ? "text-rose-300"
+        : "text-amber-200";
+
+  const continueLabel = phase === "game-over" ? "New Game" : "Next Round";
+  const continueClass =
+    phase === "game-over"
+      ? "bg-rose-500 text-rose-950 hover:bg-rose-400"
+      : "bg-emerald-500 text-emerald-950 hover:bg-emerald-400";
+
+  return (
+    <motion.div
+      className="fixed inset-0 z-[60] flex items-center justify-center p-4 sm:p-8 pointer-events-auto"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="brawl-battle-result-title"
+    >
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" />
+
+      <motion.div
+        className="relative w-full max-w-lg overflow-hidden rounded-2xl bg-gradient-to-b from-slate-900/95 to-slate-950/98 shadow-2xl ring-1 ring-white/15"
+        initial={{ scale: 0.94, y: 16 }}
+        animate={{ scale: 1, y: 0 }}
+        transition={{ type: "spring", stiffness: 380, damping: 32 }}
+      >
+        <AnimatePresence mode="wait" initial={false}>
+          {view === "summary" ? (
+            <motion.div
+              key="summary"
+              initial={{ opacity: 0, x: -12 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -12 }}
+              transition={{ duration: 0.18 }}
+            >
+              <header className="px-5 py-8 text-center sm:px-6 sm:py-10">
+                <h2
+                  id="brawl-battle-result-title"
+                  className={`text-4xl font-black tracking-tight sm:text-5xl ${titleClass}`}
+                >
+                  {title}
+                </h2>
+                <div className="mt-6">
+                  <HpSummary report={report} />
+                </div>
+              </header>
+
+              <footer className="flex flex-col gap-2 border-t border-white/10 px-4 py-4 sm:px-5">
+                <button
+                  type="button"
+                  onClick={() => setView("breakdown")}
+                  className="w-full rounded-xl bg-white/10 px-4 py-3 text-sm font-bold uppercase tracking-wide text-white transition hover:bg-white/15 active:scale-[0.98]"
+                >
+                  View Breakdown
+                </button>
+                <button
+                  type="button"
+                  onClick={onContinue}
+                  className={`w-full rounded-xl px-4 py-3 text-sm font-bold uppercase tracking-wide transition active:scale-[0.98] ${continueClass}`}
+                >
+                  {continueLabel}
+                </button>
+              </footer>
+            </motion.div>
+          ) : (
+            <motion.div
+              key="breakdown"
+              initial={{ opacity: 0, x: 12 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: 12 }}
+              transition={{ duration: 0.18 }}
+              className="flex flex-col"
+            >
+              <header className="flex items-center gap-3 border-b border-white/10 px-4 py-4 sm:px-5">
+                <button
+                  type="button"
+                  onClick={() => setView("summary")}
+                  className="shrink-0 rounded-lg bg-white/10 px-3 py-1.5 text-xs font-bold uppercase tracking-wide text-white/80 transition hover:bg-white/15"
+                  aria-label="Back to result"
+                >
+                  Back
+                </button>
+                <h2 className="min-w-0 flex-1 text-center text-sm font-bold uppercase tracking-wide text-white/70">
+                  Battle Breakdown
+                </h2>
+                <div className="w-[52px] shrink-0" aria-hidden />
+              </header>
+
+              <BreakdownPanel report={report} />
+
+              <footer className="border-t border-white/10 px-4 py-4 sm:px-5">
+                <button
+                  type="button"
+                  onClick={onContinue}
+                  className={`w-full rounded-xl px-4 py-3 text-sm font-bold uppercase tracking-wide transition active:scale-[0.98] ${continueClass}`}
+                >
+                  {continueLabel}
+                </button>
+              </footer>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </motion.div>
+    </motion.div>
+  );
+}

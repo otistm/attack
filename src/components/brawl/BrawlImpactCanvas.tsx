@@ -90,6 +90,9 @@ const PARTICLE_COUNT_MAX = 120;
 // ---------------------------------------------------------------------------
 
 export function BrawlImpactCanvas({ impacts, auras }: BrawlImpactCanvasProps) {
+  if (impacts.length === 0 && auras.length === 0) {
+    return null;
+  }
   // `pointer-events: none` so the VFX overlay never steals a click that
   // belonged to the hand strip / pills underneath it. The canvas just
   // paints transparent pixels on top of the existing DOM. The z value
@@ -98,30 +101,26 @@ export function BrawlImpactCanvas({ impacts, auras }: BrawlImpactCanvasProps) {
   // chronologically -- brawl reveal completes before the banner mounts
   // so they never actually compete for stacking).
   return (
-    <div className="absolute inset-0 pointer-events-none z-[51]" aria-hidden="true">
+    <div className="absolute inset-0 pointer-events-none z-[51] bg-transparent" aria-hidden="true">
       <Canvas
         // Transparent so the field + cards underneath show through.
         gl={{
           alpha: true,
           antialias: true,
-          // Premultiplied alpha + sRGB makes the additive sparks read as
-          // saturated white-hot cores instead of muddy mid-grays.
           premultipliedAlpha: true,
         }}
-        // Anchor the camera at the origin looking down -Z; the renderer
-        // resizes the frustum to match the canvas DOM rect inside the
-        // ScreenSpaceCamera helper so 1 world unit == 1 CSS pixel and we
-        // can feed screen-space coordinates straight through.
+        onCreated={({ gl }) => {
+          gl.setClearColor(0x000000, 0);
+        }}
         orthographic
         camera={{ position: [0, 0, 500], zoom: 1, near: 0.1, far: 2000 }}
-        // Frame loop "demand" would let us only render on dirty frames but
-        // these are short, dramatic bursts and we want the continuous
-        // sparkle aura on the pills -- always-on is the simpler call.
         frameloop="always"
-        // Don't compete with the gameplay overlay for the CSS stacking
-        // context. We're a sibling overlay; the dom-rect alignment math
-        // assumes the canvas fills the viewport.
-        style={{ width: "100%", height: "100%", pointerEvents: "none" }}
+        style={{
+          width: "100%",
+          height: "100%",
+          pointerEvents: "none",
+          background: "transparent",
+        }}
       >
         <ScreenSpaceCamera />
         {/* Ambient lift so the sparkles / shockwave rings don't read flat. */}

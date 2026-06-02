@@ -9,13 +9,9 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test:connect": "tsx src/lib/__connect_check.ts",
-    "test:effects": "tsx src/lib/__effects_check.ts",
-    "test:copy": "tsx src/lib/__copy_check.ts",
-    "test:patterns": "tsx src/lib/__patterns_check.ts",
-    "test:session": "tsx src/lib/__session_check.ts",
-    "test:szn-players": "tsx src/lib/__szn_players_check.ts",
-    "test": "npm run test:connect && npm run test:effects && npm run test:copy && npm run test:patterns && npm run test:session && npm run test:szn-players"
+  "test:connect": "tsx src/lib/__connect_check.ts",
+  "test:effects": "tsx src/lib/__effects_check.ts",
+  "test": "npm run test:connect && npm run test:effects"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

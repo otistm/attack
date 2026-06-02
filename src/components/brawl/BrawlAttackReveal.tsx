@@ -1,41 +1,10 @@
 /**
- * BrawlAttackReveal — Brawl Mode's bespoke reveal sequence.
+ * BrawlAttackReveal — continuous element brawl combat after lock-in.
  *
- * Visual concept: the moment the 15-second snap timer auto-locks, the
- * cards on both sides leap off the hand strip and *fly at the opposing
- * HP pill*, each card dealing damage equal to its power level. Impacts
- * spawn dramatic VFX (sparks, shockwave rings, screen shake) and tick
- * the defender's pill HP downward in real time. Whichever side hits 0
- * HP loses; the winner's leftover HP lands on the existing
- * HitResultBanner via `lastBrawlResolution`.
- *
- * Architecture:
- *   - `useBrawlAttackReveal` owns the *timeline* + *HP state* + *impact
- *     queue*. It schedules the attack waves, ticks the displayed pill
- *     HPs down, queues impact events for the R3F overlay to render,
- *     and signals the parent when the sequence is done.
- *   - `BrawlAttackOverlay` is the JSX side: it mounts the
- *     `BrawlImpactCanvas` (R3F VFX) and renders flying-card DOM ghosts
- *     that arc from each card's hand position to the opposing pill via
- *     Framer Motion. The ghosts read source / target rects off
- *     `data-brawl-card-id` / `data-brawl-pill` anchors the parent sets
- *     on the live hand strip + pills.
- *
- * Why a hybrid DOM + R3F approach: the cards are already richly styled
- * DOM (existing card visuals, fonts, edges, shapes) so animating them
- * via Framer Motion gives the player a 1:1 "their card" experience. The
- * impacts themselves need crisp additive particle blending and
- * shockwave rings -- R3F is the cleanest way to ship that punch.
- *
- * Lifecycle:
- *   - `enabled` flips true when `phase === 'revealing' && gameMode ===
- *     'brawl'`. The hook captures a snapshot of the at-bat state at the
- *     instant it activates and runs its own timeline from there.
- *   - Calls `onComplete` once the final impact lands AND a short
- *     denouement pause expires. The parent wires `onComplete` to
- *     `completeReveal()` so the engine advances to `between-at-bats`.
- *   - Re-running the parent (new at-bat) tears down + rebuilds the
- *     timeline cleanly via the `runId` dep.
+ * Both sides fire on independent cooldown timers (5s base, −1s per extra
+ * card in the longest affirmed chain), cycling their bond list until one
+ * HP pill hits 0. HP and shield update instantly on each bond resolve;
+ * projectiles are cosmetic streaks (shield/heal bonds skip the projectile).
  */
 
 import {
@@ -43,8 +12,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type Dispatch,
-  type SetStateAction,
 } from "react";
 import { motion, AnimatePresence, useAnimationControls } from "motion/react";
 import {
@@ -52,6 +19,33 @@ import {
   type BrawlImpact,
   type BrawlAura,
 } from "./BrawlImpactCanvas";
+import type { Element } from "../../lib/brawlElements";
+import { applyElementCombatHit } from "../../lib/elementAbilities";
+import {
+  ELEMENT_LABEL,
+  brawlEffectiveAttackCooldownMs,
+  consumeAttackerFreeze,
+  isSelfBuffBond,
+  tickCombatDotStacks,
+  BRAWL_DOT_TICK_MS,
+  freshElementCombatState,
+  type ElementBond,
+  type ElementCombatState,
+} from "../../lib/brawlElements";
+import {
+  applySandstormTick,
+  BRAWL_SANDSTORM_TICK_MS,
+  BRAWL_SANDSTORM_WARNING_MS,
+  shouldActivateSandstorm,
+} from "../../lib/brawlSandstorm";
+import {
+  buildCombatReport,
+  logCardCombatEvent,
+  logDotTickEvents,
+  logSandstormEvent,
+  type BrawlCombatEvent,
+  type BrawlCombatReport,
+} from "../../lib/brawlCombatLog";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -59,21 +53,37 @@ import {
 
 /** A single card committed to attack in this brawl reveal. */
 export interface BrawlAttackCard {
-  /** Card id; matched against `data-brawl-card-id` to find the source rect. */
+  /** Left card id; matched against `data-brawl-card-id` for the projectile origin. */
   id: string;
-  /** Display power. Damage dealt on impact AND used to size the burst. */
+  /** Right card in the bond when an element connection applies. */
+  rightCardId?: string;
+  /** Display power. Shown on impact. */
   power: number;
-  /** Display name (short) so the flying sigil can label the projectile. */
+  /** Display name (short) for impact floaters. */
   label?: string;
+  /** Element brawl: bond element (fire/poison/freeze/shield/heal). */
+  element?: Element;
+  /** Right-hand bond partner — skips its own attack when the chain fires. */
+  skipAttack?: boolean;
 }
 
 export interface BrawlRevealInput {
   /** True when phase === 'revealing' && gameMode === 'brawl'. */
   enabled: boolean;
-  /** Cards on the batter side, in order, that will attack the pitcher pill. */
-  batterAttackers: BrawlAttackCard[];
-  /** Cards on the pitcher side, in order, that will attack the batter pill. */
-  pitcherAttackers: BrawlAttackCard[];
+  /** Element brawl: bond-based attacks instead of chain HP scaling. */
+  elementMode?: boolean;
+  /** Element brawl: persist combat + battle log when the reveal finishes. */
+  onCombatResolved?: (combat: ElementCombatState, report: BrawlCombatReport) => void;
+  /** Element brawl: combat snapshot at lock-in for incremental resolution. */
+  elementCombatStart?: ElementCombatState;
+  /** Ms between attack waves for the user's side (chain-reduced). */
+  userAttackCooldownMs?: number;
+  /** Ms between attack waves for the opponent's side. */
+  opponentAttackCooldownMs?: number;
+  /** Connected attack groups on the batter side (each group shares cooldown). */
+  batterAttackGroups: BrawlAttackCard[][];
+  /** Connected attack groups on the pitcher side. */
+  pitcherAttackGroups: BrawlAttackCard[][];
   /** Starting HP for the batter pill (matchup total at lock-in). */
   batterHP: number;
   /** Starting HP for the pitcher pill. */
@@ -86,8 +96,11 @@ export interface BrawlRevealInput {
   userIsBatting: boolean;
   /** True if this is a 21+ HP grand-slam swing; pumps up the VFX intensity. */
   grandSlam: boolean;
-  /** Opponent hand size — used to delay attacks until flip reveal finishes. */
-  opponentHandLength: number;
+  /**
+   * Ms to wait after reveal starts for the CPU hand deal-in (face-up entry)
+   * before Player 1's attack phase begins.
+   */
+  opponentRevealDelayMs: number;
   /** Reveal complete callback. Parent wires this to `completeReveal()`. */
   onComplete: () => void;
   /** Fired on every impact so the parent can ping the screen-shake. */
@@ -114,20 +127,32 @@ export interface BrawlRevealInput {
 export type BrawlAttackPhase =
   | "idle"
   | "intro"
-  | "user"
-  | "mid"
-  | "opponent"
+  | "combat"
   | "done";
 
 export interface BrawlRevealOutput {
-  /** Live HP shown in the batter pill (decreases as the pitcher attacks). */
+  /** Live HP shown in the batter pill. */
   displayedBatterHP: number;
-  /** Live HP shown in the pitcher pill (decreases as the batter attacks). */
+  /** Live HP shown in the pitcher pill. */
   displayedPitcherHP: number;
+  /** Shield absorb on the batter seat pill. */
+  displayedBatterShield: number;
+  /** Shield absorb on the pitcher seat pill. */
+  displayedPitcherShield: number;
+  /** Burn stack on batter / pitcher pills. */
+  displayedBatterBurn: number;
+  displayedPitcherBurn: number;
+  displayedBatterPoison: number;
+  displayedPitcherPoison: number;
+  /** Incremented when heal lands on each seat — drives pill burst VFX. */
+  displayedBatterHealPulse: number;
+  displayedPitcherHealPulse: number;
   /** Active impacts the VFX canvas should render. */
   impacts: BrawlImpact[];
-  /** Cards currently in flight (DOM ghosts). */
-  flying: FlyingCard[];
+  /** Active projectiles in flight (DOM streaks). */
+  projectiles: BrawlProjectile[];
+  /** @deprecated Use `projectiles`. Kept for callers that haven't migrated. */
+  flying: BrawlProjectile[];
   /** Floating "-N" numbers spawned at impact. */
   hitNumbers: HitNumber[];
   /** True iff at least one card is mid-arc. Useful for masking other UI. */
@@ -138,10 +163,27 @@ export interface BrawlRevealOutput {
    * overlay. Idle outside of brawl reveal.
    */
   attackPhase: BrawlAttackPhase;
+  /** Per-card cooldown fill — keyed by card id after each bond fires. */
+  cardCooldowns: Record<string, CardCooldownPulse>;
+  /** True once sandstorm damage ticks are running. */
+  sandstormActive: boolean;
+  /** Current sandstorm tick index (ramps damage). */
+  sandstormTickIndex: number;
 }
 
-interface FlyingCard {
-  /** Unique key for the ghost element. */
+/** Drives the bottom-up cooldown fill on a card after it fires. */
+export interface CardCooldownPulse {
+  /** Bump to restart the CSS fill animation. */
+  pulseKey: number;
+  /** Ms until this card fires again (side cooldown × bond count). */
+  durationMs: number;
+  side: "user" | "opponent";
+  /** True while this side's attack cooldown is slowed by freeze. */
+  frozen?: boolean;
+}
+
+interface BrawlProjectile {
+  /** Unique key for the projectile element. */
   key: string;
   /** Source rect (screen-space px, top-left origin). */
   sx: number;
@@ -149,19 +191,21 @@ interface FlyingCard {
   /** Target rect (screen-space px). */
   tx: number;
   ty: number;
-  /** The original card id (for visual fingerprint -- color tint, label). */
+  /** The source card id (for DOM lookup). */
   cardId: string;
-  /** Damage this card deals. Shown as a glowing sigil on the ghost. */
+  /** Bond power shown on impact. */
   power: number;
-  /** Which side launched this attack. Colors the trail / sigil. */
+  /** Which side launched this attack. Colors the trail. */
   attacker: "user" | "opponent";
   /** Defender side -- used by the VFX impact event for tinting. */
   defender: "user" | "opponent";
-  /** Born timestamp. Drives the framer-motion exit window. */
+  /** Born timestamp. */
   bornAt: number;
-  /** Display name (or short id) for the source card. */
+  /** Element label for impact floaters. */
   label: string;
-  /** Per-card flight duration (ms); opponent dives run longer. */
+  /** Element tint for the projectile streak. */
+  element?: Element;
+  /** Flight duration (ms). */
   flightMs: number;
 }
 
@@ -173,6 +217,9 @@ interface HitNumber {
   defender: "user" | "opponent";
   bornAt: number;
   grand?: boolean;
+  label?: string;
+  /** Sandstorm ticks use a shared warm tint on both pills. */
+  variant?: "sandstorm";
 }
 
 export interface BrawlShakePulse {
@@ -185,154 +232,236 @@ export interface BrawlShakePulse {
 // Tunables
 // ---------------------------------------------------------------------------
 
-/** Pause after lock-in before the first card flies (lets the user breathe). */
+/** Pause after lock-in before the first projectile fires. */
 const ARM_DELAY_MS = 320;
-/**
- * Hold time after the pills "snap to full HP" so the player can read both
- * locked-in totals before user's first card launches. The phase banner
- * ("Your Attack") fades in during this window.
- */
+/** Hold time after pills snap to full HP before the first projectile. */
 const PHASE_INTRO_MS = 750;
-/** Gap between sequential cards in the SAME phase (one side's cards). */
-const ATTACK_GAP_MS = 320;
-/**
- * Pause between user phase ending and opponent phase starting. Long enough
- * for the player to register "their turn is done, mine is starting" via the
- * phase banner color swap, short enough that the reveal doesn't drag.
- */
-const MID_PHASE_PAUSE_MS = 650;
-/** Pause after the last impact before completeReveal fires. */
-const DENOUEMENT_MS = 1000;
-/**
- * Match `PitcherCard` flip timing in FlipPitcherStrip so attacks wait until
- * the opponent's face-down cards finish turning over.
- */
-const OPPONENT_FLIP_BASE_DELAY_S = 0.1;
-const OPPONENT_FLIP_STAGGER_S = 0.12;
-const OPPONENT_FLIP_DURATION_S = 0.7;
-const OPPONENT_REVEAL_SETTLE_MS = 200;
-
-/** Ms until the last opponent card finishes its flip-in at reveal start. */
-export function opponentHandRevealCompleteMs(handLength: number): number {
-  if (handLength <= 0) return 500;
-  const lastIdx = handLength - 1;
-  return (
-    Math.ceil(
-      (OPPONENT_FLIP_BASE_DELAY_S +
-        lastIdx * OPPONENT_FLIP_STAGGER_S +
-        OPPONENT_FLIP_DURATION_S) *
-        1000,
-    ) + OPPONENT_REVEAL_SETTLE_MS
-  );
-}
-/** Card flight time for user-phase projectiles. */
-const FLIGHT_MS = 460;
-/** Opponent dives travel farther (top strip -> bottom hand); give them
- *  extra air time so the cross-field drop reads clearly. */
-const OPPONENT_DIVE_MS = 640;
-/** How long an in-flight ghost stays mounted after impact (dissolve). */
-const FLIGHT_TAIL_MS = 220;
+/** Brief beat after a KO before the phase advances. */
+const DENOUEMENT_MS = 800;
+/** Cosmetic projectile flight (HP updates immediately on launch). */
+const PROJECTILE_MS = 280;
 /** How long a screen-space impact stays in the queue before we GC it. */
 const IMPACT_GC_MS = 1100;
-/** HP tween duration on the pill side, per impact. */
-const HP_TWEEN_MS = 360;
 const HIT_NUMBER_LIFETIME_MS = 820;
+/** How long a projectile stays mounted after impact (dissolve). */
+const PROJECTILE_TAIL_MS = 180;
 
 // ---------------------------------------------------------------------------
 // Hook: timeline + state
 // ---------------------------------------------------------------------------
 
 export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput {
-  const {
-    enabled,
-    batterAttackers,
-    pitcherAttackers,
-    batterHP,
-    pitcherHP,
-    userIsBatting,
-    grandSlam,
-    opponentHandLength,
-    onComplete,
-    onImpact,
-    runId,
-  } = input;
+  const { enabled, batterHP, pitcherHP, runId } = input;
 
-  // Latest-prop refs so the timeline effect doesn't fight React.
-  const onCompleteRef = useRef(onComplete);
-  const onImpactRef = useRef(onImpact);
+  // Latest-prop refs so the timeline effect doesn't fight React re-renders.
+  const inputRef = useRef(input);
+  inputRef.current = input;
+  const onCompleteRef = useRef(input.onComplete);
+  const onImpactRef = useRef(input.onImpact);
+  const onCombatResolvedRef = useRef(input.onCombatResolved);
   useEffect(() => {
-    onCompleteRef.current = onComplete;
-  }, [onComplete]);
+    onCompleteRef.current = input.onComplete;
+  }, [input.onComplete]);
   useEffect(() => {
-    onImpactRef.current = onImpact;
-  }, [onImpact]);
+    onImpactRef.current = input.onImpact;
+  }, [input.onImpact]);
+  useEffect(() => {
+    onCombatResolvedRef.current = input.onCombatResolved;
+  }, [input.onCombatResolved]);
 
   const [displayedBatterHP, setDisplayedBatterHP] = useState(batterHP);
   const [displayedPitcherHP, setDisplayedPitcherHP] = useState(pitcherHP);
+  const [displayedBatterShield, setDisplayedBatterShield] = useState(0);
+  const [displayedPitcherShield, setDisplayedPitcherShield] = useState(0);
+  const [displayedBatterBurn, setDisplayedBatterBurn] = useState(0);
+  const [displayedPitcherBurn, setDisplayedPitcherBurn] = useState(0);
+  const [displayedBatterPoison, setDisplayedBatterPoison] = useState(0);
+  const [displayedPitcherPoison, setDisplayedPitcherPoison] = useState(0);
+  const [displayedBatterHealPulse, setDisplayedBatterHealPulse] = useState(0);
+  const [displayedPitcherHealPulse, setDisplayedPitcherHealPulse] = useState(0);
   const [impacts, setImpacts] = useState<BrawlImpact[]>([]);
-  const [flying, setFlying] = useState<FlyingCard[]>([]);
+  const [projectiles, setProjectiles] = useState<BrawlProjectile[]>([]);
   const [hitNumbers, setHitNumbers] = useState<HitNumber[]>([]);
   const [attackPhase, setAttackPhase] = useState<BrawlAttackPhase>("idle");
+  const [cardCooldowns, setCardCooldowns] = useState<
+    Record<string, CardCooldownPulse>
+  >({});
+  const [sandstormActive, setSandstormActive] = useState(false);
+  const [sandstormTickIndex, setSandstormTickIndex] = useState(0);
   const attackingRef = useRef(false);
   const [attacking, setAttacking] = useState(false);
 
   useEffect(() => {
+    const snap = inputRef.current;
+
     // Reset visual state whenever we leave / re-enter the reveal phase.
     if (!enabled) {
-      setDisplayedBatterHP(batterHP);
-      setDisplayedPitcherHP(pitcherHP);
+      setDisplayedBatterHP(snap.batterHP);
+      setDisplayedPitcherHP(snap.pitcherHP);
+      setDisplayedBatterShield(0);
+      setDisplayedPitcherShield(0);
+      setDisplayedBatterBurn(0);
+      setDisplayedPitcherBurn(0);
+      setDisplayedBatterPoison(0);
+      setDisplayedPitcherPoison(0);
+      setDisplayedBatterHealPulse(0);
+      setDisplayedPitcherHealPulse(0);
       setImpacts([]);
-      setFlying([]);
+      setProjectiles([]);
       setHitNumbers([]);
       setAttackPhase("idle");
+      setCardCooldowns({});
+      setSandstormActive(false);
+      setSandstormTickIndex(0);
       attackingRef.current = false;
       setAttacking(false);
       return;
     }
 
-    // Snapshot starting HPs at the moment the reveal starts -- if the
-    // store's batterHP / pitcherHP shift later (they shouldn't during
-    // reveal, but defensively) we ignore them.
-    const startB = batterHP;
-    const startP = pitcherHP;
+    const {
+      batterAttackGroups,
+      pitcherAttackGroups,
+      batterHP: startB,
+      pitcherHP: startP,
+      userIsBatting,
+      opponentRevealDelayMs,
+      elementCombatStart,
+      userAttackCooldownMs = 5000,
+      opponentAttackCooldownMs = 5000,
+    } = snap;
+
     setDisplayedBatterHP(startB);
     setDisplayedPitcherHP(startP);
+    setDisplayedBatterShield(0);
+    setDisplayedPitcherShield(0);
+    setDisplayedBatterBurn(0);
+    setDisplayedPitcherBurn(0);
+    setDisplayedBatterPoison(0);
+    setDisplayedPitcherPoison(0);
+    setDisplayedBatterHealPulse(0);
+    setDisplayedPitcherHealPulse(0);
     setImpacts([]);
-    setFlying([]);
+    setProjectiles([]);
     setHitNumbers([]);
     setAttackPhase("intro");
+    setCardCooldowns({});
+    setSandstormActive(false);
+    setSandstormTickIndex(0);
     attackingRef.current = true;
     setAttacking(true);
 
-    let runningB = startB;
-    let runningP = startP;
+    let combat: ElementCombatState = elementCombatStart
+      ? { ...freshElementCombatState(), ...elementCombatStart }
+      : {
+          ...freshElementCombatState(),
+          playerHP: userIsBatting ? startB : startP,
+          cpuHP: userIsBatting ? startP : startB,
+        };
 
-    // Locate the user / opponent pills + each card's hand rect via the
-    // DOM anchors the parent component placed. We capture these
-    // *immediately* at reveal start so a later DOM reflow (the cards
-    // disappearing as they "fly", for example) can't trash the math.
+    const combatStartSnapshot: ElementCombatState = { ...combat };
+    const combatEvents: BrawlCombatEvent[] = [];
+    let sandstormTickCount = 0;
+
+    const applyHitAndLog = (
+      before: ElementCombatState,
+      card: BrawlAttackCard,
+      isUser: boolean,
+    ): ElementCombatState => {
+      const after = applyElementCombatHit(
+        before,
+        {
+          element: card.element,
+          power: card.power,
+          leftCardId: card.id,
+          rightCardId: card.rightCardId,
+        },
+        isUser,
+      );
+      combatEvents.push(
+        logCardCombatEvent(before, after, {
+          cardId: card.id,
+          power: card.power,
+          element: card.element,
+          label: card.label,
+          attackerIsPlayer: isUser,
+        }),
+      );
+      return after;
+    };
+
+    const syncDisplayInstant = (state: ElementCombatState) => {
+      const batterHp = userIsBatting ? state.playerHP : state.cpuHP;
+      const pitcherHp = userIsBatting ? state.cpuHP : state.playerHP;
+      const batterShield = userIsBatting ? state.shieldOnPlayer : state.shieldOnCpu;
+      const pitcherShield = userIsBatting ? state.shieldOnCpu : state.shieldOnPlayer;
+      const batterBurn = userIsBatting ? state.burnOnPlayer : state.burnOnCpu;
+      const pitcherBurn = userIsBatting ? state.burnOnCpu : state.burnOnPlayer;
+      const batterPoison = userIsBatting ? state.poisonOnPlayer : state.poisonOnCpu;
+      const pitcherPoison = userIsBatting ? state.poisonOnCpu : state.poisonOnPlayer;
+      setDisplayedBatterHP(batterHp);
+      setDisplayedPitcherHP(pitcherHp);
+      setDisplayedBatterShield(batterShield);
+      setDisplayedPitcherShield(pitcherShield);
+      setDisplayedBatterBurn(batterBurn);
+      setDisplayedPitcherBurn(pitcherBurn);
+      setDisplayedBatterPoison(batterPoison);
+      setDisplayedPitcherPoison(pitcherPoison);
+      syncCardFreezeFlags(state);
+    };
+
+    const syncCardFreezeFlags = (state: ElementCombatState) => {
+      setCardCooldowns((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const [id, pulse] of Object.entries(prev)) {
+          const frozen =
+            pulse.side === "user"
+              ? state.freezeOnPlayer > 0
+              : state.freezeOnCpu > 0;
+          if (pulse.frozen !== frozen) {
+            next[id] = { ...pulse, frozen };
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+    };
+
+    syncDisplayInstant(combat);
+
+    const userAttackGroups = userIsBatting
+      ? batterAttackGroups
+      : pitcherAttackGroups;
+    const opponentAttackGroups = userIsBatting
+      ? pitcherAttackGroups
+      : batterAttackGroups;
+
+    const pulseHealOnSeat = (seat: "batter" | "pitcher") => {
+      if (seat === "batter") {
+        setDisplayedBatterHealPulse((n) => n + 1);
+      } else {
+        setDisplayedPitcherHealPulse((n) => n + 1);
+      }
+    };
+
+    let userGroupIdx = 0;
+    let oppGroupIdx = 0;
+    let combatOver = false;
+    let sideTick = 0;
+
     const lookup = (selector: string): DOMRect | null => {
       const el = document.querySelector<HTMLElement>(selector);
       if (!el) return null;
       return el.getBoundingClientRect();
     };
-    const userPillRect = lookup('[data-brawl-pill="user"]');
-    const opponentPillRect = lookup('[data-brawl-pill="opponent"]');
     const center = (r: DOMRect | null) =>
       r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
-    const userPill = center(userPillRect);
-    const opponentPill = center(opponentPillRect);
 
-    // Defensive fallback: if the pills haven't mounted yet (race), aim
-    // at viewport-relative anchors so the timeline still resolves and
-    // calls completeReveal. The visual would just be "card flies to
-    // mid-screen" instead of "to pill", which is degraded but not
-    // broken.
-    const userPillFallback = userPill ?? {
+    const userPillFallback = {
       x: window.innerWidth / 2,
       y: window.innerHeight - 160,
     };
-    const opponentPillFallback = opponentPill ?? {
+    const opponentPillFallback = {
       x: window.innerWidth / 2,
       y: 220,
     };
@@ -354,8 +483,6 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
           : null;
       const fromScoped = pick(scoped);
       if (fromScoped) return fromScoped;
-      // Never fall back to an unscoped lookup — shared general-pool ids
-      // exist on both strips and querySelector would grab the wrong hand.
       return attacker === "user" ? userPillFallback : opponentPillFallback;
     };
 
@@ -366,7 +493,6 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
         : (c ?? opponentPillFallback);
     };
 
-    /** Resolve the on-screen pill for a batter/pitcher *seat* (not UI side). */
     const pillForSeat = (seat: "batter" | "pitcher") => {
       const c = center(lookup(`[data-brawl-pill-seat="${seat}"]`));
       if (c) return c;
@@ -381,9 +507,6 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       return pillAt(uiSide);
     };
 
-    const damagedSeat = (isBatterCard: boolean): "batter" | "pitcher" =>
-      isBatterCard ? "pitcher" : "batter";
-
     const uiSideForSeat = (seat: "batter" | "pitcher"): "user" | "opponent" =>
       seat === "batter"
         ? userIsBatting
@@ -393,157 +516,6 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
           ? "opponent"
           : "user";
 
-    /** Hand-strip center; `bottom` biases toward the lower edge for long dives. */
-    const handAt = (
-      side: "user" | "opponent",
-      depth: "center" | "bottom" = "center",
-    ) => {
-      const el = document.querySelector<HTMLElement>(
-        `[data-brawl-hand="${side}"]`,
-      );
-      if (el) {
-        const r = el.getBoundingClientRect();
-        if (r.width > 0 && r.height > 0) {
-          return {
-            x: r.left + r.width / 2,
-            y:
-              depth === "bottom"
-                ? r.bottom - Math.min(32, r.height * 0.1)
-                : r.top + r.height / 2,
-          };
-        }
-      }
-      return pillAt(side);
-    };
-
-    /**
-     * Ghost flight destination. User cards strike the damaged seat's
-     * pill. Opponent cards dive to the user's hand strip at the screen
-     * bottom so the cross-field attack reads at full length.
-     */
-    const attackTarget = (step: {
-      attacker: "user" | "opponent";
-      isBatterCard: boolean;
-    }) => {
-      const seat = damagedSeat(step.isBatterCard);
-      if (step.attacker === "opponent") {
-        return handAt(uiSideForSeat(seat), "bottom");
-      }
-      return pillForSeat(seat);
-    };
-
-    const flightMsFor = (attacker: "user" | "opponent") =>
-      attacker === "opponent" ? OPPONENT_DIVE_MS : FLIGHT_MS;
-
-    // Build a SEQUENTIAL attack schedule: user's cards launch first
-    // (all in order), then a brief mid-phase pause, then opponent's
-    // cards launch (all in order). Previous reveal interleaved sides
-    // every other card; playtesters reported they couldn't tell which
-    // side was doing what damage. Sequential by side makes the
-    // narrative obvious: "first I attack their HP bar, then they
-    // attack mine."
-    //
-    // Mapping from "batter / pitcher seat" -> "user / opponent VFX
-    // tint" comes from `userIsBatting`. The damage math is unchanged:
-    // batter-seat cards deplete pitcher HP, pitcher-seat cards deplete
-    // batter HP, regardless of who attacks first visually.
-    interface Step {
-      tMs: number;
-      /** "user" if it's the user's card flying out; otherwise "opponent". */
-      attacker: "user" | "opponent";
-      /** Which pill takes the hit. */
-      defender: "user" | "opponent";
-      card: BrawlAttackCard;
-      /** True if this card belongs to the batter seat (deducts pitcher HP).
-       *  False -> pitcher seat card (deducts batter HP). */
-      isBatterCard: boolean;
-    }
-    const steps: Step[] = [];
-
-    // Resolve which queue maps to "user" vs "opponent" based on the
-    // current seat. The user phase always plays first regardless of
-    // whether the user is batting or pitching this at-bat.
-    const userPhaseQueue = userIsBatting ? batterAttackers : pitcherAttackers;
-    const opponentPhaseQueue = userIsBatting ? pitcherAttackers : batterAttackers;
-    // `isBatterCard` is true when the queue belongs to the batter
-    // seat -- batter cards always damage the pitcher pill.
-    const userPhaseIsBatterSeat = userIsBatting;
-    const opponentPhaseIsBatterSeat = !userIsBatting;
-
-    const opponentRevealMs = opponentHandRevealCompleteMs(opponentHandLength);
-
-    let cursor = ARM_DELAY_MS + PHASE_INTRO_MS + opponentRevealMs;
-    const userPhaseStartMs = cursor;
-
-    // ---- Phase 1: user's cards attack opponent's pill -----------------
-    for (const card of userPhaseQueue) {
-      steps.push({
-        tMs: cursor,
-        attacker: "user",
-        defender: "opponent",
-        card,
-        isBatterCard: userPhaseIsBatterSeat,
-      });
-      cursor += ATTACK_GAP_MS;
-    }
-    // Last user-phase impact lands at (last launch + FLIGHT_MS). Move
-    // cursor past that impact, then add the mid-phase pause so the
-    // banner has time to swap from "Your Attack" -> "Opponent's
-    // Attack" before the first opponent ghost lifts off.
-    const lastUserLaunchMs = cursor - ATTACK_GAP_MS;
-    const userPhaseEndMs =
-      userPhaseQueue.length > 0 ? lastUserLaunchMs + FLIGHT_MS : userPhaseStartMs;
-    cursor = userPhaseEndMs + MID_PHASE_PAUSE_MS;
-    const opponentPhaseStartMs = cursor;
-
-    // ---- Phase 2: opponent's cards attack user's pill -----------------
-    for (const card of opponentPhaseQueue) {
-      steps.push({
-        tMs: cursor,
-        attacker: "opponent",
-        defender: "user",
-        card,
-        isBatterCard: opponentPhaseIsBatterSeat,
-      });
-      cursor += ATTACK_GAP_MS;
-    }
-    const lastOpponentLaunchMs = cursor - ATTACK_GAP_MS;
-    const opponentPhaseEndMs =
-      opponentPhaseQueue.length > 0
-        ? lastOpponentLaunchMs + OPPONENT_DIVE_MS
-        : opponentPhaseStartMs;
-
-    // Schedule the phase-banner transitions independent of any
-    // individual step timer so the banner colors swap cleanly even if
-    // a phase has zero attackers (e.g. the user has an empty hand,
-    // which shouldn't happen in real brawl but is defensive).
-    const phaseSchedule: Array<{ at: number; to: BrawlAttackPhase }> = [];
-    if (userPhaseQueue.length > 0) {
-      phaseSchedule.push({ at: userPhaseStartMs, to: "user" });
-    }
-    if (opponentPhaseQueue.length > 0) {
-      phaseSchedule.push({ at: userPhaseEndMs, to: "mid" });
-      phaseSchedule.push({ at: opponentPhaseStartMs, to: "opponent" });
-    }
-    phaseSchedule.push({ at: opponentPhaseEndMs, to: "done" });
-
-    // Precompute step metadata; source/target rects are resolved when each
-    // step fires so opponent cards (which flip face-up at reveal start)
-    // and pill positions stay accurate after layout settles.
-    const precomputed = steps.map((step, i) => ({ ...step, i }));
-
-    const timers: ReturnType<typeof setTimeout>[] = [];
-
-    // Fire the phase-banner transitions. Each scheduled change just
-    // flips the React state -- the BrawlPhaseBanner reads `attackPhase`
-    // and animates its own copy in / out from that.
-    for (const change of phaseSchedule) {
-      timers.push(setTimeout(() => setAttackPhase(change.to), change.at));
-    }
-
-    // Garbage-collect old impacts so the array doesn't grow without
-    // bound. We could just rely on the canvas's per-impact `bornAt`
-    // ttl, but trimming React state keeps reconciliation light.
     const gcImpacts = () => {
       const now = performance.now();
       setImpacts((prev) =>
@@ -551,153 +523,524 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       );
     };
 
-    const lastStepIndex = steps.length - 1;
+    const isCombatOver = () =>
+      combat.playerHP <= 0 || combat.cpuHP <= 0;
 
-    for (const step of precomputed) {
+    const timers: ReturnType<typeof setTimeout>[] = [];
+
+    const endCombat = () => {
+      if (combatOver) return;
+      combatOver = true;
+      setAttackPhase("done");
       timers.push(
         setTimeout(() => {
-          const src = cardRectFor(step.card.id, step.attacker);
-          const dst = attackTarget(step);
-          const impactAt = pillForSeat(damagedSeat(step.isBatterCard));
-          const defenderUi = uiSideForSeat(damagedSeat(step.isBatterCard));
+          attackingRef.current = false;
+          setAttacking(false);
+          onCombatResolvedRef.current?.(
+            combat,
+            buildCombatReport(
+              combatStartSnapshot,
+              combat,
+              combatEvents,
+              sandstormTickCount,
+            ),
+          );
+          onCompleteRef.current();
+        }, DENOUEMENT_MS),
+      );
+    };
 
-          // Spawn ghost card flying source -> dst.
-          const ghostKey = `${runId}-${step.card.id}-${step.tMs}`;
-          const stepFlightMs = flightMsFor(step.attacker);
-          const ghost: FlyingCard = {
-            key: ghostKey,
-            sx: src.x,
-            sy: src.y,
-            tx: dst.x,
-            ty: dst.y,
-            cardId: step.card.id,
-            power: step.card.power,
-            attacker: step.attacker,
-            defender: defenderUi,
+    let combatSteps = 0;
+    const maxCombatSteps =
+      Math.max(
+        400,
+        (userAttackGroups.length + opponentAttackGroups.length) * 200,
+      );
+
+    const effectiveCooldownFor = (side: "user" | "opponent") => {
+      const baseMs =
+        side === "user" ? userAttackCooldownMs : opponentAttackCooldownMs;
+      const freezeStack =
+        side === "user" ? combat.freezeOnPlayer : combat.freezeOnCpu;
+      return brawlEffectiveAttackCooldownMs(baseMs, freezeStack);
+    };
+
+    const pushGroupCooldown = (
+      group: BrawlAttackCard[],
+      side: "user" | "opponent",
+      durationMs: number,
+    ) => {
+      const frozen =
+        side === "user"
+          ? combat.freezeOnPlayer > 0
+          : combat.freezeOnCpu > 0;
+      setCardCooldowns((prev) => {
+        const next = { ...prev };
+        const pulseKey =
+          Math.max(
+            0,
+            ...group.map((c) => prev[c.id]?.pulseKey ?? 0),
+          ) + 1;
+        for (const card of group) {
+          next[card.id] = { pulseKey, durationMs, side, frozen };
+        }
+        return next;
+      });
+    };
+
+    const seedInitialCooldowns = (combatStartMs: number) => {
+      setCardCooldowns(() => {
+        const next: Record<string, CardCooldownPulse> = {};
+        const seedSide = (
+          side: "user" | "opponent",
+          groups: BrawlAttackCard[][],
+        ) => {
+          const eff = effectiveCooldownFor(side);
+          const frozen =
+            side === "user"
+              ? combat.freezeOnPlayer > 0
+              : combat.freezeOnCpu > 0;
+          groups.forEach((group, index) => {
+            const durationMs = combatStartMs + (index + 1) * eff;
+            for (const card of group) {
+              next[card.id] = {
+                pulseKey: 0,
+                durationMs,
+                side,
+                frozen,
+              };
+            }
+          });
+        };
+        seedSide("user", userAttackGroups);
+        seedSide("opponent", opponentAttackGroups);
+        return next;
+      });
+    };
+
+    const resolveCardHit = (card: BrawlAttackCard, isUser: boolean) => {
+      combat = applyHitAndLog(combat, card, isUser);
+      syncDisplayInstant(combat);
+      if (isCombatOver()) endCombat();
+    };
+
+    const fireCardAttack = (
+      card: BrawlAttackCard,
+      side: "user" | "opponent",
+      groupIdx: number,
+      cardIdx: number,
+    ) => {
+      const isUser = side === "user";
+      const attackerUi = isUser ? "user" : "opponent";
+      const selfSeat: "batter" | "pitcher" = isUser
+        ? userIsBatting
+          ? "batter"
+          : "pitcher"
+        : userIsBatting
+          ? "pitcher"
+          : "batter";
+      const foeSeat: "batter" | "pitcher" =
+        selfSeat === "batter" ? "pitcher" : "batter";
+      const selfPill = pillForSeat(selfSeat);
+      const foePill = pillForSeat(foeSeat);
+      const defenderUi = uiSideForSeat(foeSeat);
+      const fxKey = `${runId}-${side}-${sideTick++}-${groupIdx}-${cardIdx}`;
+
+      if (card.element && isSelfBuffBond(card.element)) {
+        combat = applyHitAndLog(combat, card, isUser);
+        syncDisplayInstant(combat);
+        if (isCombatOver()) {
+          endCombat();
+          return;
+        }
+        if (card.element === "heal") {
+          pulseHealOnSeat(selfSeat);
+        }
+        const buffLabel =
+          card.element === "heal"
+            ? `+${card.power} Heal`
+            : `+${card.power} Shield`;
+        const hitNumber: HitNumber = {
+          id: `${fxKey}-buff`,
+          x: selfPill.x,
+          y: selfPill.y,
+          value: card.power,
+          defender: attackerUi,
+          bornAt: performance.now(),
+          label: buffLabel,
+        };
+        setHitNumbers((prev) => [...prev, hitNumber]);
+        timers.push(
+          setTimeout(() => {
+            setHitNumbers((prev) =>
+              prev.filter((n) => n.id !== `${fxKey}-buff`),
+            );
+          }, HIT_NUMBER_LIFETIME_MS),
+        );
+        return;
+      }
+
+      const src = cardRectFor(card.id, attackerUi);
+      const hitLabel = card.element
+        ? `${card.power} ${ELEMENT_LABEL[card.element]}`
+        : `${card.power} Hit`;
+
+      setProjectiles((prev) => [
+        ...prev,
+        {
+          key: fxKey,
+          sx: src.x,
+          sy: src.y,
+          tx: foePill.x,
+          ty: foePill.y,
+          cardId: card.id,
+          power: card.power,
+          attacker: attackerUi,
+          defender: defenderUi,
+          bornAt: performance.now(),
+          label: card.label ?? card.id,
+          element: card.element,
+          flightMs: PROJECTILE_MS,
+        },
+      ]);
+
+      timers.push(
+        setTimeout(() => {
+          resolveCardHit(card, isUser);
+
+          const impactPayload: BrawlImpact = {
+            id: fxKey,
+            x: foePill.x,
+            y: foePill.y,
+            power: card.power,
             bornAt: performance.now(),
-            label: step.card.label ?? step.card.id,
-            flightMs: stepFlightMs,
+            defender: defenderUi,
+            grand: false,
           };
-          setFlying((prev) => [...prev, ghost]);
+          setImpacts((prev) => [...prev, impactPayload]);
+          setHitNumbers((prev) => [
+            ...prev,
+            {
+              id: `${fxKey}-hit`,
+              x: foePill.x,
+              y: foePill.y,
+              value: card.power,
+              defender: defenderUi,
+              bornAt: performance.now(),
+              label: hitLabel,
+            },
+          ]);
+          onImpactRef.current?.(card.power, false);
 
-          // Schedule the impact event for the moment the ghost lands.
           timers.push(
             setTimeout(() => {
-              // Deplete the defender's HP. Floor at 0 -- the side that
-              // hits 0 first stays at 0 even if more attacks land.
-              // Damage routing is by *seat* (batter / pitcher), not by
-              // VFX tint -- a batter-side card always hits pitcher HP.
-              const damage = Math.max(0, step.card.power);
-              if (step.isBatterCard) {
-                runningP = Math.max(0, runningP - damage);
-                tweenHP(runningP, HP_TWEEN_MS, setDisplayedPitcherHP);
-              } else {
-                runningB = Math.max(0, runningB - damage);
-                tweenHP(runningB, HP_TWEEN_MS, setDisplayedBatterHP);
-              }
-
-              const impactPayload: BrawlImpact = {
-                id: ghostKey,
-                x: impactAt.x,
-                y: impactAt.y,
-                power: step.card.power,
-                bornAt: performance.now(),
-                defender: defenderUi,
-                grand: grandSlam && step.i === lastStepIndex,
-              };
-              setImpacts((prev) => [...prev, impactPayload]);
-              const hitNumber: HitNumber = {
-                id: `${ghostKey}-hit`,
-                x: impactAt.x,
-                y: impactAt.y,
-                value: damage,
-                defender: defenderUi,
-                bornAt: performance.now(),
-                grand: impactPayload.grand,
-              };
-              setHitNumbers((prev) => [...prev, hitNumber]);
-              onImpactRef.current?.(step.card.power, !!impactPayload.grand);
-
-              // Despawn the ghost after a short dissolve window.
-              timers.push(
-                setTimeout(() => {
-                  setFlying((prev) => prev.filter((f) => f.key !== ghostKey));
-                  gcImpacts();
-                }, FLIGHT_TAIL_MS),
+              setHitNumbers((prev) =>
+                prev.filter((n) => n.id !== `${fxKey}-hit`),
               );
-              timers.push(
-                setTimeout(() => {
-                  setHitNumbers((prev) => prev.filter((n) => n.id !== `${ghostKey}-hit`));
-                }, HIT_NUMBER_LIFETIME_MS),
-              );
-            }, stepFlightMs),
+            }, HIT_NUMBER_LIFETIME_MS),
           );
-        }, step.tMs),
+        }, PROJECTILE_MS),
       );
-    }
 
-    // Wrap-up timer: opponentPhaseEndMs is when the last impact lands.
-    // Add a brief dissolve + denouement before completeReveal flips the
-    // phase forward so the player gets a beat to see the final pill HP.
-    const totalMs =
-      opponentPhaseEndMs + FLIGHT_TAIL_MS + DENOUEMENT_MS;
+      timers.push(
+        setTimeout(() => {
+          setProjectiles((prev) => prev.filter((f) => f.key !== fxKey));
+          gcImpacts();
+        }, PROJECTILE_MS + PROJECTILE_TAIL_MS),
+      );
+    };
+
+    const fireSideAttack = (side: "user" | "opponent") => {
+      if (combatOver) return;
+
+      const isUser = side === "user";
+      const groups = isUser ? userAttackGroups : opponentAttackGroups;
+      if (groups.length === 0) return;
+
+      const groupIdx = isUser ? userGroupIdx++ : oppGroupIdx++;
+      const group = groups[groupIdx % groups.length];
+      if (group.length === 0) return;
+
+      const sideCooldownMs =
+        side === "user" ? userAttackCooldownMs : opponentAttackCooldownMs;
+      const freezeOnSide = isUser ? combat.freezeOnPlayer : combat.freezeOnCpu;
+      const effectiveSideCooldownMs = brawlEffectiveAttackCooldownMs(
+        sideCooldownMs,
+        freezeOnSide,
+      );
+      const cycleMs = Math.max(
+        1,
+        groups.length * effectiveSideCooldownMs,
+      );
+
+      let groupPower = 0;
+      for (let cardIdx = 0; cardIdx < group.length; cardIdx++) {
+        if (++combatSteps >= maxCombatSteps) {
+          endCombat();
+          return;
+        }
+        const card = group[cardIdx];
+        if (card.skipAttack) continue;
+        groupPower += card.power;
+        fireCardAttack(card, side, groupIdx, cardIdx);
+        if (combatOver) return;
+      }
+
+      combat = consumeAttackerFreeze(combat, isUser, groupPower);
+      pushGroupCooldown(group, side, cycleMs);
+    };
+
+    const scheduleSideLoop = (side: "user" | "opponent") => {
+      const groups = side === "user" ? userAttackGroups : opponentAttackGroups;
+      if (groups.length === 0 || combatOver) return;
+
+      const loop = () => {
+        if (combatOver) return;
+        fireSideAttack(side);
+        if (!combatOver) {
+          timers.push(setTimeout(loop, Math.max(0, effectiveCooldownFor(side))));
+        }
+      };
+      timers.push(setTimeout(loop, Math.max(0, effectiveCooldownFor(side))));
+    };
+
+    const spawnSandstormFloaters = (damage: number, tick: number) => {
+      const bornAt = performance.now();
+      const userP = pillAt("user");
+      const oppP = pillAt("opponent");
+      const label = `-${damage}`;
+      setHitNumbers((prev) => [
+        ...prev,
+        {
+          id: `sandstorm-user-${tick}-${bornAt}`,
+          x: userP.x,
+          y: userP.y,
+          value: damage,
+          defender: "user",
+          bornAt,
+          label,
+          variant: "sandstorm",
+        },
+        {
+          id: `sandstorm-opp-${tick}-${bornAt}`,
+          x: oppP.x,
+          y: oppP.y,
+          value: damage,
+          defender: "opponent",
+          bornAt,
+          label,
+          variant: "sandstorm",
+        },
+      ]);
+      timers.push(
+        setTimeout(() => {
+          setHitNumbers((prev) =>
+            prev.filter(
+              (n) =>
+                n.id !== `sandstorm-user-${tick}-${bornAt}` &&
+                n.id !== `sandstorm-opp-${tick}-${bornAt}`,
+            ),
+          );
+        }, HIT_NUMBER_LIFETIME_MS),
+      );
+    };
+
+    let sandstormTick = 0;
+    let sandstormInterval: ReturnType<typeof setInterval> | null = null;
+
+    const activateSandstorm = () => {
+      if (combatOver || !shouldActivateSandstorm(combat)) return;
+      setSandstormActive(true);
+      sandstormTick = 0;
+
+      sandstormInterval = setInterval(() => {
+        if (combatOver) return;
+        sandstormTick += 1;
+        sandstormTickCount = sandstormTick;
+        const { next, damage, instantEnd } = applySandstormTick(
+          combat,
+          sandstormTick,
+        );
+        combat = next;
+        combatEvents.push(logSandstormEvent(damage, sandstormTick));
+        syncDisplayInstant(combat);
+        spawnSandstormFloaters(damage, sandstormTick);
+        setSandstormTickIndex(sandstormTick);
+        onImpactRef.current?.(damage, instantEnd);
+        if (instantEnd || isCombatOver()) endCombat();
+      }, BRAWL_SANDSTORM_TICK_MS);
+    };
+
+    const combatStartMs =
+      ARM_DELAY_MS +
+      PHASE_INTRO_MS +
+      (snap.elementMode ? 480 : Math.max(0, opponentRevealDelayMs));
+
+    seedInitialCooldowns(combatStartMs);
+
+    const dotTick = () => {
+      if (combatOver) return;
+      const beforeDot = combat;
+      combat = tickCombatDotStacks(combat);
+      combatEvents.push(...logDotTickEvents(beforeDot, combat));
+      syncDisplayInstant(combat);
+      if (isCombatOver()) endCombat();
+    };
+    const dotInterval = setInterval(dotTick, BRAWL_DOT_TICK_MS);
+
     timers.push(
       setTimeout(() => {
-        attackingRef.current = false;
-        setAttacking(false);
-        onCompleteRef.current();
-      }, totalMs),
+        if (combatOver) return;
+        setAttackPhase("combat");
+        scheduleSideLoop("user");
+        scheduleSideLoop("opponent");
+        if (userAttackGroups.length === 0 && opponentAttackGroups.length === 0) {
+          endCombat();
+          return;
+        }
+        timers.push(
+          setTimeout(() => {
+            if (combatOver) return;
+            activateSandstorm();
+          }, BRAWL_SANDSTORM_WARNING_MS),
+        );
+      }, combatStartMs),
     );
 
     return () => {
+      combatOver = true;
       for (const t of timers) clearTimeout(t);
+      clearInterval(dotInterval);
+      if (sandstormInterval) clearInterval(sandstormInterval);
       attackingRef.current = false;
       setAttacking(false);
     };
-  }, [enabled, runId, batterAttackers, pitcherAttackers, batterHP, pitcherHP, userIsBatting, grandSlam, opponentHandLength]);
+    // Pin the timeline to the at-bat id only. All other inputs are read
+    // from `inputRef` so HP tweens / projectile state updates can't
+    // restart the schedule mid-sequence (which was cancelling attacks).
+  }, [enabled, runId]);
 
   return {
     displayedBatterHP,
     displayedPitcherHP,
+    displayedBatterShield,
+    displayedPitcherShield,
+    displayedBatterBurn,
+    displayedPitcherBurn,
+    displayedBatterPoison,
+    displayedPitcherPoison,
+    displayedBatterHealPulse,
+    displayedPitcherHealPulse,
     impacts,
-    flying,
+    projectiles,
+    flying: projectiles,
     hitNumbers,
     attacking,
     attackPhase,
+    cardCooldowns,
+    sandstormActive,
+    sandstormTickIndex,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Tween helper — animate a numeric state down to `target` over `durationMs`.
+// Per-card cooldown fill (mounted on each bond card in the hand strip)
 // ---------------------------------------------------------------------------
 
-function tweenHP(
-  target: number,
-  durationMs: number,
-  setter: Dispatch<SetStateAction<number>>,
-) {
-  let start: number | null = null;
-  let raf = 0;
-  // Sample the current value lazily via a setter closure -- we kick
-  // tweens off every impact and they shouldn't fight each other (the
-  // most recent tween always wins because React batches setter calls).
-  let from: number | null = null;
-  const step = (ts: number) => {
-    if (start === null) start = ts;
-    const t = Math.min(1, (ts - start) / durationMs);
-    const eased = 1 - Math.pow(1 - t, 2);
-    setter((prev) => {
-      if (from === null) from = prev;
-      const next = from + (target - from) * eased;
-      return next;
-    });
-    if (t < 1) raf = requestAnimationFrame(step);
-  };
-  raf = requestAnimationFrame(step);
-  // We don't expose cancellation -- new tweens overwrite the React
-  // setter ordering naturally. `raf` is held in closure only for the
-  // lifetime of this tween.
-  void raf;
+const COOLDOWN_TONE: Record<
+  "user" | "opponent",
+  { veil: string; edge: string; glow: string }
+> = {
+  user: {
+    veil: "bg-slate-950/58",
+    edge: "bg-amber-400/90",
+    glow: "0 0 10px rgba(251,191,36,0.85)",
+  },
+  opponent: {
+    veil: "bg-slate-950/58",
+    edge: "bg-rose-400/90",
+    glow: "0 0 10px rgba(251,113,133,0.85)",
+  },
+};
+
+/** Bottom-up veil shrink — card is ready when the overlay reaches zero height. */
+export function BrawlCardCooldownOverlay({
+  pulse,
+  compact = false,
+}: {
+  pulse: CardCooldownPulse;
+  compact?: boolean;
+}) {
+  const tone = pulse.frozen
+    ? {
+        veil: "bg-cyan-950/65",
+        edge: "bg-cyan-300/95",
+        glow: "0 0 12px rgba(56,189,248,0.9)",
+        text: "text-cyan-50",
+      }
+    : {
+        ...COOLDOWN_TONE[pulse.side],
+        text: pulse.side === "user" ? "text-amber-100" : "text-rose-100",
+      };
+  const durationSec = pulse.durationMs / 1000;
+  const [remainingSec, setRemainingSec] = useState(() =>
+    Math.ceil(pulse.durationMs / 1000),
+  );
+
+  useEffect(() => {
+    const start = performance.now();
+    const totalMs = pulse.durationMs;
+    setRemainingSec(Math.ceil(totalMs / 1000));
+
+    let frame = 0;
+    const tick = () => {
+      const leftMs = Math.max(0, totalMs - (performance.now() - start));
+      setRemainingSec(Math.ceil(leftMs / 1000));
+      if (leftMs > 0) frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [pulse.pulseKey, pulse.durationMs]);
+
+  return (
+    <div
+      className={`absolute inset-0 z-40 pointer-events-none overflow-hidden rounded-[inherit] ${
+        compact ? "rounded-lg" : "rounded-xl"
+      }`}
+      aria-hidden="true"
+    >
+      <motion.div
+        key={pulse.pulseKey}
+        className={`absolute inset-x-0 bottom-0 origin-bottom ${tone.veil} backdrop-blur-[1px]`}
+        initial={{ height: "100%" }}
+        animate={{ height: "0%" }}
+        transition={{ duration: durationSec, ease: "linear" }}
+      >
+        <div
+          className={`absolute inset-x-0 top-0 h-[3px] ${tone.edge}`}
+          style={{ boxShadow: tone.glow }}
+        />
+      </motion.div>
+      {remainingSec > 0 && (
+        <div className="absolute inset-x-0 bottom-1.5 z-50 flex justify-center pointer-events-none">
+          <span
+            className={`font-black tabular-nums leading-none drop-shadow-[0_1px_4px_rgba(0,0,0,0.85)] ${
+              compact ? "text-[10px]" : "text-xs"
+            } ${tone.text}`}
+          >
+            {remainingSec}
+          </span>
+        </div>
+      )}
+      {pulse.frozen && (
+        <div className="absolute inset-x-0 top-1 z-[60] flex justify-center pointer-events-none">
+          <span className="px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-widest text-cyan-100 bg-cyan-900/80 border border-cyan-400/50">
+            Frozen
+          </span>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -713,24 +1056,28 @@ function cssEscape(s: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// JSX shell: mounts the R3F canvas + the flying-card ghosts.
+// JSX shell: mounts the R3F canvas + projectile streaks.
 // ---------------------------------------------------------------------------
 
 export function BrawlAttackOverlay({
   impacts,
   flying,
+  projectiles,
   auras,
   hitNumbers,
   shakePulse,
   attackPhase,
 }: {
   impacts: BrawlImpact[];
-  flying: FlyingCard[];
+  /** @deprecated Prefer `projectiles`. */
+  flying?: BrawlProjectile[];
+  projectiles?: BrawlProjectile[];
   auras: BrawlAura[];
   hitNumbers: HitNumber[];
   shakePulse: BrawlShakePulse;
   attackPhase: BrawlAttackPhase;
 }) {
+  const activeProjectiles = projectiles ?? flying ?? [];
   const shake = useAnimationControls();
   const lastShake = useRef(0);
   useEffect(() => {
@@ -749,16 +1096,22 @@ export function BrawlAttackOverlay({
   }, [shakePulse, shake]);
 
   return (
-    <motion.div
-      className="fixed inset-0 z-[53] pointer-events-none"
-      initial={false}
-      animate={shake}
-    >
-      <BrawlImpactCanvas impacts={impacts} auras={auras} />
-      <FlyingCardLayer flying={flying} />
-      <HitNumberLayer numbers={hitNumbers} />
-      <BrawlPhaseBanner phase={attackPhase} />
-    </motion.div>
+    <>
+      {/* R3F canvas stays outside the shake wrapper — CSS transforms on a
+          WebGL parent often blank the framebuffer to white. */}
+      <div className="fixed inset-0 z-[53] pointer-events-none">
+        <BrawlImpactCanvas impacts={impacts} auras={auras} />
+      </div>
+      <motion.div
+        className="fixed inset-0 z-[54] pointer-events-none"
+        initial={false}
+        animate={shake}
+      >
+        <ProjectileLayer projectiles={activeProjectiles} />
+        <HitNumberLayer numbers={hitNumbers} />
+        <BrawlPhaseBanner phase={attackPhase} />
+      </motion.div>
+    </>
   );
 }
 
@@ -771,13 +1124,10 @@ export function BrawlAttackOverlay({
 
 function BrawlPhaseBanner({ phase }: { phase: BrawlAttackPhase }) {
   // The mid-attack pills ("Your Cards Attack", "Opponent's Cards
-  // Attack", "Switching Sides") all duplicated information the
-  // animation itself was already shouting via the amber/rose tints
-  // on flying cards + HP pill impacts. The screen-center pill kept
-  // competing with the actual attack visuals, so they're suppressed
-  // here. Only the pre-attack "Locked In" intro pill survives -- it
-  // bridges the dead air between lockIn and the first card launch
-  // when there's nothing else animating.
+  // Attack", "Switching Sides", "Combat") all duplicated information the
+  // animation itself was already shouting via projectiles + HP pill impacts.
+  // Only the pre-attack "Locked In" intro pill survives — it bridges the
+  // dead air between lockIn and the first card launch.
   const config =
     phase === "intro"
       ? {
@@ -813,144 +1163,124 @@ function BrawlPhaseBanner({ phase }: { phase: BrawlAttackPhase }) {
 }
 
 // ---------------------------------------------------------------------------
-// DOM ghost cards (Framer Motion) flying from source rect to target rect.
+// DOM projectile streaks from card origin → opposing HP pill.
 // ---------------------------------------------------------------------------
 
-function FlyingCardLayer({ flying }: { flying: FlyingCard[] }) {
-  // Pointer-events: none so the ghosts never block the cards underneath
-  // (and the pills the user might be staring at). Fixed positioning so
-  // we can pass viewport-space coordinates straight in. Sits one layer
-  // above the R3F impact canvas so the flying card silhouette reads
-  // clearly against the shockwave burst.
+const ELEMENT_PROJECTILE_TONE: Record<
+  Element,
+  { core: string; glow: string; trail: string }
+> = {
+  fire: {
+    core: "rgba(251,146,60,0.95)",
+    glow: "0 0 22px rgba(251,146,60,0.75)",
+    trail: "rgba(249,115,22,0.55)",
+  },
+  poison: {
+    core: "rgba(192,132,252,0.95)",
+    glow: "0 0 22px rgba(168,85,247,0.75)",
+    trail: "rgba(147,51,234,0.55)",
+  },
+  freeze: {
+    core: "rgba(125,211,252,0.95)",
+    glow: "0 0 22px rgba(56,189,248,0.75)",
+    trail: "rgba(14,165,233,0.55)",
+  },
+  shield: {
+    core: "rgba(250,204,21,0.95)",
+    glow: "0 0 22px rgba(234,179,8,0.75)",
+    trail: "rgba(202,138,4,0.55)",
+  },
+  heal: {
+    core: "rgba(74,222,128,0.95)",
+    glow: "0 0 22px rgba(34,197,94,0.75)",
+    trail: "rgba(22,163,74,0.55)",
+  },
+};
+
+function ProjectileLayer({ projectiles }: { projectiles: BrawlProjectile[] }) {
   return (
-    <div
-      className="absolute inset-0 z-[52] pointer-events-none"
-      aria-hidden="true"
-    >
+    <div className="absolute inset-0 z-[52] pointer-events-none" aria-hidden="true">
       <AnimatePresence>
-        {flying.map((card) => (
-          <FlyingCard key={card.key} card={card} />
+        {projectiles.map((proj) => (
+          <BrawlProjectileStreak key={proj.key} proj={proj} />
         ))}
       </AnimatePresence>
     </div>
   );
 }
 
-function FlyingCard({ card }: { card: FlyingCard }) {
-  // Translate the rect-center coordinates into a Framer Motion
-  // initial/animate pair. We compute a control offset so the card arcs
-  // upward through the field instead of cutting flat across the screen
-  // -- arcs read way more "attacking" than a straight glide.
-  const dx = card.tx - card.sx;
-  const dy = card.ty - card.sy;
+function BrawlProjectileStreak({ proj }: { proj: BrawlProjectile }) {
+  const dx = proj.tx - proj.sx;
+  const dy = proj.ty - proj.sy;
   const distance = Math.hypot(dx, dy);
-  const diveDown = card.attacker === "opponent" && dy > 0;
-  const arcLift = diveDown
-    ? Math.max(80, distance * 0.2 + Math.abs(dx) * 0.1)
-    : Math.max(48, distance * 0.14 + Math.abs(dx) * 0.06);
-  const midX =
-    card.sx + dx * 0.5 + (dx >= 0 ? 1 : -1) * arcLift * (diveDown ? 0.42 : 0.32);
-  // When the target sits below the source (opponent diving down-field),
-  // bow through the middle of the drop — never lift above the source,
-  // which read as "attacking upward / themselves" in playtests.
-  const midY = diveDown
-    ? card.sy + dy * 0.62
-    : dy > 0
-      ? card.sy + dy * 0.46
-      : Math.min(card.sy, card.ty) - arcLift;
-  const flightDuration = (card.flightMs + 200) / 1000;
+  const midX = proj.sx + dx * 0.5 + (dx >= 0 ? 1 : -1) * Math.max(24, distance * 0.08);
+  const midY = proj.sy + dy * 0.5 - Math.max(32, distance * 0.12);
+  const flightDuration = (proj.flightMs + 120) / 1000;
 
-  // The Framer waypoints are absolute viewport pixels but we render the
-  // card with translate from the rect's top-left. To keep the card
-  // centered on the path we offset by half its width/height.
-  const cardW = 84;
-  const cardH = 112;
-  const halfW = cardW / 2;
-  const halfH = cardH / 2;
-
-  // Color flavor: the user's outgoing attacks are amber, opponent's are
-  // rose. Mirrors the BrawlImpactCanvas tinting so the ghost + impact
-  // burst read as one continuous strike.
-  const tone =
-    card.attacker === "user"
+  const sideTone =
+    proj.attacker === "user"
       ? {
-          border: "border-amber-300/80",
-          bg: "from-amber-500/80 via-amber-600/70 to-orange-700/80",
-          glow: "0 0 24px rgba(251,191,36,0.55), 0 0 60px rgba(251,191,36,0.35)",
-          ring: "ring-amber-200/70",
-          text: "text-amber-50",
+          core: "rgba(251,191,36,0.95)",
+          glow: "0 0 20px rgba(251,191,36,0.65)",
+          trail: "rgba(251,191,36,0.45)",
         }
       : {
-          border: "border-rose-300/80",
-          bg: "from-rose-500/80 via-rose-600/70 to-red-700/80",
-          glow: "0 0 24px rgba(244,63,94,0.55), 0 0 60px rgba(244,63,94,0.35)",
-          ring: "ring-rose-200/70",
-          text: "text-rose-50",
+          core: "rgba(244,63,94,0.95)",
+          glow: "0 0 20px rgba(244,63,94,0.65)",
+          trail: "rgba(244,63,94,0.45)",
         };
+  const elementTone = proj.element ? ELEMENT_PROJECTILE_TONE[proj.element] : sideTone;
 
   return (
-    <motion.div
-      // Absolutely positioned at the source center, then animated along
-      // the three waypoints. We translate by negative half-size in CSS
-      // so the (x,y) coordinate stays on the *center* of the card.
-      style={{ position: "absolute", left: 0, top: 0, willChange: "transform" }}
-      initial={{
-        x: card.sx - halfW,
-        y: card.sy - halfH,
-        scale: 0.6,
-        rotate: card.attacker === "user" ? -8 : 8,
-        opacity: 0.95,
-      }}
-      animate={{
-        x: [card.sx - halfW, midX - halfW, card.tx - halfW],
-        y: [card.sy - halfH, midY - halfH, card.ty - halfH],
-        scale: [0.78, 1.18, 0.85],
-        rotate: [
-          card.attacker === "user" ? -8 : 8,
-          card.attacker === "user" ? 18 : -18,
-          card.attacker === "user" ? 40 : -40,
-        ],
-        opacity: [0.95, 1, 0],
-        transition: {
+    <>
+      <motion.div
+        style={{ position: "absolute", left: 0, top: 0, willChange: "transform" }}
+        initial={{ x: proj.sx - 10, y: proj.sy - 10, opacity: 0, scale: 0.35 }}
+        animate={{
+          x: [proj.sx - 10, midX - 10, proj.tx - 10],
+          y: [proj.sy - 10, midY - 10, proj.ty - 10],
+          opacity: [0, 1, 1, 0],
+          scale: [0.35, 1, 1, 0.6],
+        }}
+        transition={{
           duration: flightDuration,
-          times: [0, 0.72, 1],
-          ease: diveDown ? [0.22, 0.03, 0.26, 1] : [0.4, 0, 0.2, 1],
-        },
-      }}
-      exit={{ opacity: 0, transition: { duration: 0.18 } }}
-    >
-      <div
-        className={`relative w-[84px] h-[112px] rounded-xl border-2 ${tone.border} ring-2 ${tone.ring} bg-gradient-to-br ${tone.bg} backdrop-blur-sm shadow-[0_8px_32px_rgba(0,0,0,0.55)] flex flex-col items-center justify-center select-none`}
-        style={{ boxShadow: tone.glow }}
+          times: [0, 0.35, 0.88, 1],
+          ease: [0.35, 0, 0.2, 1],
+        }}
       >
-        {/* Glyph: stylized strike emoji + the card id stub in tiny type
-            (no real card art, just a "this came from card X" hint). */}
-        <span
-          className={`text-[42px] leading-none font-black ${tone.text} drop-shadow-[0_2px_6px_rgba(0,0,0,0.6)]`}
-          style={{ textShadow: "0 0 12px rgba(255,255,255,0.5)" }}
-        >
-          {card.power}
-        </span>
-        <span
-          className={`mt-1 text-[7px] font-black uppercase tracking-[0.24em] ${tone.text} opacity-90 max-w-[74px] text-center truncate`}
-        >
-          {card.label}
-        </span>
-        {/* Comet streak behind the card -- a thin gradient that trails
-            outward to fake the motion blur Drei's <Trail> would give
-            us in 3D. Sits underneath the card body via z-[-1]. */}
         <div
-          aria-hidden="true"
-          className="absolute -z-10 inset-0 rounded-xl blur-md"
+          className="rounded-full"
           style={{
-            background:
-              card.attacker === "user"
-                ? "radial-gradient(ellipse, rgba(251,191,36,0.45), transparent 70%)"
-                : "radial-gradient(ellipse, rgba(244,63,94,0.45), transparent 70%)",
+            width: 20,
+            height: 20,
+            background: `radial-gradient(circle, ${elementTone.core} 0%, ${elementTone.trail} 55%, transparent 100%)`,
+            boxShadow: elementTone.glow,
+            filter: "blur(1px)",
           }}
         />
-      </div>
-    </motion.div>
+      </motion.div>
+      <motion.div
+        style={{ position: "absolute", left: 0, top: 0, willChange: "transform" }}
+        initial={{ x: proj.sx, y: proj.sy, opacity: 0 }}
+        animate={{
+          x: [proj.sx, midX, proj.tx],
+          y: [proj.sy, midY, proj.ty],
+          opacity: [0, 0.85, 0],
+        }}
+        transition={{ duration: flightDuration, ease: "easeOut" }}
+      >
+        <div
+          style={{
+            width: Math.max(48, distance * 0.35),
+            height: 4,
+            borderRadius: 9999,
+            background: `linear-gradient(90deg, transparent, ${elementTone.trail}, transparent)`,
+            transform: `rotate(${Math.atan2(dy, dx) * (180 / Math.PI)}deg)`,
+            transformOrigin: "left center",
+          }}
+        />
+      </motion.div>
+    </>
   );
 }
 
@@ -962,9 +1292,11 @@ function HitNumberLayer({ numbers }: { numbers: HitNumber[] }) {
           <motion.div
             key={n.id}
             className={`absolute -translate-x-1/2 -translate-y-1/2 px-2 py-1 rounded-md border text-xs font-black tracking-[0.14em] ${
-              n.defender === "user"
-                ? "bg-rose-500/85 border-rose-200/80 text-rose-50"
-                : "bg-amber-500/85 border-amber-200/80 text-amber-50"
+              n.variant === "sandstorm"
+                ? "bg-orange-600/90 border-orange-200/80 text-orange-50 shadow-[0_0_12px_rgba(251,146,60,0.65)]"
+                : n.defender === "user"
+                  ? "bg-rose-500/85 border-rose-200/80 text-rose-50"
+                  : "bg-amber-500/85 border-amber-200/80 text-amber-50"
             }`}
             style={{ left: n.x, top: n.y }}
             initial={{ y: 0, opacity: 0, scale: 0.72 }}
@@ -972,7 +1304,7 @@ function HitNumberLayer({ numbers }: { numbers: HitNumber[] }) {
             exit={{ y: -68, opacity: 0, scale: 0.82 }}
             transition={{ duration: 0.62, ease: [0.2, 0.82, 0.2, 1] }}
           >
-            -{n.value}
+            {n.label ?? `-${n.value}`}
           </motion.div>
         ))}
       </AnimatePresence>

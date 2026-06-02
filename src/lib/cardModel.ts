@@ -48,8 +48,10 @@ export function shapeToDefaultColor(shape: ShapeType): EdgeColor {
     case "circle":
       return "blue";
     case "star":
+    case "triangle":
       return "purple";
     case "wildcard":
+    case "hexagon":
       return "emerald";
     default:
       return "none";

@@ -12,40 +12,55 @@ import {
   cardHeaderNameClassName,
   cardHeaderPlayerClassName,
   displayValueFor,
-  rarityLabel,
-  RARITY_GRADIENT,
   PLAY_CARD,
 } from '../lib/cardDisplay';
 import { useGameStore, getUiUserSide, isLowLeverageAtBat, ResolutionBeat, RevealBeatAnimation, Phase, BRAWL_SNAP_DURATION_MS as BRAWL_SNAP_DURATION_MS_STORE } from '../lib/gameStore';
 import { HitOutcome, type BrawlOutcomeResolution } from '../lib/scoring';
 import {
-  playBatSuccess,
   playCardPickup,
   playCardSwap,
+  scheduleCardsDealSound,
   playHit,
   playOut,
-  scheduleCardsDealSound,
+  playBatSuccess,
 } from '../lib/gameAudio';
 import { playSfx } from '../lib/sfx';
 import { ConnectHint, ShapeMode, SHAPE_COLORS, SHAPE_DEFAULTS, SHAPE_LABEL, ShapeHalfProps, ShapeType } from './cardShapes';
 import type { EdgeColor } from '../lib/cardModel';
 import { EDGE_COLOR_LABEL, EDGE_COLORS, shapeToDefaultColor } from '../lib/cardModel';
-import { SznEdgeHalf } from './SznEdgeHalf';
-import type { SznEdgeId } from '../lib/sznEdges';
-import { PlayerHero } from './PlayerHero';
-import { ManagerHand } from './ManagerHand';
-import { QuestStrip } from './QuestStrip';
 import {
   BrawlAttackOverlay,
+  BrawlCardCooldownOverlay,
   useBrawlAttackReveal,
+  type BrawlAttackCard,
   type BrawlShakePulse,
+  type CardCooldownPulse,
 } from './brawl/BrawlAttackReveal';
-import { BrawlDraftOverlay } from './brawl/BrawlDraftOverlay';
+import { BrawlSandstormOverlay } from './brawl/BrawlSandstormOverlay';
+import { BrawlBattleResultScreen } from './brawl/BrawlBattleResultScreen';
+import {
+  ELEMENT_LABEL,
+  BRAWL_START_HP,
+  brawlAttackCooldownMs,
+  brawlConnectionBorderTone,
+  maxAffirmedChainLength,
+  type ElementBond,
+} from '../lib/brawlElements';
+import { buildHandAttackGroupsWithAbilities, resolvedSnapDisplayValue } from '../lib/elementAbilities';
+import {
+  computeHandDealCompleteMs,
+  SIGNATURE_DELAY_CHILDREN,
+  SIGNATURE_SETTLE_PAD,
+  SIGNATURE_STAGGER,
+  GENERAL_STAGGER,
+} from '../lib/brawlHandTiming';
+import {
+  BrawlPillFireAnimation,
+  BrawlPillHealAnimation,
+  BrawlPillPoisonAnimation,
+  BrawlPillShieldBorder,
+} from './brawl/BrawlPillEffects';
 import type { BrawlAura } from './brawl/BrawlImpactCanvas';
-import { teamPalette } from '../lib/teamColors';
-import { RARITY_BASE_VALUE } from '../lib/run';
-import { PLAYERS } from '../lib/players';
-import { ALL_SZN_PLAYERS, isSznPlayer } from '../lib/sznPlayers';
 import { useSznGamepad, useGamepadPresent } from '../lib/useSznGamepad';
 
 /**
@@ -298,8 +313,8 @@ export const ShapeHalf = ({
   );
 };
 
-// Exported so the BrawlDraftOverlay can render draft picks in the
-// same visual language as the in-hand cards. The component is large
+// Exported for static card previews that reuse the in-hand visual language.
+// The component is large
 // and mostly hand-specific (drag hints, equipped item slots, reveal
 // highlights), but `readOnly` + neutral connection flags make it
 // safe to mount in a static picker context too.
@@ -317,6 +332,7 @@ export const CardItem = ({
   dragActive = false,
   tutorialRegions = false,
   readOnly = false,
+  snapDisplay,
 }: {
   card: CardDefinition;
   isConnectedLeft: boolean;
@@ -360,6 +376,8 @@ export const CardItem = ({
    * is non-draggable but should still receive hover (ability tooltips).
    */
   readOnly?: boolean;
+  /** Snap-adjusted center value (e.g. Ember worth 2 in a chain). */
+  snapDisplay?: { value: number; boosted: boolean };
 }) => {
   const equippedItemIdsRaw = useGameStore((s) => s.equippedItems[card.id]);
   const equippedItemIds = equippedItemIdsRaw || [];
@@ -375,105 +393,35 @@ export const CardItem = ({
   const isConnectedLeft = dragActive ? false : rawIsConnectedLeft;
   const isConnectedRight = dragActive ? false : rawIsConnectedRight;
   const isConnected = isConnectedLeft || isConnectedRight;
-  // SZN Mode: cards whose abilityType is "Player" represent an MLB player
-  // dropped into the hand strip. They're rendered with team colors, the
-  // tier-based combat value, and no ability tooltip. The id format is
-  // `player:${player.id}` (set by `playerAsCard` in connect.ts).
-  //
-  // The lookup spans BOTH player registries (legacy `PLAYERS` for
-  // Quick-Match / Auction Draft + `ALL_SZN_PLAYERS` for SZN runs). The
-  // previous baseline only checked legacy PLAYERS, so every SZN
-  // player-card landed with `playerForCard = null`, which collapsed
-  // `playerPalette` to null and fell through the team-gradient inline
-  // style -- the card body then rendered fully transparent (no
-  // background class either) and the user saw a colorless, see-through
-  // card during at-bats. Joining both registries restores the team
-  // gradient for every SZN player while still preserving the legacy
-  // path for the non-SZN modes.
-  const isPlayerCard = card.abilityType === 'Player';
-  const playerForCard = isPlayerCard
-    ? (PLAYERS.find((p) => `player:${p.id}` === card.id) ??
-        ALL_SZN_PLAYERS.find((p) => `player:${p.id}` === card.id)) ?? null
-    : null;
-  const playerRarity = useGameStore((s) => {
-    if (!isPlayerCard || !playerForCard || !s.run) return 'common' as const;
-    // Look in both the user's roster and the ghost's roster so the AI
-    // hand also renders with the correct rarity value during a series.
-    const inUser = s.run.roster.find((r) => r.player.id === playerForCard.id);
-    if (inUser) return inUser.rarity;
-    const inGhost = s.run.ghost?.roster.find(
-      (r) => r.player.id === playerForCard.id,
-    );
-    return inGhost?.rarity ?? 'common';
-  });
-  // SZN mode: the legacy `card.player` field on items is real-world
-  // attribution (e.g. "Mike Trout (2024)") that has nothing to do with
-  // the user's signed roster. Hide it on item cards so the only player
-  // names visible in SZN combat are the actual MlbPlayer cards. Player
-  // cards (`isPlayerCard`) skip this branch entirely -- they render
-  // their own portrait + team chrome.
-  const sznMode = useGameStore((s) => s.gameMode === 'szn');
-  // Brawl Mode: replaces the hover-tooltip ability flow with an inline
-  // one-line `brawlTagline` rendered on the card face. The 15s snap
-  // timer leaves no room to hover-read multi-clause descriptions, so we
-  // also skip the tooltip wiring entirely when this is true.
-  const cardBrawlMode = useGameStore((s) => s.gameMode === 'brawl');
-  const hideCardPlayer = sznMode && !isPlayerCard;
-  // Normalized team + role lookup that works for BOTH player types:
-  // SZN players carry `teamId` + `role`, legacy MLB players carry
-  // `team` + `role`. Mirroring `PlayerCard.tsx` here keeps the at-bat
-  // hand visual identical to every other surface that renders a
-  // player.
-  const playerTeamCode = playerForCard
-    ? (isSznPlayer(playerForCard) ? playerForCard.teamId : playerForCard.team)
-    : null;
-  const playerRoleCode: 'Batter' | 'Pitcher' | null = playerForCard
-    ? playerForCard.role
-    : null;
-  // Player card body now reads as RARITY first (mirrors `PlayerCard.tsx`
-  // and `SznCard` so every player-shaped surface in SZN paints with the
-  // same dominant signal). Team is still painted in the top-left team-
-  // code chip below. Falls back to the team gradient only when no
-  // rarity is resolvable -- defensive against external callers that
-  // haven't wired rarity through (legacy MlbPlayer code paths).
-  const rarityPalette = isPlayerCard
-    ? (RARITY_GRADIENT[playerRarity] ?? null)
-    : null;
-  const teamPalette_ = playerTeamCode ? teamPalette(playerTeamCode) : null;
-  const playerPalette = rarityPalette ?? teamPalette_;
-  const playerBaseValue = isPlayerCard ? RARITY_BASE_VALUE[playerRarity] : null;
-  // Player cards: `modifier.value` comes from scoring (includes rarity via
-  // `baseValue` on the SZN player-as-card). When a modifier exists,
-  // `playerBaseValue + playerDelta` equals `modifier.value`.
-  const playerDelta =
-    isPlayerCard && modifier ? modifier.value - card.baseValue : 0;
+  const sznMode = false;
+  const cardBrawlMode = true;
+  const hideCardPlayer = sznMode;
   const cardIsAbility = isAbilityCard(card);
   const cardIsValue = isValueCard(card);
-  // Combat display: player cards use rarity floor + delta; catalog cards
-  // prefer the live scored modifier (same source as the pill chain) and
-  // fall back to the printed face value only when the card isn't in the
-  // active best chain yet.
   const displayValue: number = valueOverride ?? (
-    isPlayerCard && playerBaseValue != null
-      ? playerBaseValue + playerDelta
-      : modifier?.value !== undefined
-        ? modifier.value
+    modifier?.value !== undefined
+      ? modifier.value
+      : snapDisplay?.boosted
+        ? snapDisplay.value
         : displayValueFor(card)
   );
-  const abilityFooterText = cardIsAbility && !isPlayerCard ? abilityFaceText(card) : null;
-  const showCenterNumber = !isPlayerCard && (cardIsValue || cardIsAbility);
+  const snapValueBoosted =
+    valueOverride === undefined &&
+    modifier?.value === undefined &&
+    !!snapDisplay?.boosted;
+  const abilityFooterText = cardIsAbility ? abilityFaceText(card) : null;
+  const showCenterNumber = cardIsValue || cardIsAbility;
   // General Draw value cards take their label color as the body fill.
   // Signature ability cards stay white so the footer description reads
   // clearly against a neutral face.
   const isGeneralDraw = cardIsValue && card.abilityType === 'General Draw';
   const shouldUseCardColorBody = isGeneralDraw && !!card.color;
-  const cardBgClass = isPlayerCard
-    ? (playerPalette ? '' : 'bg-slate-700')
-    : shouldUseCardColorBody ? card.color! : 'bg-white';
-  const defaultValueColor = isPlayerCard
-    ? 'text-white'
-    : shouldUseCardColorBody ? 'text-white' : 'text-slate-800';
-  const valueColorClass = isPlayerCard || shouldUseCardColorBody
+  /** Boosted snap values need high contrast on the default white card face. */
+  const snapBoostOnWhiteFace = snapValueBoosted && !shouldUseCardColorBody;
+  const snapBoostOnColoredFace = snapValueBoosted && shouldUseCardColorBody;
+  const cardBgClass = shouldUseCardColorBody ? card.color! : 'bg-white';
+  const defaultValueColor = shouldUseCardColorBody ? 'text-white' : 'text-slate-800';
+  const valueColorClass = shouldUseCardColorBody
     ? defaultValueColor
     : modifier?.color
       ? TEXT_COLORS[modifier.color] || defaultValueColor
@@ -534,28 +482,56 @@ export const CardItem = ({
   //  - dragActive + isConnected : freeze on the "lit" mid-pulse color so the
   //    card stays visibly connected without strobing every Reorder tick.
   //  - dragActive + !isConnected: static slate border, no shadow drama.
-  //  - no drag                  : the original infinite blue keyframe pulse
-  //    when connected, or the resting card shadow when not.
+  //  - no drag                  : the original infinite keyframe pulse when
+  //    connected, or the resting card shadow when not.
+  // In brawl mode, connected cards pulse in their seam element color.
+  const brawlBorder =
+    cardBrawlMode && isConnected
+      ? brawlConnectionBorderTone(
+          card.leftShape,
+          card.rightShape,
+          isConnectedLeft,
+          isConnectedRight,
+        )
+      : null;
+  const defaultConnectedDrag = {
+    borderColor: '#60a5fa',
+    boxShadow: '0 0 18px rgba(59,130,246,0.55)',
+  };
+  const defaultConnectedPulse = {
+    borderColor: ['#3b82f6', '#60a5fa', '#3b82f6'],
+    boxShadow: [
+      '0 0 15px rgba(59,130,246,0.4)',
+      '0 0 30px rgba(59,130,246,0.8)',
+      '0 0 15px rgba(59,130,246,0.4)',
+    ],
+  };
+  const connectedDrag = brawlBorder
+    ? {
+        borderColor: brawlBorder.rest,
+        boxShadow: `0 0 18px ${brawlBorder.shadowHigh}`,
+      }
+    : defaultConnectedDrag;
+  const connectedPulse = brawlBorder
+    ? {
+        borderColor: [brawlBorder.rest, brawlBorder.pulse, brawlBorder.rest],
+        boxShadow: [
+          `0 0 15px ${brawlBorder.shadowLow}`,
+          `0 0 28px ${brawlBorder.shadowHigh}`,
+          `0 0 15px ${brawlBorder.shadowLow}`,
+        ],
+      }
+    : defaultConnectedPulse;
   const baseAnimate = dragActive
     ? isConnected
-      ? {
-          borderColor: '#60a5fa',
-          boxShadow: '0 0 18px rgba(59,130,246,0.55)',
-        }
+      ? connectedDrag
       : {
           borderColor: '#e2e8f0',
           boxShadow:
             '0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)',
         }
     : isConnected
-    ? {
-        borderColor: ['#3b82f6', '#60a5fa', '#3b82f6'],
-        boxShadow: [
-          '0 0 15px rgba(59,130,246,0.4)',
-          '0 0 30px rgba(59,130,246,0.8)',
-          '0 0 15px rgba(59,130,246,0.4)',
-        ],
-      }
+    ? connectedPulse
     : {
         borderColor: '#e2e8f0',
         boxShadow:
@@ -689,8 +665,8 @@ export const CardItem = ({
         flex flex-col items-center justify-center
         ${readOnly ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'}
       `}
-        onPointerEnter={isPlayerCard || cardIsValue ? undefined : openAbilityHover}
-        onPointerLeave={isPlayerCard || cardIsValue ? undefined : scheduleCloseAbilityHover}
+        onPointerEnter={cardIsValue ? undefined : openAbilityHover}
+        onPointerLeave={cardIsValue ? undefined : scheduleCloseAbilityHover}
         onPointerMove={() => {
           if (!cardIsValue && abilityHoverRef.current) syncAbilityAnchor();
         }}
@@ -699,161 +675,120 @@ export const CardItem = ({
         style={{
           marginLeft: noMargin ? 0 : isConnectedLeft ? `${sz.connectedGap}px` : `${sz.gap}px`,
           marginRight: noMargin ? 0 : isConnectedRight ? `${sz.connectedGap}px` : `${sz.gap}px`,
-          ...(isPlayerCard && playerPalette
-            ? {
-                background: `linear-gradient(160deg, ${playerPalette.primary} 0%, ${playerPalette.secondary} 100%)`,
-              }
-            : {}),
         }}
       >
-        {card.sznLeftEdge ? (
-          <SznEdgeHalf
-            edge={card.sznLeftEdge as SznEdgeId}
-            side="left"
-            isConnected={isConnectedLeft}
-            compact={compact}
-            hint={leftHint}
-            dragActive={dragActive}
-          />
-        ) : (
-          <ShapeHalf
-            shape={card.leftShape}
-            edgeColor={leftEdgeColor}
-            side="left"
-            isConnected={isConnectedLeft}
-            compact={compact}
-            mode={leftMode}
-            colorMode={leftColorMode}
-            hint={leftHint}
-            dragActive={dragActive}
-          />
-        )}
-        {card.sznRightEdge ? (
-          <SznEdgeHalf
-            edge={card.sznRightEdge as SznEdgeId}
-            side="right"
-            isConnected={isConnectedRight}
-            compact={compact}
-            hint={rightHint}
-            dragActive={dragActive}
-          />
-        ) : (
-          <ShapeHalf
-            shape={card.rightShape}
-            edgeColor={rightEdgeColor}
-            side="right"
-            isConnected={isConnectedRight}
-            compact={compact}
-            mode={rightMode}
-            colorMode={rightColorMode}
-            hint={rightHint}
-            dragActive={dragActive}
-          />
-        )}
+        <ShapeHalf
+          shape={card.leftShape}
+          edgeColor={leftEdgeColor}
+          side="left"
+          isConnected={isConnectedLeft}
+          compact={compact}
+          mode={leftMode}
+          colorMode={leftColorMode}
+          hint={leftHint}
+          dragActive={dragActive}
+        />
+        <ShapeHalf
+          shape={card.rightShape}
+          edgeColor={rightEdgeColor}
+          side="right"
+          isConnected={isConnectedRight}
+          compact={compact}
+          mode={rightMode}
+          colorMode={rightColorMode}
+          hint={rightHint}
+          dragActive={dragActive}
+        />
 
-      {isPlayerCard && playerForCard ? (
-        <>
-          {/* Diagonal sheen so the player card reads as a Topps-style card. */}
-          <div
-            aria-hidden
-            className="absolute inset-0 pointer-events-none z-0"
-            style={{
-              background:
-                'linear-gradient(135deg, rgba(255,255,255,0.18) 0%, rgba(255,255,255,0) 35%, rgba(0,0,0,0.18) 100%)',
-            }}
-          />
-          <div
-            className={`absolute ${sz.topPad} left-0 right-0 flex justify-between items-start z-30 px-2`}
-          >
-            <span
-              className={`${sz.playerText} font-black uppercase tracking-widest text-white/90`}
-              style={{ textShadow: '0 1px 2px rgba(0,0,0,0.6)' }}
-            >
-              {playerTeamCode ?? ''}
-            </span>
-            <span
-              className={`${sz.playerText} font-black uppercase tracking-widest bg-black/40 rounded px-1 text-amber-200`}
-            >
-              {rarityLabel(playerRarity)}
-            </span>
+      <div className={`absolute inset-x-0 top-0 z-30 flex flex-col items-center text-center w-full ${cardHeaderClassName(compact, headerOnColoredBody)}`}>
+        {!hideCardPlayer && card.player && (
+          <div className={`w-full ${cardHeaderPlayerClassName(compact, headerOnColoredBody)}`}>
+            {card.player.split(' (')[0]}
           </div>
-          <div className="absolute left-0 right-0 z-30 flex flex-col items-center gap-0.5" style={{ top: '36%' }}>
-            <span
-              className={`${sz.nameText} font-black uppercase tracking-tight text-white leading-tight bg-black/40 rounded px-1.5 py-0.5 max-w-[88%] line-clamp-2 text-center`}
-              style={{ textShadow: '0 1px 1px rgba(0,0,0,0.6)' }}
-            >
-              {card.name}
-            </span>
-            {/* Brawl Mode tagline directly below the player-card name.
-                Both sizes wrap to 2 lines for the same readability
-                reason as the non-player card variant. */}
-            {cardBrawlMode && card.brawlTagline && !cardIsAbility && (
-              <motion.span
-                key={`tagline-${highlightTone ?? 'idle'}`}
-                className={`${compact ? 'text-[7px] leading-[1.1]' : 'text-[9px] leading-[1.15]'} font-bold uppercase tracking-tight text-amber-900 bg-amber-200/95 rounded px-1 py-0.5 max-w-[92%] text-center border border-amber-400/60 shadow-sm line-clamp-2`}
-                animate={
-                  highlightTone === 'source'
-                    ? {
-                        backgroundColor: ['rgba(254,243,199,0.95)', 'rgba(250,204,21,0.98)', 'rgba(254,243,199,0.95)'],
-                        scale: [1, 1.18, 1.06],
-                        x: [0, -2, 2, -1, 1, 0],
-                        boxShadow: [
-                          '0 0 0 0 rgba(250,204,21,0)',
-                          '0 0 14px 4px rgba(250,204,21,0.85)',
-                          '0 0 4px 1px rgba(250,204,21,0.35)',
-                        ],
-                      }
-                    : { scale: 1, x: 0 }
-                }
-                transition={{ duration: 0.5, ease: 'easeOut' }}
-              >
-                {card.brawlTagline}
-              </motion.span>
-            )}
-          </div>
-          {/* "ON DECK" role pill so the user immediately reads the card as
-              their active batter/pitcher and not just a portrait. The text
-              comes straight off the underlying MLB role so a reliever and
-              a starter both surface "PITCHING" -- the seat IS the role. */}
-          <div className="absolute left-1/2 -translate-x-1/2 z-30" style={{ bottom: '20%' }}>
-            <span
-              className="text-[8px] font-black uppercase tracking-[0.2em] bg-emerald-400/90 text-emerald-950 rounded-full px-1.5 py-[1px] shadow-md"
-              style={{ textShadow: 'none' }}
-            >
-              {playerRoleCode === 'Pitcher' ? 'Pitching' : 'Batting'}
-            </span>
-          </div>
-        </>
-      ) : (
-        <div className={`absolute inset-x-0 top-0 z-30 flex flex-col items-center text-center w-full ${cardHeaderClassName(compact, headerOnColoredBody)}`}>
-          {!hideCardPlayer && card.player && (
-            <div className={`w-full ${cardHeaderPlayerClassName(compact, headerOnColoredBody)}`}>
-              {card.player.split(' (')[0]}
-            </div>
-          )}
-          <div className={`w-full ${cardHeaderNameClassName(compact, headerOnColoredBody)}`}>
-            {card.name}
-          </div>
+        )}
+        <div className={`w-full ${cardHeaderNameClassName(compact, headerOnColoredBody)}`}>
+          {card.name}
         </div>
-      )}
+        {cardBrawlMode && card.brawlTagline && !cardIsAbility && (
+          <motion.span
+            key={`tagline-${highlightTone ?? 'idle'}`}
+            className={`mt-0.5 ${compact ? 'text-[7px] leading-[1.1]' : 'text-[9px] leading-[1.15]'} font-bold uppercase tracking-tight text-amber-900 bg-amber-200/95 rounded px-1 py-0.5 max-w-[92%] text-center border border-amber-400/60 shadow-sm line-clamp-2`}
+            animate={
+              highlightTone === 'source'
+                ? {
+                    backgroundColor: ['rgba(254,243,199,0.95)', 'rgba(250,204,21,0.98)', 'rgba(254,243,199,0.95)'],
+                    scale: [1, 1.18, 1.06],
+                    x: [0, -2, 2, -1, 1, 0],
+                    boxShadow: [
+                      '0 0 0 0 rgba(250,204,21,0)',
+                      '0 0 14px 4px rgba(250,204,21,0.85)',
+                      '0 0 4px 1px rgba(250,204,21,0.35)',
+                    ],
+                  }
+                : { scale: 1, x: 0 }
+            }
+            transition={{ duration: 0.5, ease: 'easeOut' }}
+          >
+            {card.brawlTagline}
+          </motion.span>
+        )}
+      </div>
       {showCenterNumber && (
         <motion.div
           data-tutorial={tutorialRegions ? 'card-value' : undefined}
-          key={valueOverride !== undefined ? `override-${valueOverride}` : 'live'}
-          initial={
+          key={
             valueOverride !== undefined
+              ? `override-${valueOverride}`
+              : snapValueBoosted
+                ? `snap-boost-${displayValue}`
+                : 'live'
+          }
+          initial={
+            valueOverride !== undefined || snapValueBoosted
               ? { scale: 1.5, opacity: 0.5 }
               : false
           }
           animate={
-            valueOverride !== undefined
-              ? { scale: 1, opacity: 1 }
-              : undefined
+            snapValueBoosted
+              ? {
+                  scale: [1, 1.14, 1],
+                  opacity: 1,
+                  textShadow: snapBoostOnWhiteFace
+                    ? [
+                        '0 0 10px rgba(245,158,11,0.35)',
+                        '0 0 18px rgba(245,158,11,0.55)',
+                        '0 0 10px rgba(245,158,11,0.35)',
+                      ]
+                    : [
+                        '0 0 10px rgba(251,191,36,0.55)',
+                        '0 0 22px rgba(251,191,36,0.95)',
+                        '0 0 10px rgba(251,191,36,0.55)',
+                      ],
+                }
+              : valueOverride !== undefined
+                ? { scale: 1, opacity: 1 }
+                : undefined
           }
-          transition={{ type: 'spring', stiffness: 300, damping: 15 }}
-          className={`${cardCenterValueClass()} ${sz.valueText} font-black z-20 drop-shadow-sm transition-colors duration-300 ${valueColorClass}`}
+          transition={
+            snapValueBoosted
+              ? { duration: 1.15, repeat: Infinity, ease: 'easeInOut' }
+              : { type: 'spring', stiffness: 300, damping: 15 }
+          }
+          className={`${cardCenterValueClass()} ${sz.valueText} font-black z-20 transition-colors duration-300 ${
+            snapBoostOnWhiteFace
+              ? 'text-amber-950'
+              : snapBoostOnColoredFace
+                ? 'text-amber-100'
+                : `${valueColorClass} drop-shadow-sm`
+          }`}
         >
-          {displayValue}
+          {snapBoostOnWhiteFace ? (
+            <span className="inline-flex items-center justify-center min-w-[1.25em] px-2 py-0.5 rounded-lg bg-amber-100 border-2 border-amber-500/75 shadow-[0_0_16px_rgba(245,158,11,0.4)] tabular-nums">
+              {displayValue}
+            </span>
+          ) : (
+            displayValue
+          )}
         </motion.div>
       )}
       {abilityFooterText && (
@@ -898,12 +833,8 @@ const BRAWL_SNAP_HINT_THRESHOLD_MS = BRAWL_SNAP_DURATION_MS / 3;
 const BRAWL_SNAP_TICK_WINDOW_MS = 10_000;
 
 export const CardGameOverlay = () => {
-  // SZN deck-footer height (the always-visible two-row decks rendered by
-  // `SznFooterDecks` at the App level). Read it from the store so the
-  // user-hand container lifts by exactly the deck's footprint -- the
-  // score pill / lock-in button can never disappear behind the deck.
-  // Stays at 0 outside of SZN so the legacy combat lanes are unaffected.
-  const footerDeckHeight = useGameStore((s) => s.sznFooterHeight);
+  // SZN deck footer is unused in brawl-only mode.
+  const footerDeckHeight = 0;
   const batter = useGameStore((s) => s.batter);
   const pitcher = useGameStore((s) => s.pitcher);
   const batterHand = useGameStore((s) => s.batterHand);
@@ -913,22 +844,18 @@ export const CardGameOverlay = () => {
   const phase = useGameStore((s) => s.phase);
   const lockIn = useGameStore((s) => s.lockIn);
   const startNextAtBat = useGameStore((s) => s.startNextAtBat);
-  const setShowStartScreen = useGameStore((s) => s.setShowStartScreen);
+  const returnToBrawlMenu = useGameStore((s) => s.returnToBrawlMenu);
   // SZN Mode: when the run is active and a series game just finished, the
   // "New Game" button becomes "Continue Run" and reports the result back
   // to the run controller (advances to game 2/3 or ends the series).
-  const sznRunActive = useGameStore((s) => s.gameMode === 'szn' && !!s.run);
-  // Brawl Mode flag. Strips the at-bat down to its core combat loop:
-  // no Manager's Hand, no Quest strip. Lock In carries a 60s countdown
-  // and auto-commits when it hits zero. The opponent's value pill flips
-  // to sit BELOW their cards, and both PlayerHero rails are hidden so
-  // the pills are the canonical HP readouts during the snap.
-  const brawlMode = useGameStore((s) => s.gameMode === 'brawl');
+  const sznRunActive = false;
+  // Brawl Mode flag. Strips the at-bat down to its core combat loop.
+  // Lock In carries a 60s countdown
+  // and auto-commits when it hits zero. HP pills are the canonical readouts.
+  const brawlMode = true;
   // True while the inning-start draft overlay is up. We unmount the
   // lock-in timer in that case so the countdown can't tick down
   // behind the picker -- it re-anchors fresh once the user picks
-  // (see `selectBrawlDraftCard` in gameStore).
-  const brawlDraftActive = useGameStore((s) => s.brawlDraftChoice !== null);
   const run = useGameStore((s) => s.run);
   const reportSeriesGameResult = useGameStore((s) => s.reportSeriesGameResult);
   // Tri-state result for the SZN "Continue Run" handoff: ties cap at one
@@ -952,6 +879,12 @@ export const CardGameOverlay = () => {
   // Null on every non-brawl at-bat; the banner falls back to the
   // standard chain-math copy.
   const lastBrawlResolution = useGameStore((s) => s.lastBrawlResolution);
+  const brawlElementCombat = useGameStore((s) => s.brawlElementCombat);
+  const lastElementBonds = useGameStore((s) => s.lastElementBonds);
+  const lastElementCombatStart = useGameStore((s) => s.lastElementCombatStart);
+  const lastBrawlCombatReport = useGameStore((s) => s.lastBrawlCombatReport);
+  const dismissBrawlBattleReport = useGameStore((s) => s.dismissBrawlBattleReport);
+  const commitElementCombatResult = useGameStore((s) => s.commitElementCombatResult);
   const scoreBatterFn = useGameStore((s) => s.scoreBatter);
   const scorePitcherFn = useGameStore((s) => s.scorePitcher);
   const previewMatchupFn = useGameStore((s) => s.previewMatchup);
@@ -980,7 +913,7 @@ export const CardGameOverlay = () => {
   );
   const brawlStreakBatter = useGameStore((s) => s.brawlStreakBatter);
   const brawlStreakPitcher = useGameStore((s) => s.brawlStreakPitcher);
-  const rallyFireWeeksLeft = useGameStore((s) => s.run?.rallyFireWeeksLeft ?? 0);
+  const rallyFireWeeksLeft = 0;
   // Which seat is the human in this half? When pitching, the bottom strip
   // becomes the pitcher hand (drag, lock-in, status chips on the user's
   // side) and the top strip becomes the AI batter (face-down -> revealed).
@@ -1025,9 +958,9 @@ export const CardGameOverlay = () => {
   // (where `userTeam` is selected) for why this MUST be a useMemo over
   // primitive selections and not a single combined zustand selector.
   const seriesGameResult = useMemo(() => {
-    const userIsAway = userTeam === 'AWAY';
-    const userScore = userIsAway ? awayScore : homeScore;
-    const ghostScore = userIsAway ? homeScore : awayScore;
+    const userIsPlayer = userTeam === 'PLAYER';
+    const userScore = userIsPlayer ? awayScore : homeScore;
+    const ghostScore = userIsPlayer ? homeScore : awayScore;
     let result: 'user' | 'ghost' | 'draw';
     if (userScore > ghostScore) result = 'user';
     else if (ghostScore > userScore) result = 'ghost';
@@ -1041,7 +974,6 @@ export const CardGameOverlay = () => {
   // refreshes against the new layout.
   const affirmedSeams = useGameStore((s) => s.affirmedSeams);
   const brawlOpponentSeams = useGameStore((s) => s.brawlOpponentSeams);
-  const brawlOpponentPlanHand = useGameStore((s) => s.brawlOpponentPlanHand);
   const affirmDraggedCard = useGameStore((s) => s.affirmDraggedCard);
   // Bag <-> hand recall. The footer rail's CROSS / mouse-click already
   // wires the deal direction (bag -> hand); the in-hand controller
@@ -1094,7 +1026,7 @@ export const CardGameOverlay = () => {
 
   // Non-SZN post-at-bat CTA controller binding. CROSS advances:
   //   - between-at-bats   -> startNextAtBat
-  //   - game-over non-SZN -> setShowStartScreen(true) (back to lanes)
+  //   - game-over -> returnToBrawlMenu (fresh brawl)
   // SZN runs go through the unified priority-60 handler below (which
   // also drives hand-surface focus during the resolved phase). Keeping
   // this one alive for non-SZN lanes preserves the Quick Match / Draft
@@ -1102,19 +1034,24 @@ export const CardGameOverlay = () => {
   useSznGamepad({
     id: 'card-game-overlay-cta',
     priority: 10,
-    enabled: isResolved && !sznRunActive,
+    enabled: isResolved && !sznRunActive && !lastBrawlCombatReport,
     handler: (btn) => {
       if (btn !== 'CROSS') return;
       if (phase === 'between-at-bats') {
         startNextAtBat();
       } else if (phase === 'game-over') {
-        setShowStartScreen(true);
+        returnToBrawlMenu();
       }
     },
   });
   /** Opponent total stays hidden only while hands are still locked (selection). During
    *  `revealing`, both pills follow the beat-by-beat orchestrator; after that, finals. */
   const hideOpponentTotals = isSelecting;
+  /** Brawl: CPU pill + hand stay hidden until Player 1 locks in. */
+  const hideCpuUi = brawlMode && isSelecting;
+  const showOpponentPill = !hideCpuUi;
+  /** CPU strip + pill use the same footprint as Player 1's hand in brawl. */
+  const opponentUiCompact = !brawlMode;
 
   // Decide which per-card modifier set the strips render against. While the
   // player is selecting we want LIVE previews so the numbers update as cards
@@ -1183,117 +1120,111 @@ export const CardGameOverlay = () => {
   // resolveBrawlOutcome uses to pick single / double / triple / HR /
   // grand slam. Scaling guarantees the visual depletion lands on the
   // exact value the at-bat ladder is judged against.
-  const brawlAttackers = useMemo(() => {
-    if (!brawlMode) return { batter: [], pitcher: [] };
-    const buildSide = (
-      hand: typeof batterHand,
-      cardMods: Record<string, { value: number }>,
-      sideTotal: number,
-    ) => {
-      // Only include cards that actually SCORED into a group on this
-      // at-bat. `scoreGroup` only writes a `cardModifiers` entry when
-      // it processes a card inside a group; singletons / unconnected
-      // cards never land in the map. Those cards didn't contribute to
-      // the pill total and so they shouldn't launch a projectile here
-      // -- otherwise an unsnapped card would visibly attack and look
-      // like it dealt phantom damage. Cards with a 0 modifier value
-      // (chain-too-short, fully debuffed) are also filtered so the
-      // reveal doesn't fire empty ghosts.
-      const raw = hand
-        .filter((c) => {
-          const mod = cardMods[c.id];
-          return mod !== undefined && Math.max(0, Math.round(mod.value)) > 0;
-        })
-        .map((c) => ({
-          id: c.id,
-          power: Math.max(0, Math.round(cardMods[c.id].value)),
-          label: c.name ?? c.id,
-        }));
-      const target = Math.max(0, Math.round(sideTotal));
-      if (target === 0) return [];
-      if (raw.length === 0) {
-        // Side has HP but no per-card modifier entries (aggregate-only
-        // bonuses). Still animate every hand card so the opponent's
-        // projectiles visibly fly on phase 2.
-        if (hand.length === 0) return [];
-        const base = Math.floor(target / hand.length);
-        const remainder = target - base * hand.length;
-        return hand.map((c, i) => ({
-          id: c.id,
-          power: base + (i === hand.length - 1 ? remainder : 0),
-          label: c.name ?? c.id,
-        }));
-      }
-      const rawSum = raw.reduce((s, c) => s + c.power, 0);
-      // Defensive: if every contributing card somehow rounds to 0
-      // (target > 0 but rawSum === 0), distribute the target evenly so
-      // the bar still drains visibly.
-      if (rawSum === 0) {
-        const base = Math.floor(target / raw.length);
-        const remainder = target - base * raw.length;
-        return raw.map((c, i) => ({
-          ...c,
-          power: base + (i === raw.length - 1 ? remainder : 0),
-        }));
-      }
-      // Common path: scale proportionally so sum === target. Cards
-      // that contributed more to the raw chain hit harder; the relative
-      // weighting is preserved.
-      const scaled = raw.map((c) => ({
-        ...c,
-        power: Math.max(0, Math.round((c.power * target) / rawSum)),
-      }));
-      // Push any rounding residual into the highest-damage card so the
-      // sum lands exactly on `target`. We pick the heaviest card (not
-      // just the last) so the "finishing blow" feels like a heavyweight
-      // landed it rather than a chip card silently absorbing slack.
-      let residual = target - scaled.reduce((s, c) => s + c.power, 0);
-      if (residual !== 0) {
-        let idx = 0;
-        for (let i = 1; i < scaled.length; i++) {
-          if (scaled[i].power > scaled[idx].power) idx = i;
-        }
-        scaled[idx] = {
-          ...scaled[idx],
-          power: Math.max(0, scaled[idx].power + residual),
-        };
-      }
-      return scaled;
-    };
+  const brawlAttackGroups = useMemo(() => {
+    if (!brawlMode || !lastElementBonds) {
+      return { batter: [] as BrawlAttackCard[][], pitcher: [] as BrawlAttackCard[][] };
+    }
+    const userHand = userIsBatting ? batterHand : pitcherHand;
+    const oppHand = userIsBatting ? pitcherHand : batterHand;
+    const userGroups = buildHandAttackGroupsWithAbilities(
+      userHand,
+      lastElementBonds.user,
+      affirmedSeams,
+    );
+    const oppGroups = buildHandAttackGroupsWithAbilities(
+      oppHand,
+      lastElementBonds.opponent,
+      brawlOpponentSeams,
+    );
+    return userIsBatting
+      ? { batter: userGroups, pitcher: oppGroups }
+      : { batter: oppGroups, pitcher: userGroups };
+  }, [
+    brawlMode,
+    lastElementBonds,
+    userIsBatting,
+    batterHand,
+    pitcherHand,
+    affirmedSeams,
+    brawlOpponentSeams,
+  ]);
+
+  const brawlAttackCooldowns = useMemo(() => {
+    if (!brawlMode) return { user: 5000, opponent: 5000 };
+    const userHandLocal = userIsBatting ? batterHand : pitcherHand;
+    const oppHandLocal = userIsBatting ? pitcherHand : batterHand;
+    const userChain = maxAffirmedChainLength(userHandLocal, affirmedSeams);
+    const oppChain = maxAffirmedChainLength(oppHandLocal, brawlOpponentSeams);
     return {
-      batter: buildSide(batterHand, lastBatterCardModifiers, lastBatterScore),
-      pitcher: buildSide(pitcherHand, lastPitcherCardModifiers, lastPitcherScore),
+      user: brawlAttackCooldownMs(userChain),
+      opponent: brawlAttackCooldownMs(oppChain),
     };
   }, [
     brawlMode,
+    userIsBatting,
     batterHand,
     pitcherHand,
-    lastBatterCardModifiers,
-    lastPitcherCardModifiers,
-    lastBatterScore,
-    lastPitcherScore,
+    affirmedSeams,
+    brawlOpponentSeams,
   ]);
+
+  const elementAtBatPlan = useMemo(() => {
+    if (!brawlMode || !lastElementBonds || !lastElementCombatStart) return null;
+    const start = {
+      playerHP: lastElementCombatStart.playerHP,
+      cpuHP: lastElementCombatStart.cpuHP,
+      burnOnPlayer: 0,
+      poisonOnPlayer: 0,
+      burnOnCpu: 0,
+      poisonOnCpu: 0,
+      shieldOnPlayer: 0,
+      shieldOnCpu: 0,
+      freezeOnPlayer: 0,
+      freezeOnCpu: 0,
+    };
+    return { start };
+  }, [brawlMode, lastElementBonds, lastElementCombatStart]);
+
+  const brawlRevealStartHp = useMemo(() => {
+    const player =
+      lastElementCombatStart?.playerHP ?? brawlElementCombat.playerHP;
+    const cpu = lastElementCombatStart?.cpuHP ?? brawlElementCombat.cpuHP;
+    return userIsBatting
+      ? { batter: player, pitcher: cpu }
+      : { batter: cpu, pitcher: player };
+  }, [
+    lastElementCombatStart,
+    brawlElementCombat,
+    userIsBatting,
+  ]);
+
+  // Element brawl uses projectiles — don't block the attack phase on the
+  // opponent hand deal-in animation (the CPU strip was hidden until lock-in).
+  const brawlOpponentRevealDelayMs = 0;
 
   const brawlReveal = useBrawlAttackReveal({
     enabled: brawlMode && phase === 'revealing',
-    batterAttackers: brawlAttackers.batter,
-    pitcherAttackers: brawlAttackers.pitcher,
-    batterHP: lastBatterScore,
-    pitcherHP: lastPitcherScore,
+    elementMode: true,
+    elementCombatStart: elementAtBatPlan?.start,
+    userAttackCooldownMs: brawlAttackCooldowns.user,
+    opponentAttackCooldownMs: brawlAttackCooldowns.opponent,
+    batterAttackGroups: brawlAttackGroups.batter,
+    pitcherAttackGroups: brawlAttackGroups.pitcher,
+    batterHP: brawlRevealStartHp.batter,
+    pitcherHP: brawlRevealStartHp.pitcher,
     userIsBatting,
-    grandSlam: lastBrawlResolution?.grandSlam === true,
-    opponentHandLength: (userIsBatting ? pitcherHand : batterHand).length,
+    grandSlam: false,
+    opponentRevealDelayMs: brawlOpponentRevealDelayMs,
     onComplete: completeReveal,
+    onCombatResolved: (combat, report) => {
+      commitElementCombatResult(combat, report);
+    },
     onImpact: (power, grand) => {
-      // Scope shake to the brawl overlay and scale by impact power so
-      // big swings read heavier than chip hits.
       setBrawlShake((prev) => ({
         id: prev.id + 1,
         power,
         grand,
       }));
-      // Impact thud sfx: short, low, punchy. Plays once per attack
-      // beat so the cascade of cards reads as a steady percussion line.
       playHit();
     },
     // runId pins the timeline to the current at-bat -- two sequential
@@ -1345,8 +1276,8 @@ export const CardGameOverlay = () => {
   // attack sequence completes. After resolve, pills show post-combat
   // remaining HP (the shield depleted), not the pre-attack starting totals.
   const batterDisplayValue = isResolved
-    ? brawlMode && lastBrawlResolution
-      ? lastBrawlResolution.batterRemainingHP
+    ? brawlMode
+      ? lastBatterScore
       : lastBatterScore
     : isRevealing
       ? brawlMode
@@ -1354,8 +1285,8 @@ export const CardGameOverlay = () => {
         : reveal.displayedBatter
       : matchup.batterDisplay;
   const pitcherDisplayValue = isResolved
-    ? brawlMode && lastBrawlResolution
-      ? lastBrawlResolution.pitcherRemainingHP
+    ? brawlMode
+      ? lastPitcherScore
       : lastPitcherScore
     : isRevealing
       ? brawlMode
@@ -1412,47 +1343,75 @@ export const CardGameOverlay = () => {
   // tracks the live preview (full). During reveal it drains against the
   // locked-in shield. After the result it stays visible showing
   // remaining HP vs the starting shield max.
-  const userBrawlHpMax =
-    !brawlMode
-      ? null
-      : isSelecting
-        ? Math.max(1, userPillDisplay ?? 0)
-        : lastBrawlResolution
-          ? userIsBatting
-            ? lastBrawlResolution.batterStartingHP
-            : lastBrawlResolution.pitcherStartingHP
-          : isRevealing
-            ? userIsBatting
-              ? lastBatterScore
-              : lastPitcherScore
-            : Math.max(1, userPillDisplay ?? 0);
+  const userBrawlHpMax = brawlMode ? BRAWL_START_HP : null;
   const opponentBrawlHpMax =
     !brawlMode
       ? null
-      : isSelecting && hideOpponentTotals
+      : hideCpuUi || (isSelecting && hideOpponentTotals)
         ? null
-        : isSelecting
-          ? Math.max(1, aiPillDisplay ?? 0)
-          : lastBrawlResolution
-            ? userIsBatting
-              ? lastBrawlResolution.pitcherStartingHP
-              : lastBrawlResolution.batterStartingHP
-            : isRevealing
-              ? userIsBatting
-                ? lastPitcherScore
-                : lastBatterScore
-              : Math.max(1, aiPillDisplay ?? 0);
+        : BRAWL_START_HP;
   const userBrawlHpFill = brawlMode && userBrawlHpMax != null;
   const opponentBrawlHpFill = brawlMode && opponentBrawlHpMax != null;
-  const userLabel = userIsBatting ? 'Batter' : 'Pitcher';
-  const aiLabel = userIsBatting ? 'Pitcher' : 'Batter';
+  const userShieldDisplay =
+    brawlMode && isRevealing
+      ? userIsBatting
+        ? brawlReveal.displayedBatterShield
+        : brawlReveal.displayedPitcherShield
+      : 0;
+  const aiShieldDisplay =
+    brawlMode && isRevealing
+      ? userIsBatting
+        ? brawlReveal.displayedPitcherShield
+        : brawlReveal.displayedBatterShield
+      : 0;
+  const userBurnDisplay =
+    brawlMode && isRevealing
+      ? userIsBatting
+        ? brawlReveal.displayedBatterBurn
+        : brawlReveal.displayedPitcherBurn
+      : 0;
+  const aiBurnDisplay =
+    brawlMode && isRevealing
+      ? userIsBatting
+        ? brawlReveal.displayedPitcherBurn
+        : brawlReveal.displayedBatterBurn
+      : 0;
+  const userPoisonDisplay =
+    brawlMode && isRevealing
+      ? userIsBatting
+        ? brawlReveal.displayedBatterPoison
+        : brawlReveal.displayedPitcherPoison
+      : 0;
+  const aiPoisonDisplay =
+    brawlMode && isRevealing
+      ? userIsBatting
+        ? brawlReveal.displayedPitcherPoison
+        : brawlReveal.displayedBatterPoison
+      : 0;
+  const userHealPulse =
+    brawlMode && isRevealing
+      ? userIsBatting
+        ? brawlReveal.displayedBatterHealPulse
+        : brawlReveal.displayedPitcherHealPulse
+      : 0;
+  const aiHealPulse =
+    brawlMode && isRevealing
+      ? userIsBatting
+        ? brawlReveal.displayedPitcherHealPulse
+        : brawlReveal.displayedBatterHealPulse
+      : 0;
+  const brawlHpInstant = brawlMode && isRevealing;
+  const userLabel = 'Player 1';
+  const brawlCardCooldowns =
+    brawlMode && isRevealing ? brawlReveal.cardCooldowns : undefined;
+  const aiLabel = 'CPU';
   const userTone = userIsBatting ? 'batter' : 'pitcher';
   const aiTone = userIsBatting ? 'pitcher' : 'batter';
 
   // Brawl selection: the pill shows one green HP total (chain + bonuses
   // already folded into `previewMatchup`, no separate "+N" suffix).
   const userPillHighlight = brawlMode && isSelecting;
-  const aiPillHighlight = brawlMode && isSelecting && !hideOpponentTotals;
+  const aiPillHighlight = brawlMode && isSelecting && !hideOpponentTotals && showOpponentPill;
 
   // Set of cardIds in the user's hand that have an unresolved player-choice
   // prompt. The HandStrip uses this to render the "USE" pill on the
@@ -1590,7 +1549,7 @@ export const CardGameOverlay = () => {
       return;
     }
     if (phase === 'game-over') {
-      setShowStartScreen(true);
+      returnToBrawlMenu();
     }
   }, [
     phase,
@@ -1598,7 +1557,7 @@ export const CardGameOverlay = () => {
     startNextAtBat,
     reportSeriesGameResult,
     seriesGameResult,
-    setShowStartScreen,
+    returnToBrawlMenu,
   ]);
 
   // Unified in-game handler. Sits ABOVE the SznFooterDecks router
@@ -1805,228 +1764,12 @@ export const CardGameOverlay = () => {
   // controller affordance.
   const gamepadPresent = useGamepadPresent();
   const screenCtaFocused =
-    (sznRunActive || brawlMode) &&
     gamepadPresent &&
     sznGamepadFocus === 'screen' &&
     isSelecting;
 
-  // ---- Quick Resolve auto-chain --------------------------------------------
-  // Cheap recompute on every render -- the helper is a few branches over
-  // primitive store fields, so a memo would cost more than it saves.
-  const isLowLeverage = isLowLeverageAtBat({
-    gameMode,
-    run,
-    phase,
-    inning,
-    totalInnings,
-    half,
-    outs,
-    bases,
-    homeScore,
-    awayScore,
-    userTeam,
-    pendingChoices,
-    activeChoiceCardId,
-    tutorialActive,
-  });
-  // "Resolve Inning" one-shot burst: when the player clicked the
-  // Resolve Inning button this inning, treat every at-bat as low-
-  // leverage until the inning ticks. Pairs with `quickResolveEnabled`
-  // -- the burst doesn't require Quick Resolve to be ON, it acts as
-  // its own one-inning override of the leverage gate.
-  const resolveInningArmed =
-    resolveInningTarget !== null && resolveInningTarget === inning;
-  const effectiveLowLeverage = isLowLeverage || resolveInningArmed;
-  // Surface the auto-pilot state to the toggle UI so the player can see
-  // at a glance whether the toggle is "armed and waiting" (on but the
-  // current spot is high-leverage) vs "actively driving" (on AND
-  // currently auto-running the chain).
-  const quickResolveActive =
-    (quickResolveEnabled && isLowLeverage) || resolveInningArmed;
-  // Latch the toggle-on moment so we ONLY auto-resolve at-bats that the
-  // player explicitly opted into via the toggle. Without this, flipping
-  // the toggle ON during a between-at-bats pause would immediately fire
-  // startNextAtBat() under the player's finger before they could read
-  // the result of the at-bat that just finished. The latch arms once
-  // both conditions hold (toggle on AND we're in `selecting` phase) and
-  // disarms whenever the toggle goes off.
-  const autoChainArmedRef = useRef(false);
-  useEffect(() => {
-    if (!quickResolveEnabled && !resolveInningArmed) {
-      autoChainArmedRef.current = false;
-      return;
-    }
-    if (phase === 'selecting' && effectiveLowLeverage) {
-      autoChainArmedRef.current = true;
-    }
-  }, [quickResolveEnabled, resolveInningArmed, phase, effectiveLowLeverage]);
-  // The actual auto-advance driver. Fires whenever phase / leverage
-  // changes; each transition along the chain re-triggers the effect
-  // with fresh state, so the chain "walks itself" through the
-  // selecting -> revealing -> between-at-bats loop with no manual
-  // sequencing. completeReveal/startNextAtBat are both idempotent
-  // outside their valid phase, so a stale fire is a safe no-op.
-  useEffect(() => {
-    if (!quickResolveEnabled && !resolveInningArmed) return;
-    if (tutorialActive) return;
-    if (!autoChainArmedRef.current) return;
-    if (phase === 'selecting') {
-      if (!effectiveLowLeverage) return; // leverage spiked; hand control back
-      // Defer one tick so any in-flight render (USE prompt, dealing
-      // animation) commits first, and so React's strict-mode double
-      // invoke can't drive two simultaneous lockIns.
-      const t = setTimeout(() => {
-        const s = useGameStore.getState();
-        if (s.phase !== 'selecting') return;
-        if (s.gameMode === 'brawl' && s.brawlDraftChoice !== null) return;
-        const burstArmed =
-          s.resolveInningTarget !== null && s.resolveInningTarget === s.inning;
-        if (!s.quickResolveEnabled && !burstArmed) return;
-        if (s.activeChoiceCardId !== null) return;
-        if (s.pendingChoices.length > 0) return;
-        s.lockIn();
-      }, 60);
-      return () => clearTimeout(t);
-    }
-    if (phase === 'revealing') {
-      // Skip the ~2s+ reveal orchestrator entirely. The outcome math
-      // has already been applied to inning/outs/bases/scores inside
-      // lockIn, so completeReveal just flips the phase forward.
-      const t = setTimeout(() => {
-        const s = useGameStore.getState();
-        if (s.phase !== 'revealing') return;
-        const burstArmed =
-          s.resolveInningTarget !== null && s.resolveInningTarget === s.inning;
-        if (!s.quickResolveEnabled && !burstArmed) return;
-        s.completeReveal();
-      }, 80);
-      return () => clearTimeout(t);
-    }
-    if (phase === 'between-at-bats') {
-      // Quick "tap the result and roll" pause -- long enough for the
-      // user to glance at the new score, short enough that auto-pilot
-      // still feels like auto-pilot.
-      const t = setTimeout(() => {
-        const s = useGameStore.getState();
-        if (s.phase !== 'between-at-bats') return;
-        const burstArmed =
-          s.resolveInningTarget !== null && s.resolveInningTarget === s.inning;
-        if (!s.quickResolveEnabled && !burstArmed) return;
-        s.startNextAtBat();
-      }, 320);
-      return () => clearTimeout(t);
-    }
-    if (phase === 'game-over') {
-      // Game ended mid auto-chain; disarm so the player gets manual
-      // control over the Continue Run CTA.
-      autoChainArmedRef.current = false;
-    }
-  }, [
-    quickResolveEnabled,
-    resolveInningArmed,
-    effectiveLowLeverage,
-    phase,
-    tutorialActive,
-    // Re-running the effect when these change is safe (idempotent
-    // calls inside) and keeps the chain reactive to mid-resolve
-    // mutations like a new pendingChoice popping during reveal.
-    activeChoiceCardId,
-    pendingChoices,
-    atBatId,
-  ]);
-  // --------------------------------------------------------------------------
-
   return (
     <>
-      {/* Big dramatic outcome banner -- pops over the field for a beat after
-          the reveal sequence resolves. Adds the "punchy moment" the playtest
-          report flagged as missing: a strikeout/home run currently shrinks
-          to a tiny chip on the score pill, which makes hits feel anticlimactic
-          even when the engine has done all the work. Self-dismisses after
-          ~1.6s so the player can immediately read the matchup and tap Next. */}
-      <HitResultBanner
-        outcome={lastOutcome}
-        phase={phase}
-        atBatId={atBatId}
-        resolveLog={lastResolveLog}
-        batterTotal={lastRevealMathSnapshot?.batter.total ?? null}
-        pitcherTotal={lastRevealMathSnapshot?.pitcher.total ?? null}
-        batterName={batter?.name ?? null}
-        pitcherName={pitcher?.name ?? null}
-        userIsBatting={userIsBatting}
-        brawlResolution={lastBrawlResolution}
-      />
-
-      {!brawlMode && <QuestStrip />}
-
-      {/* Brawl Mode owns its own reveal spotlight via the BrawlAttackOverlay
-          mounted at the end of this file -- the per-beat highlight ring
-          is the wrong vocabulary for "cards smash into HP pill" so we
-          suppress it whenever the brawl reveal is active. */}
-      {!brawlMode && (
-        <RevealBeatSpotlight
-          active={isRevealing}
-          spotlight={reveal.revealSpotlight}
-          batterCardIds={batterCardIds}
-          batterModifiers={batterModifiersForStrip}
-          pitcherModifiers={pitcherModifiersForStrip}
-          batterOverrides={reveal.batterValueOverrides}
-          pitcherOverrides={reveal.pitcherValueOverrides}
-        />
-      )}
-
-      {/* Card-vs-card attack & floating-counter overlay. Lives beside the
-          spotlight so the spotlight's stage-center caption + the attack
-          layer's lane-anchored animations coexist without fighting for
-          the same DOM rect. The overlay self-gates on `isRevealing`, so
-          it's a true no-op during selection / between-at-bats. */}
-      <RevealAttackOverlay active={isRevealing} currentAnimation={reveal.currentAnimation} />
-
-      {/* Brawl: half-inning summary flashcard. Fades in during the
-          2.1s side-switch window (`between-at-bats` after a half flip)
-          and reads the snapshotted highlights from the just-completed
-          half (W/L vs the AI, longest chain forged, peak hit). Cleared
-          on `startNextAtBat`. Self-gates so non-brawl modes never see it. */}
-      <BrawlInningSummaryOverlay />
-
-      {/* Brawl: inning-2 / inning-3 draft picker ("Bathroom Break" /
-          "Home Stretch"). Self-gates on `brawlDraftChoice`. */}
-      <BrawlDraftOverlay />
-
-      {/* Player hero rail: top slot = opponent (fog `?` only during selection),
-          bottom = you (live total once that side has a committed layout). Pairs
-          with your hand at the bottom whether you bat or pitch.
-          Brawl Mode strips BOTH rails -- the HP pills above/below the cards
-          are the canonical reads for that lane, and a side-rail hero would
-          just duplicate the matchup total beside the pill. */}
-      {!brawlMode && (
-        <div className="hidden md:block pointer-events-none absolute left-8 top-32 z-20">
-          <PlayerHero
-            player={userIsBatting ? pitcher : batter}
-            value={hideOpponentTotals ? null : aiPillValue}
-            role={userIsBatting ? 'PITCHER' : 'BATTER'}
-            dimmed={hideOpponentTotals}
-            showTotalBesideCard={false}
-          />
-        </div>
-      )}
-      {/* SZN Mode: the user's player already shows as a card in the
-          bottom hand strip, so the left-rail hero would just duplicate
-          the same identity (same name, same team colors). Suppress it
-          for SZN runs to keep the player rail clean; non-SZN lanes keep
-          the hero rail because their hand is dealt cards (no player).
-          Brawl Mode also bows out -- the user's pill is the HP readout. */}
-      {!sznRunActive && !brawlMode && (
-        <div className="hidden md:block pointer-events-none absolute left-8 bottom-32 z-20">
-          <PlayerHero
-            player={userIsBatting ? batter : pitcher}
-            value={userPillValue}
-            role={userIsBatting ? 'BATTER' : 'PITCHER'}
-            dimmed={false}
-          />
-        </div>
-      )}
-
       {/* AI hand - top of screen. Face-down during selection regardless of
           whether the AI is playing batter or pitcher this half (same
           fog-of-war either direction).
@@ -2055,42 +1798,50 @@ export const CardGameOverlay = () => {
             data-brawl-pill-seat={userIsBatting ? 'pitcher' : 'batter'}
             className="flex flex-col items-center gap-1"
           >
-            <ScorePill
-              label={aiLabel}
-              tone={aiTone}
-              value={hideOpponentTotals ? null : aiPillDisplay}
-              outcomeStyle={outcomeBadgeStyle}
-              compact
-              banner={hideOpponentTotals ? null : aiBanner}
-              heroHasValue={false}
-              highlightValue={aiPillHighlight}
-              brawlHpMax={opponentBrawlHpMax}
-              brawlHpSide="opponent"
-              brawlHpFill={opponentBrawlHpFill}
-            />
+            <AnimatePresence>
+              {showOpponentPill && (
+                <motion.div
+                  key={`cpu-pill-${atBatId}`}
+                  initial={{ opacity: 0, scale: 0.92, y: -8 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.96, y: -6 }}
+                  transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
+                >
+                  <ScorePill
+                    label={aiLabel}
+                    tone={aiTone}
+                    value={hideOpponentTotals ? null : aiPillDisplay}
+                    outcomeStyle={outcomeBadgeStyle}
+                    compact={opponentUiCompact}
+                    banner={hideOpponentTotals ? null : aiBanner}
+                    highlightValue={aiPillHighlight}
+                    brawlHpMax={opponentBrawlHpMax}
+                    brawlHpSide="opponent"
+                    brawlHpFill={opponentBrawlHpFill}
+                    brawlShield={aiShieldDisplay}
+                    brawlBurn={aiBurnDisplay}
+                    brawlPoison={aiPoisonDisplay}
+                    brawlHealPulse={aiHealPulse}
+                    brawlHpInstant={brawlHpInstant}
+                  />
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
           <div data-tutorial="opponent-hand" data-brawl-hand="opponent">
-            {brawlMode && isSelecting && !brawlDraftActive ? (
-              <BrawlOpponentArrangeStrip
-                dealtHand={aiHand}
-                planHand={
-                  brawlOpponentPlanHand.length > 0 ? brawlOpponentPlanHand : aiHand
-                }
-                planSeams={brawlOpponentSeams}
-                modifiers={aiModifiers}
-                atBatId={atBatId}
-                compact
-              />
-            ) : brawlMode && isSelecting && brawlDraftActive ? null : (
+            {hideCpuUi ? (
+              <BrawlHiddenOpponentHandSlot compact={opponentUiCompact} />
+            ) : (
               <FlipPitcherStrip
                 hand={aiHand}
                 modifiers={aiModifiers}
-                revealed={!isSelecting}
+                revealed={brawlMode || !isSelecting}
                 atBatId={atBatId}
-                compact
+                compact={opponentUiCompact}
                 valueOverrides={aiValueOverrides}
                 highlightTones={aiHighlights}
                 affirmedSeams={brawlMode ? brawlOpponentSeams : undefined}
+                cardCooldowns={brawlCardCooldowns}
               />
             )}
           </div>
@@ -2130,11 +1881,15 @@ export const CardGameOverlay = () => {
               outcomeStyle={outcomeBadgeStyle}
               atBatId={atBatId}
               banner={userBanner}
-              heroHasValue={!sznRunActive && !brawlMode}
               highlightValue={userPillHighlight}
               brawlHpMax={userBrawlHpMax}
               brawlHpSide="user"
               brawlHpFill={userBrawlHpFill}
+              brawlShield={userShieldDisplay}
+              brawlBurn={userBurnDisplay}
+              brawlPoison={userPoisonDisplay}
+              brawlHealPulse={userHealPulse}
+              brawlHpInstant={brawlHpInstant}
             />
           </div>
 
@@ -2146,7 +1901,7 @@ export const CardGameOverlay = () => {
               effects. Only renders during selection AND only when the user
               is the batter (otherwise we'd be telling the user about
               effects they themselves dealt to the AI). */}
-          {userIsBatting && (
+          {userIsBatting && !brawlMode && (
             <BatterStatusStrip
               batterHand={batterHand}
               pitcherHand={pitcherHand}
@@ -2155,7 +1910,7 @@ export const CardGameOverlay = () => {
             />
           )}
 
-          {brawlMode && isSelecting && !brawlDraftActive && (
+          {brawlMode && isSelecting && (
             <BrawlSnapAttackHint
               remainingMs={brawlSnapRemainingMs}
               hasSnapChain={userHasSnapChain}
@@ -2163,7 +1918,6 @@ export const CardGameOverlay = () => {
           )}
 
           <div data-tutorial="user-hand" data-brawl-hand="user">
-            {!(brawlMode && brawlDraftActive) && (
             <HandStrip
               hand={userHand}
               onReorder={reorderUser}
@@ -2173,6 +1927,7 @@ export const CardGameOverlay = () => {
               direction="bottom"
               valueOverrides={userValueOverrides}
               highlightTones={userHighlights}
+              cardCooldowns={brawlCardCooldowns}
               // Manual-connection mechanic: only seams the player has dragged
               // into place chain. We pass affirmedSeams in EVERY phase so the
               // visible chain art always matches what the engine actually
@@ -2211,7 +1966,6 @@ export const CardGameOverlay = () => {
               }
               enableBrawlHandSfx={brawlMode && isSelecting}
             />
-            )}
           </div>
 
           <AnimatePresence mode="wait">
@@ -2223,98 +1977,16 @@ export const CardGameOverlay = () => {
                 exit={{ opacity: 0, y: 10 }}
                 className="flex flex-col items-center gap-2"
               >
-                {brawlMode ? (
-                  // Brawl Lock In embeds the countdown inside the commit
-                  // button. Tap early or let it hit zero — both fire
-                  // lockIn. Unmount while the inning-start draft is up so
-                  // the 60s window re-anchors once the user picks.
-                  brawlDraftActive ? null : (
-                    <BrawlLockInButton
-                      phase={phase}
-                      atBatId={atBatId}
-                      onLockIn={lockIn}
-                      onRemainingMsChange={setBrawlSnapRemainingMs}
-                      focused={screenCtaFocused}
-                    />
-                  )
-                ) : (
-                  <CtaButton
-                    data-tutorial="lock-in"
-                    onClick={lockIn}
-                    focused={screenCtaFocused}
-                    tone="blue"
-                    size="lg"
-                  >
-                    Lock In
-                  </CtaButton>
-                )}
-                {sznRunActive && !tutorialActive && !brawlMode && (
-                  <div className="flex flex-wrap items-center justify-center gap-2">
-                    <QuickResolveToggle
-                      enabled={quickResolveEnabled}
-                      active={quickResolveActive}
-                      onChange={setQuickResolveEnabled}
-                    />
-                    {/* One-shot "Resolve Inning" burst -- bypasses the
-                        leverage gate for this inning only. Useful in
-                        blowouts where Quick Resolve's leverage check
-                        is being too conservative (e.g. RISP with a
-                        12-run lead). Highlights when armed so the
-                        user knows the burst is active. */}
-                    <button
-                      type="button"
-                      onClick={requestResolveInning}
-                      disabled={resolveInningArmed}
-                      title={
-                        resolveInningArmed
-                          ? 'Resolve Inning is armed — auto-resolving every at-bat this inning.'
-                          : 'Burn through the rest of THIS inning with no leverage check.'
-                      }
-                      className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-[0.18em] ring-1 transition-all shadow ${
-                        resolveInningArmed
-                          ? 'bg-emerald-500/90 text-emerald-950 ring-emerald-300 shadow-emerald-900/40 cursor-default'
-                          : 'bg-slate-700/60 text-slate-300 ring-slate-500/40 hover:bg-slate-700/80 hover:text-slate-100'
-                      }`}
-                    >
-                      <span
-                        className={`w-1.5 h-1.5 rounded-full ${
-                          resolveInningArmed
-                            ? 'bg-emerald-900 animate-pulse'
-                            : 'bg-slate-400'
-                        }`}
-                      />
-                      {resolveInningArmed
-                        ? `Bursting Inning ${inning}`
-                        : 'Resolve Inning'}
-                    </button>
-                  </div>
-                )}
-                {/* Discoverability nudge: the QuickResolveToggle pill is
-                    small enough that first-time SZN players were missing
-                    it entirely during playtest. When we hit a verifiable
-                    low-leverage spot but the toggle is OFF, surface a
-                    one-line hint right under the toggle pill so the player
-                    learns the feature exists exactly at the moment it
-                    would help them. Auto-hides the moment the toggle is
-                    flipped on (active OR armed) so it doesn't compete with
-                    the pill's own state visuals. */}
-                {sznRunActive &&
-                  !tutorialActive &&
-                  !brawlMode &&
-                  !quickResolveEnabled &&
-                  isLowLeverage && (
-                    <button
-                      type="button"
-                      onClick={() => setQuickResolveEnabled(true)}
-                      className="text-[10px] uppercase tracking-[0.18em] text-emerald-200/80 hover:text-emerald-100 underline decoration-dotted underline-offset-4 transition-colors"
-                      title="Auto-resolves this and other low-leverage at-bats. Toggle off any time."
-                    >
-                      Boring spot — tap Quick Resolve to skip
-                    </button>
-                  )}
+                <BrawlLockInButton
+                  phase={phase}
+                  atBatId={atBatId}
+                  onLockIn={lockIn}
+                  onRemainingMsChange={setBrawlSnapRemainingMs}
+                  focused={screenCtaFocused}
+                />
               </motion.div>
             )}
-            {isResolved && (
+            {isResolved && !lastBrawlCombatReport && (
               <motion.div
                 key="result"
                 initial={{ opacity: 0, y: 10 }}
@@ -2329,26 +2001,11 @@ export const CardGameOverlay = () => {
                     tone="emerald"
                     size="md"
                   >
-                    Next At-Bat
-                  </CtaButton>
-                ) : sznRunActive ? (
-                  <CtaButton
-                    onClick={() =>
-                      reportSeriesGameResult(
-                        seriesGameResult.result,
-                        seriesGameResult.userScore,
-                        seriesGameResult.ghostScore,
-                      )
-                    }
-                    focused={screenCtaFocused}
-                    tone="emerald"
-                    size="md"
-                  >
-                    Continue Run
+                    Next Round
                   </CtaButton>
                 ) : (
                   <CtaButton
-                    onClick={() => setShowStartScreen(true)}
+                    onClick={() => returnToBrawlMenu()}
                     focused={screenCtaFocused}
                     tone="rose"
                     size="md"
@@ -2362,8 +2019,6 @@ export const CardGameOverlay = () => {
         </div>
       </motion.div>
 
-      {!brawlMode && <ManagerHand side={userSide} />}
-
       {/* SZN deck footer is mounted at App level so it persists across
           the entire SZN experience (front office, draft, series intro,
           combat). It self-locates this overlay's user-hand container
@@ -2375,16 +2030,36 @@ export const CardGameOverlay = () => {
           below the HitResultBanner that sits at the top of this
           fragment. The components themselves are no-ops when there's
           nothing in-flight (empty impacts + empty flying arrays). */}
-      {brawlMode && phase === 'revealing' && (
-        <BrawlAttackOverlay
-          impacts={brawlReveal.impacts}
-          flying={brawlReveal.flying}
-          auras={brawlAuras}
-          hitNumbers={brawlReveal.hitNumbers}
-          shakePulse={brawlShake}
-          attackPhase={brawlReveal.attackPhase}
-        />
+      {phase === 'revealing' && (
+        <>
+          <BrawlSandstormOverlay
+            active={brawlReveal.sandstormActive}
+            tickIndex={brawlReveal.sandstormTickIndex}
+          />
+          <BrawlAttackOverlay
+            impacts={brawlReveal.impacts}
+            projectiles={brawlReveal.projectiles}
+            auras={brawlAuras}
+            hitNumbers={brawlReveal.hitNumbers}
+            shakePulse={brawlShake}
+            attackPhase={brawlReveal.attackPhase}
+          />
+        </>
       )}
+
+      <AnimatePresence>
+        {brawlMode &&
+          isResolved &&
+          lastBrawlCombatReport &&
+          (phase === 'between-at-bats' || phase === 'game-over') && (
+            <BrawlBattleResultScreen
+              key={`battle-report-${atBatId}`}
+              report={lastBrawlCombatReport}
+              phase={phase}
+              onContinue={dismissBrawlBattleReport}
+            />
+          )}
+      </AnimatePresence>
     </>
   );
 };
@@ -2500,7 +2175,7 @@ function BrawlSnapAttackHint({
           aria-live="polite"
         >
           <div className="text-[10px] font-black uppercase tracking-[0.28em] text-center">
-            Snap to Attack
+            Snap bonds to strike
           </div>
           <div className="mt-0.5 text-[11px] font-semibold text-center opacity-90">
             Drag adjacent cards together before time runs out
@@ -2709,7 +2384,6 @@ const HitResultBanner = ({
   brawlResolution: BrawlOutcomeResolution | null;
 }) => {
   const [visible, setVisible] = useState(false);
-  const brawlDraftActive = useGameStore((s) => s.brawlDraftChoice !== null);
   const inResolvedPhase =
     phase === 'between-at-bats' || phase === 'game-over';
   // Side-switch suppression: during the ~2s window after a half retires
@@ -2753,13 +2427,11 @@ const HitResultBanner = ({
     return () => clearTimeout(t);
   }, [phase, outcome, atBatId, sideJustSwitched]);
 
-  // Out sting whenever the user records or suffers an out.
   useEffect(() => {
     if (!visible || sideJustSwitched || outcome !== 'out') return;
     playOut();
   }, [visible, sideJustSwitched, outcome, atBatId]);
 
-  // Brawl-only hit stings (user batting or opponent hit while user pitches).
   useEffect(() => {
     if (!visible || sideJustSwitched || brawlResolution === null) return;
     if (outcome === null) return;
@@ -2793,7 +2465,7 @@ const HitResultBanner = ({
       ? `You out-hit by ${margin}`
       : `Hit through you by ${margin}`
     : userIsBatting
-      ? `Pitcher held you off by ${margin}`
+      ? `CPU held you off by ${margin}`
       : `You shut it down by ${margin}`;
 
   // Brawl Mode overrides. The "scoreline" reads as HP ("Batter HP 24
@@ -2813,44 +2485,26 @@ const HitResultBanner = ({
         ? `Shield broken (${brawlResolution!.pitcherRemainingHP} HP left)`
         : `Shut down — ${brawlResolution!.pitcherRemainingHP} HP left`
     : verb;
-  const scorelineBatterLabel = inBrawl
-    ? `${batterName ?? 'Batter'} HP ${brawlResolution!.batterRemainingHP}`
-    : `${batterName ?? 'Batter'} ${batterTotal}`;
-  const scorelinePitcherLabel = inBrawl
-    ? `${pitcherName ?? 'Pitcher'} HP ${brawlResolution!.pitcherRemainingHP}`
-    : `${pitcherName ?? 'Pitcher'} ${pitcherTotal}`;
+  const player1Total = userIsBatting ? batterTotal : pitcherTotal;
+  const cpuTotal = userIsBatting ? pitcherTotal : batterTotal;
+  const scorelinePlayer1Label = inBrawl
+    ? `Player 1 HP ${
+        userIsBatting
+          ? brawlResolution!.batterRemainingHP
+          : brawlResolution!.pitcherRemainingHP
+      }`
+    : `Player 1 ${player1Total}`;
+  const scorelineCpuLabel = inBrawl
+    ? `CPU HP ${
+        userIsBatting
+          ? brawlResolution!.pitcherRemainingHP
+          : brawlResolution!.batterRemainingHP
+      }`
+    : `CPU ${cpuTotal}`;
   const isGrandSlam = brawlResolution?.grandSlam === true;
 
-  // Ball-in-play + out cut-ins: video + outcome chyron. User batting sees
-  // per-hit clips; user pitching sees `pitcher-hit.mp4` on opponent hits.
-  // Outs: `batter-out.mp4` (user batting) / `out.mp4` (user pitching).
-  const isHitOutcome =
-    outcome === 'single' ||
-    outcome === 'double' ||
-    outcome === 'triple' ||
-    outcome === 'homerun';
-  const resultVideo = isHitOutcome
-    ? userIsBatting
-      ? HIT_VIDEOS[outcome]
-      : PITCHER_HIT_VIDEO
-    : outcome === 'out'
-      ? userIsBatting
-        ? OUT_VIDEOS.userBatterOut
-        : OUT_VIDEOS.userPitcherOut
-      : null;
-  const hitTypeLabel = isGrandSlam
-    ? 'Grand Slam!'
-    : resultVideo && outcome === 'out'
-      ? 'Out'
-      : cfg.label;
-  const hitVideoAria = resultVideo ? hitTypeLabel : '';
-  // Synchronous gate (don't rely on the visibility timeout alone).
-  // When the inning-start draft opens (`selecting` + brawlDraftChoice)
-  // or we leave the resolved beat, unmount immediately so a lingering
-  // `fixed z-[200]` hit-video layer can't paint over the draft scrim
-  // and trap the player on a dark fullscreen.
   const shouldShow =
-    visible && inResolvedPhase && !sideJustSwitched && !brawlDraftActive;
+    visible && inResolvedPhase && !sideJustSwitched;
 
   return (
     <AnimatePresence>
@@ -2865,51 +2519,8 @@ const HitResultBanner = ({
             transition: { type: 'spring', stiffness: 280, damping: 18 },
           }}
           exit={{ opacity: 0, scale: 1.15, transition: { duration: 0.4 } }}
-          className={
-            resultVideo
-              ? // Fixed + high z so the clip paints above score pills,
-                // hands, CTAs, and UIOverlay chrome during the result
-                // beat only. Draft overlay uses z-[220] so it stays on top.
-                'fixed inset-0 z-[200] pointer-events-none flex items-center justify-center'
-              : 'absolute inset-0 z-30 pointer-events-none flex items-center justify-center'
-          }
+          className="absolute inset-0 z-30 pointer-events-none flex items-center justify-center"
         >
-          {resultVideo ? (
-            <div className="relative w-[min(72vw,540px)] rounded-2xl overflow-hidden shadow-2xl">
-              <video
-                key={`result-video-${atBatId}-${outcome}`}
-                src={resultVideo.src}
-                autoPlay
-                muted
-                playsInline
-                aria-label={hitVideoAria}
-                className="block w-full h-auto"
-              />
-              <div
-                className="absolute inset-x-0 bottom-0 flex items-end justify-center pb-5 pt-16 bg-gradient-to-t from-black/80 via-black/35 to-transparent pointer-events-none"
-                aria-hidden="true"
-              >
-                <span
-                  className={`text-4xl sm:text-5xl font-black uppercase tracking-[0.2em] leading-none ${
-                    isGrandSlam
-                      ? 'text-amber-200'
-                      : outcome === 'out'
-                        ? 'text-rose-200'
-                        : outcome === 'homerun'
-                          ? 'text-orange-200'
-                          : outcome === 'triple'
-                            ? 'text-emerald-200'
-                            : outcome === 'double'
-                              ? 'text-sky-200'
-                              : 'text-blue-100'
-                  }`}
-                  style={{ textShadow: '0 2px 12px rgba(0,0,0,0.85)' }}
-                >
-                  {hitTypeLabel}
-                </span>
-              </div>
-            </div>
-          ) : (
           <div
             className={`px-10 py-4 rounded-3xl shadow-2xl border-4 ${cfg.classes} flex flex-col items-center gap-1`}
             style={{ textShadow: '0 2px 8px rgba(0,0,0,0.45)' }}
@@ -2956,11 +2567,11 @@ const HitResultBanner = ({
               <div className="mt-2 flex flex-col items-center gap-0.5">
                 <div className="flex items-center gap-2 text-[11px] font-black uppercase tracking-[0.2em] opacity-95">
                   <span className="rounded-md bg-slate-900/40 px-2 py-0.5 border border-white/25">
-                    {scorelineBatterLabel}
+                    {scorelinePlayer1Label}
                   </span>
                   <span className="opacity-70">vs</span>
                   <span className="rounded-md bg-slate-900/40 px-2 py-0.5 border border-white/25">
-                    {scorelinePitcherLabel}
+                    {scorelineCpuLabel}
                   </span>
                 </div>
                 <span
@@ -2993,7 +2604,6 @@ const HitResultBanner = ({
               </div>
             )}
           </div>
-          )}
         </motion.div>
       )}
     </AnimatePresence>
@@ -3034,37 +2644,19 @@ const HIT_BANNER_CONFIG: Record<
     classes:
       'bg-gradient-to-br from-rose-600 to-rose-800 text-white border-rose-200',
   },
+  grandSlam: {
+    label: 'Grand Slam!',
+    sub: '',
+    classes:
+      'bg-gradient-to-br from-amber-300 via-orange-500 to-rose-500 text-slate-900 border-amber-100',
+  },
+  walk: {
+    label: 'Walk',
+    sub: '',
+    classes:
+      'bg-gradient-to-br from-slate-500 to-slate-700 text-white border-slate-300',
+  },
 };
-
-/**
- * Ball-in-play video clips. One per hit outcome. Rendered by
- * `HitResultBanner` in place of the styled gradient pill so a hit feels
- * like an actual broadcast cut-in (animated play type chyron over a
- * looping highlight clip) rather than a text card. Lives under
- * `public/videos/` so the paths are static-served by Vite/Next at the
- * leading-slash URL below.
- */
-const HIT_VIDEOS: Record<
-  Exclude<HitOutcome, 'out'>,
-  { src: string; label: string }
-> = {
-  single: { src: '/videos/single.mp4', label: 'Single!' },
-  double: { src: '/videos/double.mp4', label: 'Double!' },
-  triple: { src: '/videos/triple.mp4', label: 'Triple!' },
-  homerun: { src: '/videos/home-run.mp4', label: 'Home Run!' },
-};
-
-/** Opponent hit while the user is pitching. */
-const PITCHER_HIT_VIDEO = {
-  src: '/videos/pitcher-hit.mp4',
-  label: 'Hit',
-} as const;
-
-/** Out cut-ins keyed by which seat the user occupied for the at-bat. */
-const OUT_VIDEOS = {
-  userBatterOut: { src: '/videos/batter-out.mp4', label: 'Out' },
-  userPitcherOut: { src: '/videos/out.mp4', label: 'Out' },
-} as const;
 
 /**
  * Per-outcome broadcaster barks. Picked deterministically by
@@ -3115,6 +2707,8 @@ const HIT_BANNER_BARKS: Record<HitOutcome, string[]> = {
     "Strike three — he's gone.",
     "Webbed it.",
   ],
+  grandSlam: ["Bases cleared.", "Maximum damage."],
+  walk: ["Take your base.", "Free pass."],
 };
 
 function pickBark(outcome: HitOutcome, atBatId: number): string {
@@ -3312,15 +2906,6 @@ interface ScorePillProps {
    */
   atBatId?: number;
   /**
-   * When true, the live BATTER/PITCHER total is also being rendered by the
-   * left-rail PlayerHero (md-and-up only). The pill's label+value span is
-   * then hidden at the `md` breakpoint so the user isn't reading the same
-   * number twice; the pill bg itself collapses too when there's nothing
-   * else to anchor (no outcome chip). Below `md` -- where
-   * the hero rail is hidden -- the pill stays the canonical readout.
-   */
-  heroHasValue?: boolean;
-  /**
    * Brawl reveal: locked-in max HP. When set alongside a numeric `value`,
    * the pill renders an internal left-to-right fill so the pill itself
    * reads as an HP bar while keeping its rounded shape.
@@ -3330,6 +2915,15 @@ interface ScorePillProps {
   brawlHpSide?: 'user' | 'opponent';
   /** When true the pill always renders as an HP bar (track + fill). */
   brawlHpFill?: boolean;
+  /** Remaining shield absorb on this pill (ticks down as damage is blocked). */
+  brawlShield?: number;
+  /** Active burn / poison stacks on this pill. */
+  brawlBurn?: number;
+  brawlPoison?: number;
+  /** Incrementing id — triggers a one-shot heal burst on the pill. */
+  brawlHealPulse?: number;
+  /** Skip bar tween — HP updates instantly on each hit. */
+  brawlHpInstant?: boolean;
   /** When true the score renders as a single green total (brawl HP preview). */
   highlightValue?: boolean;
 }
@@ -3357,10 +2951,14 @@ const ScorePill = ({
   compact = false,
   banner = null,
   atBatId,
-  heroHasValue = false,
   brawlHpMax = null,
   brawlHpSide = 'user',
   brawlHpFill = false,
+  brawlShield = 0,
+  brawlBurn = 0,
+  brawlPoison = 0,
+  brawlHealPulse = 0,
+  brawlHpInstant = false,
   highlightValue = false,
 }: ScorePillProps) => {
   const showBrawlFill = brawlHpFill && value != null && value >= 0;
@@ -3368,16 +2966,23 @@ const ScorePill = ({
   const clampedHp = showBrawlFill
     ? Math.max(0, Math.min(safeMax, value!))
     : 0;
+  const clampedBurn = showBrawlFill ? Math.max(0, brawlBurn) : 0;
+  const clampedPoison = showBrawlFill ? Math.max(0, brawlPoison) : 0;
+  const shieldAbsorb = showBrawlFill ? Math.max(0, brawlShield) : 0;
   const fillPct = showBrawlFill ? (clampedHp / safeMax) * 100 : 100;
   const critical = showBrawlFill && fillPct > 0 && fillPct <= 25;
-  const brawlFillClass =
-    brawlHpSide === 'user'
-      ? 'bg-gradient-to-r from-amber-500/90 via-amber-400/85 to-yellow-300/80'
-      : 'bg-gradient-to-r from-rose-500/90 via-rose-400/85 to-red-300/80';
-  const brawlFillGlow =
-    brawlHpSide === 'user'
-      ? '0 0 16px rgba(251,191,36,0.45)'
-      : '0 0 16px rgba(244,63,94,0.45)';
+  const hasBurn = clampedBurn > 0;
+  const hasPoison = clampedPoison > 0;
+  const brawlFillClass = hasPoison
+    ? 'bg-gradient-to-r from-violet-600/95 via-purple-500/90 to-fuchsia-400/85'
+    : hasBurn
+      ? 'bg-gradient-to-r from-orange-600/95 via-orange-500/90 to-amber-400/85'
+      : 'bg-gradient-to-r from-emerald-600/95 via-emerald-500/90 to-green-400/85';
+  const brawlFillGlow = hasPoison
+    ? '0 0 16px rgba(168,85,247,0.5)'
+    : hasBurn
+      ? '0 0 16px rgba(249,115,22,0.5)'
+      : '0 0 16px rgba(34,197,94,0.45)';
 
   const valueColor = showBrawlFill
     ? highlightValue
@@ -3395,19 +3000,6 @@ const ScorePill = ({
     ? 'px-4 py-1 text-sm gap-2'
     : 'px-6 py-2 text-xl gap-4';
 
-  // At md+ the PlayerHero rail carries the live total, so the pill's
-  // label+value span is dropped to avoid a redundant readout. The pill bg
-  // itself only stays at md when there's *something else* inside it worth
-  // showing (an outcome chip after lock-in, or a hit-scale hint badge mid
-  // selection). Below md the heroes are hidden and the pill is the
-  // canonical readout, so this collapsing logic is a no-op. The threshold
-  // here MUST stay in sync with the `hidden md:block` gate on the hero
-  // wrappers above -- otherwise either the pill collapses while no hero
-  // shows (no readout at all) or both render and the value is duplicated.
-  const hasOutcomeChip = !!outcome;
-  const valueGroupClass = heroHasValue ? 'md:hidden' : '';
-  const pillBgHiddenAtMd = heroHasValue && !hasOutcomeChip;
-
   return (
     // `z-30` lifts the pill (and the BeatBanner anchored absolute below it)
     // above sibling cards in the user's column. Without this the banner
@@ -3417,9 +3009,19 @@ const ScorePill = ({
     // banner only renders during reveal beats, so this z-index is moot
     // during selection / between-at-bats.
     <div className="relative z-30 flex flex-col items-center" data-score-pill={tone}>
+      <div className="relative">
+        {showBrawlFill && <BrawlPillShieldBorder active={shieldAbsorb > 0} />}
+        {showBrawlFill && shieldAbsorb > 0 && (
+          <div
+            className="absolute -top-1.5 -right-1.5 z-20 min-w-[1.35rem] px-1.5 py-0.5 rounded-full bg-amber-400/95 text-amber-950 text-[10px] font-black leading-none shadow-md border border-amber-200/80 pointer-events-none"
+            aria-label={`${shieldAbsorb} shield absorb remaining`}
+          >
+            {shieldAbsorb}
+          </div>
+        )}
       <motion.div
         layout
-        className={`relative overflow-hidden rounded-full font-bold shadow-xl border-2 flex flex-wrap items-center justify-center gap-1 ${containerSize} ${pillBgHiddenAtMd ? 'md:hidden' : ''} ${
+        className={`relative overflow-hidden rounded-full font-bold shadow-xl border-2 flex flex-wrap items-center justify-center gap-1 ${containerSize} ${
           showBrawlFill
             ? 'bg-slate-950/55 border-white/35 text-white'
             : 'bg-white/95 backdrop-blur text-slate-900 border-white/50'
@@ -3428,7 +3030,7 @@ const ScorePill = ({
         {showBrawlFill && (
           <>
             <motion.div
-              className={`absolute inset-y-0 left-0 ${brawlFillClass}`}
+              className={`absolute inset-y-0 left-0 z-[3] ${brawlFillClass}`}
               initial={false}
               animate={{
                 width: `${fillPct}%`,
@@ -3436,13 +3038,22 @@ const ScorePill = ({
                   ? 'brightness(1.2) saturate(1.3)'
                   : 'brightness(1) saturate(1)',
               }}
-              transition={{
-                width: { duration: 0.4, ease: [0.4, 0, 0.2, 1] },
-                filter: { duration: 0.3 },
-              }}
+              transition={
+                brawlHpInstant
+                  ? { duration: 0 }
+                  : {
+                      width: { duration: 0.4, ease: [0.4, 0, 0.2, 1] },
+                      filter: { duration: 0.3 },
+                    }
+              }
               style={{ boxShadow: brawlFillGlow }}
               aria-hidden="true"
             />
+            {hasBurn && !hasPoison && (
+              <BrawlPillFireAnimation widthPct={fillPct} />
+            )}
+            {hasPoison && <BrawlPillPoisonAnimation widthPct={fillPct} />}
+            <BrawlPillHealAnimation pulseId={brawlHealPulse} />
             {[25, 50, 75].map((t) => (
               <div
                 key={t}
@@ -3468,7 +3079,7 @@ const ScorePill = ({
           </>
         )}
         <div className="relative z-10 flex flex-wrap items-center justify-center gap-1">
-        <span className={`flex items-center gap-2 ${valueGroupClass}`}>
+        <span className="flex items-center gap-2">
           <span className={compact ? `text-[10px] font-extrabold uppercase tracking-widest ${labelColor}` : `text-xs font-extrabold uppercase tracking-widest ${labelColor}`}>
             {label}
           </span>
@@ -3504,6 +3115,7 @@ const ScorePill = ({
         </AnimatePresence>
         </div>
       </motion.div>
+      </div>
 
       {/* Banner sits in flow below the pill so it doesn't visually shove the
           rest of the column when it animates in. The pill itself gets `layout`
@@ -3615,126 +3227,6 @@ const RevealBeatSpotlight = ({
         <p className="mt-4 max-w-[min(24rem,calc(100vw-2rem))] text-center text-[11px] font-semibold leading-snug text-slate-200 drop-shadow-lg">
           {caption}
         </p>
-      </motion.div>
-    </div>
-  );
-};
-
-/**
- * Brawl Mode: per-half summary flashcard. Renders the user-side
- * highlights of the just-completed half-inning (W/L vs AI, longest
- * chain, peak hit outcome) as a centered card during the side-switch
- * window. Reads `brawlInningSummary` from the store -- populated at
- * lockIn when the half flips, cleared at startNextAtBat. Self-mutes
- * when the slot is null OR we're outside brawl OR we're not in the
- * `between-at-bats` pause, so non-brawl modes never see it.
- *
- * Auto-fades on a 2s tween (matches the 2.1s side-switch timer so the
- * overlay exits just before the next at-bat deals in).
- */
-const BrawlInningSummaryOverlay = () => {
-  const summary = useGameStore((s) => s.brawlInningSummary);
-  const gameMode = useGameStore((s) => s.gameMode);
-  const phase = useGameStore((s) => s.phase);
-  // Live seat read so the "YOU'RE UP TO BAT / PITCHING NOW" cue inside
-  // the recap card reflects whichever side the user is sitting in for
-  // the NEXT half (UIOverlay's generic InningTransitionBanner is
-  // suppressed in brawl, so this card is the only place the side flip
-  // is surfaced).
-  const userSide = useGameStore(getUiUserSide);
-  if (gameMode !== 'brawl') return null;
-  if (phase !== 'between-at-bats' && phase !== 'game-over') return null;
-  if (!summary) return null;
-  // The summary snapshots the JUST-ENDED half; the NEXT half is the
-  // mirror image (top -> bottom, bottom -> top of inning+1). Compute
-  // the "now playing" line from that so the inning header reads as
-  // forward motion ("Top of the 2nd · You're Up to Bat") instead of a
-  // backward recap headline.
-  const nextHalf: 'top' | 'bottom' = summary.half === 'top' ? 'bottom' : 'top';
-  const nextInning = summary.half === 'top' ? summary.inning : summary.inning + 1;
-  const nextHalfLabel = nextHalf === 'top' ? 'TOP' : 'BOTTOM';
-  const ordinal = (() => {
-    const n = nextInning;
-    const v = n % 100;
-    if (v >= 11 && v <= 13) return `${n}th`;
-    switch (n % 10) {
-      case 1:
-        return `${n}st`;
-      case 2:
-        return `${n}nd`;
-      case 3:
-        return `${n}rd`;
-      default:
-        return `${n}th`;
-    }
-  })();
-  const seatCue = userSide === 'Batting' ? "YOU'RE UP TO BAT" : "YOU'RE PITCHING NOW";
-  const halfLabel = summary.half === 'top' ? 'Top' : 'Bottom';
-  const wlNarrator =
-    summary.userWins > summary.userLosses
-      ? 'YOU TOOK THE INNING'
-      : summary.userWins < summary.userLosses
-        ? 'AI TOOK THE INNING'
-        : 'EVEN INNING';
-  const peakOutcomeCopy = summary.peakUserOutcome
-    ? summary.peakUserOutcome === 'homerun'
-      ? 'HOME RUN'
-      : summary.peakUserOutcome === 'triple'
-        ? 'TRIPLE'
-        : summary.peakUserOutcome === 'double'
-          ? 'DOUBLE'
-          : summary.peakUserOutcome === 'single'
-            ? 'SINGLE'
-            : 'OUT'
-    : 'NO HIT';
-  const chainLabel = summary.longestUserChain >= 2 ? `${summary.longestUserChain}-chain` : 'No chain';
-  return (
-    <div className="fixed inset-0 z-[33] pointer-events-none flex items-center justify-center px-4">
-      <motion.div
-        key={`brawl-summary-${summary.inning}-${summary.half}-${summary.userWins}-${summary.userLosses}`}
-        initial={{ opacity: 0, scale: 0.85, y: 24 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        exit={{ opacity: 0, scale: 0.92, y: 16 }}
-        transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
-        className="min-w-[320px] max-w-[440px] rounded-2xl border-2 border-amber-400/80 bg-slate-950/95 px-8 py-6 shadow-[0_8px_48px_rgba(0,0,0,0.6)] backdrop-blur-md"
-      >
-        {/* Side-switch header: the generic InningTransitionBanner is
-            suppressed in brawl so this row carries the "Top of the 2nd ·
-            YOU'RE UP TO BAT" line that the player needs to register the
-            seat flip. Hidden on the final-game card because there's no
-            next half to telegraph. */}
-        {!summary.isGameEnd && (
-          <div className="flex flex-col items-center mb-3">
-            <span className="text-[9px] font-black uppercase tracking-[0.32em] text-amber-300/80">
-              {nextHalfLabel} OF THE {ordinal}
-            </span>
-            <span className="text-[10px] font-black uppercase tracking-[0.28em] text-amber-200 mt-0.5">
-              {seatCue}
-            </span>
-          </div>
-        )}
-        <p className="text-center text-[10px] font-black uppercase tracking-[0.28em] text-amber-400 mb-1">
-          {summary.isGameEnd ? 'Final Inning Recap' : `${halfLabel} of ${summary.inning} -- Recap`}
-        </p>
-        <p className="text-center text-base font-black uppercase tracking-wider text-slate-100 mb-4">
-          {wlNarrator}
-        </p>
-        <div className="grid grid-cols-3 gap-3 text-center">
-          <div className="rounded-lg bg-slate-900/80 border border-slate-700/50 px-2 py-2">
-            <p className="text-[8px] font-black uppercase tracking-widest text-slate-400 mb-0.5">Record</p>
-            <p className="text-lg font-black tabular-nums text-slate-100">
-              {summary.userWins}<span className="text-slate-500">-</span>{summary.userLosses}
-            </p>
-          </div>
-          <div className="rounded-lg bg-slate-900/80 border border-slate-700/50 px-2 py-2">
-            <p className="text-[8px] font-black uppercase tracking-widest text-slate-400 mb-0.5">Best Chain</p>
-            <p className="text-lg font-black tabular-nums text-amber-300">{chainLabel}</p>
-          </div>
-          <div className="rounded-lg bg-slate-900/80 border border-slate-700/50 px-2 py-2">
-            <p className="text-[8px] font-black uppercase tracking-widest text-slate-400 mb-0.5">Peak Swing</p>
-            <p className="text-[11px] font-black uppercase tracking-tight text-emerald-300 leading-tight pt-1">{peakOutcomeCopy}</p>
-          </div>
-        </div>
       </motion.div>
     </div>
   );
@@ -4429,18 +3921,6 @@ type DealDirection = 'top' | 'bottom';
 // keeping drag interactions snappy and decoupled from the entry stagger.
 // ---------------------------------------------------------------------------
 
-// Bumped from 0.18 to 0.55 so the signature cards wait for the left-rail
-// PlayerHero entry tween to finish (~0.48s for the batter row including
-// its 0.08s role stagger) before the first hand card flies in. The user-
-// facing sequence is then: pitcher hero -> batter hero -> signature cards
-// -> general-draw cards.
-const SIGNATURE_DELAY_CHILDREN = 0.55;
-const SIGNATURE_STAGGER = 0.1;
-// Pause after the last signature settles before the deck draw starts.
-const SIGNATURE_SETTLE_PAD = 0.55;
-// Spacing between successive deck draws; long enough that each card reads as
-// an individual "draw" rather than a flurry.
-const GENERAL_STAGGER = 0.45;
 // Off-screen "deck" position: cards begin far to the right with a slight tilt.
 const DECK_OFFSET_X = 700;
 
@@ -4467,11 +3947,16 @@ function buildEntryConfig(
   const signaturesEndAt = SIGNATURE_DELAY_CHILDREN + lastSigIdx * SIGNATURE_STAGGER;
   const signaturesSettled = signaturesEndAt + SIGNATURE_SETTLE_PAD;
 
+  // All-general hands (element brawl) skip the phantom signature phase.
+  const allGeneral = signatureCount === 0;
+
   let delay: number;
   let initial: EntryConfig['initial'];
   if (isGeneral) {
-    const generalIdx = mountIndex - signatureCount;
-    delay = signaturesSettled + Math.max(generalIdx, 0) * GENERAL_STAGGER;
+    const generalIdx = allGeneral ? mountIndex : mountIndex - signatureCount;
+    delay =
+      (allGeneral ? 0 : signaturesSettled) +
+      Math.max(generalIdx, 0) * GENERAL_STAGGER;
     initial = { opacity: 0, x: DECK_OFFSET_X, y: 0, rotate: 22, scale: 0.7 };
   } else {
     delay = SIGNATURE_DELAY_CHILDREN + mountIndex * SIGNATURE_STAGGER;
@@ -4494,27 +3979,6 @@ function buildEntryConfig(
       },
     },
   };
-}
-
-/** Milliseconds until the last card in a strip finishes its deal-in spring. */
-function computeHandDealCompleteMs(hand: CardDefinition[]): number {
-  if (hand.length === 0) return 0;
-  const signatureCount = hand.filter((c) => c.abilityType !== 'General Draw').length;
-  const lastSigIdx = Math.max(signatureCount - 1, 0);
-  const signaturesEndAt = SIGNATURE_DELAY_CHILDREN + lastSigIdx * SIGNATURE_STAGGER;
-  const signaturesSettled = signaturesEndAt + SIGNATURE_SETTLE_PAD;
-
-  let maxDelaySec = 0;
-  for (let mountIndex = 0; mountIndex < hand.length; mountIndex++) {
-    const isGeneral = hand[mountIndex].abilityType === 'General Draw';
-    const delay = isGeneral
-      ? signaturesSettled +
-        Math.max(mountIndex - signatureCount, 0) * GENERAL_STAGGER
-      : SIGNATURE_DELAY_CHILDREN + mountIndex * SIGNATURE_STAGGER;
-    maxDelaySec = Math.max(maxDelaySec, delay);
-  }
-  // Buffer for the spring to settle after the last card's delayed start.
-  return Math.ceil(maxDelaySec * 1000 + 650);
 }
 
 function makeItemExitTransition(reverseStaggerCount: number, index: number) {
@@ -4557,6 +4021,8 @@ interface FlipPitcherStripProps {
   highlightTones?: Record<string, 'source' | 'target'>;
   /** When set, only affirmed adjacent pairs render as connected. */
   affirmedSeams?: ReadonlySet<string>;
+  /** Brawl combat: per-card cooldown fill after each bond fires. */
+  cardCooldowns?: Record<string, CardCooldownPulse>;
 }
 
 /** Move one card one slot closer to its target index in `plan`. */
@@ -4597,6 +4063,18 @@ function nextOpponentSeamToAffirm(
   }
   return null;
 }
+
+/** Reserves opponent-hand layout while CPU cards stay hidden during snap. */
+const BrawlHiddenOpponentHandSlot = ({ compact = false }: { compact?: boolean }) => (
+  <div
+    className={
+      compact
+        ? 'min-h-[112px] w-full max-w-[420px] mx-auto'
+        : 'min-h-[176px] w-full max-w-[648px] mx-auto'
+    }
+    aria-hidden
+  />
+);
 
 interface BrawlOpponentArrangeStripProps {
   dealtHand: CardDefinition[];
@@ -4762,6 +4240,7 @@ const FlipPitcherStrip = ({
   valueOverrides,
   highlightTones,
   affirmedSeams,
+  cardCooldowns,
 }: FlipPitcherStripProps) => {
   const sz = compact
     ? { card: PLAY_CARD.compactCardClass, gap: 4, connectedGap: 0 }
@@ -4795,6 +4274,10 @@ const FlipPitcherStrip = ({
             seamRightAffirmed;
           const modifier = modifiers[card.id];
           const isGeneral = card.abilityType === 'General Draw';
+          const snapDisplay =
+            affirmedSeams !== undefined
+              ? resolvedSnapDisplayValue(card, hand, affirmedSeams)
+              : undefined;
           return (
             <PitcherCard
               key={`${atBatId}-${card.id}`}
@@ -4813,6 +4296,8 @@ const FlipPitcherStrip = ({
               fromRot={fromRot}
               valueOverride={valueOverrides?.[card.id]}
               highlightTone={highlightTones?.[card.id]}
+              cardCooldown={cardCooldowns?.[card.id]}
+              snapDisplay={snapDisplay}
             />
           );
         })}
@@ -4839,6 +4324,10 @@ interface PitcherCardProps {
   highlightTone?: 'source' | 'target' | null;
   /** Brawl snap phase: lift the card being shuffled into place. */
   isArranging?: boolean;
+  /** Brawl combat: cooldown fill after this card fires a bond. */
+  cardCooldown?: CardCooldownPulse;
+  /** Snap-adjusted center value when affirmed seams are tracked. */
+  snapDisplay?: { value: number; boosted: boolean };
 }
 
 /**
@@ -4862,6 +4351,8 @@ const PitcherCard = ({
   valueOverride,
   highlightTone,
   isArranging = false,
+  cardCooldown,
+  snapDisplay,
 }: PitcherCardProps) => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const entry = useMemo(() => buildEntryConfig(isGeneral, index, signatureCount, fromY, fromRot), []);
@@ -4910,10 +4401,11 @@ const PitcherCard = ({
       <motion.div
         className="absolute inset-0"
         style={{ transformStyle: 'preserve-3d' }}
+        initial={{ rotateY: revealed ? 180 : 0 }}
         animate={{ rotateY: revealed ? 180 : 0 }}
         transition={{
-          duration: 0.7,
-          delay: revealed ? flipDelay : 0,
+          duration: revealed ? 0 : 0.7,
+          delay: revealed ? 0 : flipDelay,
           ease: [0.4, 0, 0.2, 1],
         }}
       >
@@ -4930,7 +4422,7 @@ const PitcherCard = ({
 
         {/* Front face (real CardItem). */}
         <div
-          className="absolute inset-0"
+          className="absolute inset-0 overflow-hidden rounded-[inherit]"
           style={{
             backfaceVisibility: 'hidden',
             WebkitBackfaceVisibility: 'hidden',
@@ -4946,7 +4438,11 @@ const PitcherCard = ({
             noMargin
             valueOverride={valueOverride}
             highlightTone={highlightTone}
+            snapDisplay={snapDisplay}
           />
+          {cardCooldown && (
+            <BrawlCardCooldownOverlay pulse={cardCooldown} compact={compact} />
+          )}
         </div>
       </motion.div>
     </motion.div>
@@ -5046,6 +4542,8 @@ interface HandStripProps {
   gamepadGrabbedCardId?: string | null;
   /** Brawl: card-pickup on drag start, card-swap on live reorder. */
   enableBrawlHandSfx?: boolean;
+  /** Brawl combat: per-card cooldown fill after each bond fires. */
+  cardCooldowns?: Record<string, CardCooldownPulse>;
 }
 
 const HandStrip = ({
@@ -5067,6 +4565,7 @@ const HandStrip = ({
   gamepadFocusedCardId = null,
   gamepadGrabbedCardId = null,
   enableBrawlHandSfx = false,
+  cardCooldowns,
 }: HandStripProps) => {
   // Signature cards fly in from the screen edge they belong to (pitcher drops
   // from above, batter rises up from below); general-draw cards then sweep in
@@ -5219,6 +4718,10 @@ const HandStrip = ({
           const skipEntryAnim = entryPlayedRef.current.cards.has(card.id);
           const hasPendingChoice =
             pendingChoiceIds?.has(card.id) ?? false;
+          const snapDisplay =
+            affirmedSeams !== undefined
+              ? resolvedSnapDisplayValue(card, hand, affirmedSeams)
+              : undefined;
           return (
             <HandCard
               key={`${atBatId}-${card.id}`}
@@ -5255,6 +4758,8 @@ const HandStrip = ({
               tutorialRegions={tutorialFirstCard && index === 0}
               gamepadFocused={gamepadFocusedCardId === card.id}
               gamepadGrabbed={gamepadGrabbedCardId === card.id}
+              cardCooldown={cardCooldowns?.[card.id]}
+              snapDisplay={snapDisplay}
             />
           );
         })}
@@ -5339,6 +4844,10 @@ interface HandCardProps {
   gamepadFocused?: boolean;
   /** Controller grab highlight (violet ring + pulse), see above. */
   gamepadGrabbed?: boolean;
+  /** Brawl combat: cooldown fill after this card fires a bond. */
+  cardCooldown?: CardCooldownPulse;
+  /** Snap-adjusted center value when affirmed seams are tracked. */
+  snapDisplay?: { value: number; boosted: boolean };
 }
 
 /**
@@ -5374,6 +4883,8 @@ const HandCard = ({
   lockReorder = false,
   gamepadFocused = false,
   gamepadGrabbed = false,
+  cardCooldown,
+  snapDisplay,
 }: HandCardProps) => {
   useEffect(() => {
     onEntryPlayed(card.id);
@@ -5385,7 +4896,6 @@ const HandCard = ({
     if (skipEntryAnim) return;
     const delaySec = entry.animate.transition.delay ?? 0;
     return scheduleCardsDealSound(delaySec);
-    // Entry config is snapshotted at mount; one sound per deal-in.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -5461,7 +4971,11 @@ const HandCard = ({
           dragActive={dragActive}
           tutorialRegions={tutorialRegions}
           readOnly={lockReorder}
+          snapDisplay={snapDisplay}
         />
+        {cardCooldown && (
+          <BrawlCardCooldownOverlay pulse={cardCooldown} compact={compact} />
+        )}
         {hasPendingChoice && onTriggerChoice && (
           <UseAbilityPill
             active={isChoiceActive}

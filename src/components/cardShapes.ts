@@ -1,14 +1,24 @@
 import type { EdgeColor } from '../lib/cardModel';
 import { EDGE_COLOR_LABEL, EDGE_COLORS, shapeToDefaultColor } from '../lib/cardModel';
 
-export type ShapeType = 'diamond' | 'circle' | 'square' | 'star' | 'wildcard' | 'none';
+export type ShapeType =
+  | 'diamond'
+  | 'circle'
+  | 'square'
+  | 'star'
+  | 'triangle'
+  | 'hexagon'
+  | 'wildcard'
+  | 'none';
 
 export const SHAPE_COLORS: Record<ShapeType, string> = {
-  diamond: '#eab308', // yellow-500
-  circle: '#3b82f6', // blue-500
-  square: '#ef4444', // red-500
-  star: '#a855f7', // purple-500
-  wildcard: '#10b981', // emerald-500
+  diamond: '#eab308', // yellow-500 — shield
+  circle: '#3b82f6', // blue-500 — freeze
+  square: '#ef4444', // red-500 — fire
+  star: '#a855f7', // purple-500 (legacy)
+  triangle: '#a855f7', // purple-500 — poison
+  hexagon: '#10b981', // emerald-500 — heal
+  wildcard: '#10b981', // emerald-500 (legacy)
   none: 'transparent',
 };
 
@@ -24,10 +34,12 @@ export const SHAPE_COLORS: Record<ShapeType, string> = {
  * back to plain shape names -- the visual geometry IS the vocabulary.
  */
 export const SHAPE_LABEL: Record<ShapeType, string> = {
-  square: 'Square',
-  diamond: 'Diamond',
-  circle: 'Circle',
+  square: 'Fire',
+  diamond: 'Shield',
+  circle: 'Freeze',
   star: 'Star',
+  triangle: 'Poison',
+  hexagon: 'Heal',
   wildcard: 'Wildcard',
   none: 'None',
 };
@@ -37,6 +49,8 @@ export const SHAPE_DEFAULTS: Record<ShapeType, { rotate: number; baseScale: numb
   diamond: { rotate: 45, baseScale: 0.8, borderRadius: '4px' },
   square: { rotate: 0, baseScale: 0.85, borderRadius: '4px' },
   star: { rotate: 0, baseScale: 1.1, borderRadius: '0', clipPath: 'polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%)' },
+  triangle: { rotate: 0, baseScale: 0.95, borderRadius: '0', clipPath: 'polygon(50% 0%, 0% 100%, 100% 100%)' },
+  hexagon: { rotate: 0, baseScale: 1, borderRadius: '25%', clipPath: 'polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%)' },
   wildcard: { rotate: 0, baseScale: 1, borderRadius: '25%', clipPath: 'polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%)' },
   none: { rotate: 0, baseScale: 1, borderRadius: '0' },
 };
