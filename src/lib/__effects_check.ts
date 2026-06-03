@@ -61,6 +61,38 @@ function assert(cond: boolean, msg: string, detail?: unknown) {
 }
 
 {
+  const {
+    brawlAttackCooldownMs,
+    brawlGroupReattackMs,
+    brawlGroupInitialCooldownMs,
+    brawlEffectiveAttackCooldownMs,
+  } = await import("./brawlElements");
+  assert(brawlAttackCooldownMs(1) === 5000, "solo side interval 5s");
+  assert(brawlAttackCooldownMs(3) === 3000, "3-chain side interval 3s");
+  assert(
+    brawlGroupReattackMs(1, brawlAttackCooldownMs(3)) === 3000,
+    "fully connected hand re-attacks every side interval",
+  );
+  assert(
+    brawlGroupReattackMs(3, brawlAttackCooldownMs(1)) === 15000,
+    "3 attack slots rotate at 5s each",
+  );
+  assert(
+    brawlGroupReattackMs(2, 5000, 2) ===
+      2 * brawlEffectiveAttackCooldownMs(5000, 2),
+    "freeze extends group re-attack timing",
+  );
+  assert(
+    brawlGroupInitialCooldownMs(0, 5000, 1000) === 6000,
+    "first slot waits intro lead + one side interval",
+  );
+  assert(
+    brawlGroupInitialCooldownMs(2, 5000, 1000) === 16000,
+    "third slot staggers two extra side intervals",
+  );
+}
+
+{
   const { sandstormTickDamage, BRAWL_SANDSTORM_TICK_MS } = await import(
     "./brawlSandstorm"
   );

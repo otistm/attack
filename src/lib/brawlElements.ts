@@ -178,6 +178,34 @@ export function brawlEffectiveAttackCooldownMs(
   return baseMs + Math.max(0, freezeStack) * FREEZE_COOLDOWN_MS_PER_POWER;
 }
 
+/**
+ * Ms until an attack group fires again. The side rotates one group per slot,
+ * so a fully connected hand (1 group) re-attacks every side interval; each
+ * extra isolated segment adds another slot to the rotation.
+ */
+export function brawlGroupReattackMs(
+  attackGroupCount: number,
+  sideCooldownMs: number,
+  freezeStack: number = 0,
+): number {
+  const slots = Math.max(1, attackGroupCount);
+  const slotMs = brawlEffectiveAttackCooldownMs(sideCooldownMs, freezeStack);
+  return slots * slotMs;
+}
+
+/**
+ * Ms until an attack group's first fire after lock-in (intro lead + staggered slot).
+ */
+export function brawlGroupInitialCooldownMs(
+  groupIndex: number,
+  sideCooldownMs: number,
+  combatLeadMs: number,
+  freezeStack: number = 0,
+): number {
+  const slotMs = brawlEffectiveAttackCooldownMs(sideCooldownMs, freezeStack);
+  return combatLeadMs + (groupIndex + 1) * slotMs;
+}
+
 /** Freeze wears down as the chilled side attacks. */
 export function consumeAttackerFreeze(
   state: ElementCombatState,

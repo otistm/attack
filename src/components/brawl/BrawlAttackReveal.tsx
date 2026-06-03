@@ -23,7 +23,8 @@ import type { Element } from "../../lib/brawlElements";
 import { applyElementCombatHit } from "../../lib/elementAbilities";
 import {
   ELEMENT_LABEL,
-  brawlEffectiveAttackCooldownMs,
+  brawlGroupInitialCooldownMs,
+  brawlGroupReattackMs,
   consumeAttackerFreeze,
   isSelfBuffBond,
   tickCombatDotStacks,
@@ -175,7 +176,7 @@ export interface BrawlRevealOutput {
 export interface CardCooldownPulse {
   /** Bump to restart the CSS fill animation. */
   pulseKey: number;
-  /** Ms until this card fires again (side cooldown × bond count). */
+  /** Ms until this attack group fires again (rotation slots × side interval + freeze). */
   durationMs: number;
   side: "user" | "opponent";
   /** True while this side's attack cooldown is slowed by freeze. */
@@ -444,8 +445,6 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       }
     };
 
-    let userGroupIdx = 0;
-    let oppGroupIdx = 0;
     let combatOver = false;
     let sideTick = 0;
 
@@ -557,14 +556,6 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
         (userAttackGroups.length + opponentAttackGroups.length) * 200,
       );
 
-    const effectiveCooldownFor = (side: "user" | "opponent") => {
-      const baseMs =
-        side === "user" ? userAttackCooldownMs : opponentAttackCooldownMs;
-      const freezeStack =
-        side === "user" ? combat.freezeOnPlayer : combat.freezeOnCpu;
-      return brawlEffectiveAttackCooldownMs(baseMs, freezeStack);
-    };
-
     const pushGroupCooldown = (
       group: BrawlAttackCard[],
       side: "user" | "opponent",
@@ -588,27 +579,28 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       });
     };
 
-    const seedInitialCooldowns = (combatStartMs: number) => {
+    const seedAllGroupCooldowns = (combatLeadMs: number) => {
       setCardCooldowns(() => {
         const next: Record<string, CardCooldownPulse> = {};
         const seedSide = (
           side: "user" | "opponent",
           groups: BrawlAttackCard[][],
         ) => {
-          const eff = effectiveCooldownFor(side);
+          const sideCooldownMs =
+            side === "user" ? userAttackCooldownMs : opponentAttackCooldownMs;
           const frozen =
             side === "user"
               ? combat.freezeOnPlayer > 0
               : combat.freezeOnCpu > 0;
-          groups.forEach((group, index) => {
-            const durationMs = combatStartMs + (index + 1) * eff;
+          groups.forEach((group, groupIndex) => {
+            const durationMs = brawlGroupInitialCooldownMs(
+              groupIndex,
+              sideCooldownMs,
+              combatLeadMs,
+              side === "user" ? combat.freezeOnPlayer : combat.freezeOnCpu,
+            );
             for (const card of group) {
-              next[card.id] = {
-                pulseKey: 0,
-                durationMs,
-                side,
-                frozen,
-              };
+              next[card.id] = { pulseKey: 0, durationMs, side, frozen };
             }
           });
         };
@@ -750,28 +742,24 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       );
     };
 
-    const fireSideAttack = (side: "user" | "opponent") => {
-      if (combatOver) return;
+    const fireGroupAttack = (
+      group: BrawlAttackCard[],
+      side: "user" | "opponent",
+      groupIdx: number,
+    ) => {
+      if (combatOver || group.length === 0) return;
 
       const isUser = side === "user";
-      const groups = isUser ? userAttackGroups : opponentAttackGroups;
-      if (groups.length === 0) return;
-
-      const groupIdx = isUser ? userGroupIdx++ : oppGroupIdx++;
-      const group = groups[groupIdx % groups.length];
-      if (group.length === 0) return;
-
       const sideCooldownMs =
         side === "user" ? userAttackCooldownMs : opponentAttackCooldownMs;
       const freezeOnSide = isUser ? combat.freezeOnPlayer : combat.freezeOnCpu;
-      const effectiveSideCooldownMs = brawlEffectiveAttackCooldownMs(
+      const groups = isUser ? userAttackGroups : opponentAttackGroups;
+      const reattackMs = brawlGroupReattackMs(
+        groups.length,
         sideCooldownMs,
         freezeOnSide,
       );
-      const cycleMs = Math.max(
-        1,
-        groups.length * effectiveSideCooldownMs,
-      );
+      pushGroupCooldown(group, side, reattackMs);
 
       let groupPower = 0;
       for (let cardIdx = 0; cardIdx < group.length; cardIdx++) {
@@ -787,21 +775,55 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       }
 
       combat = consumeAttackerFreeze(combat, isUser, groupPower);
-      pushGroupCooldown(group, side, cycleMs);
     };
 
-    const scheduleSideLoop = (side: "user" | "opponent") => {
+    const scheduleGroupLoop = (
+      side: "user" | "opponent",
+      groupIndex: number,
+      combatLeadMs: number,
+    ) => {
       const groups = side === "user" ? userAttackGroups : opponentAttackGroups;
-      if (groups.length === 0 || combatOver) return;
+      const group = groups[groupIndex];
+      if (!group || group.length === 0 || combatOver) return;
 
-      const loop = () => {
-        if (combatOver) return;
-        fireSideAttack(side);
-        if (!combatOver) {
-          timers.push(setTimeout(loop, Math.max(0, effectiveCooldownFor(side))));
-        }
+      const runCycle = (delayMs: number) => {
+        timers.push(
+          setTimeout(() => {
+            if (combatOver) return;
+            fireGroupAttack(group, side, groupIndex);
+            if (combatOver) return;
+            const sideCooldownMs =
+              side === "user" ? userAttackCooldownMs : opponentAttackCooldownMs;
+            const freezeOnSide =
+              side === "user" ? combat.freezeOnPlayer : combat.freezeOnCpu;
+            const reattackMs = brawlGroupReattackMs(
+              groups.length,
+              sideCooldownMs,
+              freezeOnSide,
+            );
+            runCycle(reattackMs);
+          }, delayMs),
+        );
       };
-      timers.push(setTimeout(loop, Math.max(0, effectiveCooldownFor(side))));
+
+      const sideCooldownMs =
+        side === "user" ? userAttackCooldownMs : opponentAttackCooldownMs;
+      const firstFireMs = brawlGroupInitialCooldownMs(
+        groupIndex,
+        sideCooldownMs,
+        combatLeadMs,
+        side === "user" ? combat.freezeOnPlayer : combat.freezeOnCpu,
+      );
+      runCycle(firstFireMs);
+    };
+
+    const scheduleAllGroupLoops = (combatLeadMs: number) => {
+      for (let i = 0; i < userAttackGroups.length; i++) {
+        scheduleGroupLoop("user", i, combatLeadMs);
+      }
+      for (let i = 0; i < opponentAttackGroups.length; i++) {
+        scheduleGroupLoop("opponent", i, combatLeadMs);
+      }
     };
 
     const spawnSandstormFloaters = (damage: number, tick: number) => {
@@ -876,7 +898,8 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       PHASE_INTRO_MS +
       (snap.elementMode ? 480 : Math.max(0, opponentRevealDelayMs));
 
-    seedInitialCooldowns(combatStartMs);
+    seedAllGroupCooldowns(combatStartMs);
+    scheduleAllGroupLoops(combatStartMs);
 
     const dotTick = () => {
       if (combatOver) return;
@@ -892,8 +915,6 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       setTimeout(() => {
         if (combatOver) return;
         setAttackPhase("combat");
-        scheduleSideLoop("user");
-        scheduleSideLoop("opponent");
         if (userAttackGroups.length === 0 && opponentAttackGroups.length === 0) {
           endCombat();
           return;
