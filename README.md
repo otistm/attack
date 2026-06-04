@@ -17,6 +17,10 @@ A 3D baseball-card matchup game built with React, Three.js (R3F), Tailwind, and 
 
 The dev server runs on `http://localhost:3000`.
 
+## Design & Development
+
+Game design, balance, and engineering standards live in **[docs/ARCHMAGE_ARCHITECT.md](docs/ARCHMAGE_ARCHITECT.md)** (the Archmage Architect guide). Consult it when adding cards, mechanics, class pools, combat tuning, or VFX. Cursor agents load a summary via `.cursor/rules/archmage-architect.mdc`.
+
 ## Notes
 
 - The repo currently has no remote-AI integration. The draft AI is a deterministic

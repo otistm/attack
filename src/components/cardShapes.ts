@@ -15,7 +15,7 @@ export const SHAPE_COLORS: Record<ShapeType, string> = {
   diamond: '#eab308', // yellow-500 — shield
   circle: '#3b82f6', // blue-500 — freeze
   square: '#ef4444', // red-500 — fire
-  star: '#a855f7', // purple-500 (legacy)
+  star: '#f59e0b', // amber-500 — volt
   triangle: '#a855f7', // purple-500 — poison
   hexagon: '#10b981', // emerald-500 — heal
   wildcard: '#10b981', // emerald-500 (legacy)
@@ -37,7 +37,7 @@ export const SHAPE_LABEL: Record<ShapeType, string> = {
   square: 'Fire',
   diamond: 'Shield',
   circle: 'Freeze',
-  star: 'Star',
+  star: 'Volt',
   triangle: 'Poison',
   hexagon: 'Heal',
   wildcard: 'Wildcard',

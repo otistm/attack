@@ -23,8 +23,8 @@ import type { Element } from "../../lib/brawlElements";
 import { applyElementCombatHit } from "../../lib/elementAbilities";
 import {
   ELEMENT_LABEL,
-  brawlGroupInitialCooldownMs,
-  brawlGroupReattackMs,
+  brawlCardOverlayCooldownMs,
+  FREEZE_COOLDOWN_PAUSE_MS,
   consumeAttackerFreeze,
   isSelfBuffBond,
   tickCombatDotStacks,
@@ -66,6 +66,10 @@ export interface BrawlAttackCard {
   element?: Element;
   /** Right-hand bond partner — skips its own attack when the chain fires. */
   skipAttack?: boolean;
+  /** Affirmed group size — freeze chip = power (solo) or power − N (chain). */
+  combineCount?: number;
+  /** Catalog ids in the attacker's locked hand (Oil Flask). */
+  attackerHandCatalogIds?: readonly string[];
 }
 
 export interface BrawlRevealInput {
@@ -81,6 +85,10 @@ export interface BrawlRevealInput {
   userAttackCooldownMs?: number;
   /** Ms between attack waves for the opponent's side. */
   opponentAttackCooldownMs?: number;
+  /** Catalog ids in the user's locked hand. */
+  userHandCatalogIds?: readonly string[];
+  /** Catalog ids in the opponent's locked hand. */
+  opponentHandCatalogIds?: readonly string[];
   /** Connected attack groups on the batter side (each group shares cooldown). */
   batterAttackGroups: BrawlAttackCard[][];
   /** Connected attack groups on the pitcher side. */
@@ -176,10 +184,10 @@ export interface BrawlRevealOutput {
 export interface CardCooldownPulse {
   /** Bump to restart the CSS fill animation. */
   pulseKey: number;
-  /** Ms until this attack group fires again (rotation slots × side interval + freeze). */
+  /** Ms shown on the card overlay — one side slot (~5s), not full rotation. */
   durationMs: number;
   side: "user" | "opponent";
-  /** True while this side's attack cooldown is slowed by freeze. */
+  /** True while this card's cooldown timer is paused by freeze. */
   frozen?: boolean;
 }
 
@@ -368,6 +376,10 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       card: BrawlAttackCard,
       isUser: boolean,
     ): ElementCombatState => {
+      const input = inputRef.current;
+      const attackerHandCatalogIds = isUser
+        ? input.userHandCatalogIds ?? []
+        : input.opponentHandCatalogIds ?? [];
       const after = applyElementCombatHit(
         before,
         {
@@ -375,12 +387,15 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
           power: card.power,
           leftCardId: card.id,
           rightCardId: card.rightCardId,
+          combineCount: card.combineCount,
+          attackerHandCatalogIds,
         },
         isUser,
       );
       combatEvents.push(
         logCardCombatEvent(before, after, {
           cardId: card.id,
+          rightCardId: card.rightCardId,
           power: card.power,
           element: card.element,
           label: card.label,
@@ -389,46 +404,6 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       );
       return after;
     };
-
-    const syncDisplayInstant = (state: ElementCombatState) => {
-      const batterHp = userIsBatting ? state.playerHP : state.cpuHP;
-      const pitcherHp = userIsBatting ? state.cpuHP : state.playerHP;
-      const batterShield = userIsBatting ? state.shieldOnPlayer : state.shieldOnCpu;
-      const pitcherShield = userIsBatting ? state.shieldOnCpu : state.shieldOnPlayer;
-      const batterBurn = userIsBatting ? state.burnOnPlayer : state.burnOnCpu;
-      const pitcherBurn = userIsBatting ? state.burnOnCpu : state.burnOnPlayer;
-      const batterPoison = userIsBatting ? state.poisonOnPlayer : state.poisonOnCpu;
-      const pitcherPoison = userIsBatting ? state.poisonOnCpu : state.poisonOnPlayer;
-      setDisplayedBatterHP(batterHp);
-      setDisplayedPitcherHP(pitcherHp);
-      setDisplayedBatterShield(batterShield);
-      setDisplayedPitcherShield(pitcherShield);
-      setDisplayedBatterBurn(batterBurn);
-      setDisplayedPitcherBurn(pitcherBurn);
-      setDisplayedBatterPoison(batterPoison);
-      setDisplayedPitcherPoison(pitcherPoison);
-      syncCardFreezeFlags(state);
-    };
-
-    const syncCardFreezeFlags = (state: ElementCombatState) => {
-      setCardCooldowns((prev) => {
-        let changed = false;
-        const next = { ...prev };
-        for (const [id, pulse] of Object.entries(prev)) {
-          const frozen =
-            pulse.side === "user"
-              ? state.freezeOnPlayer > 0
-              : state.freezeOnCpu > 0;
-          if (pulse.frozen !== frozen) {
-            next[id] = { ...pulse, frozen };
-            changed = true;
-          }
-        }
-        return changed ? next : prev;
-      });
-    };
-
-    syncDisplayInstant(combat);
 
     const userAttackGroups = userIsBatting
       ? batterAttackGroups
@@ -556,15 +531,93 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
         (userAttackGroups.length + opponentAttackGroups.length) * 200,
       );
 
+    const cardPauseUntil: Record<string, number> = {};
+    let lastFreezeOnPlayer = combat.freezeOnPlayer;
+    let lastFreezeOnCpu = combat.freezeOnCpu;
+
+    const isCardCooldownPaused = (cardId: string) =>
+      performance.now() < (cardPauseUntil[cardId] ?? 0);
+
+    const isGroupCooldownPaused = (group: BrawlAttackCard[]) =>
+      group.some((card) => isCardCooldownPaused(card.id));
+
+    const attackableCardIds = (groups: BrawlAttackCard[][]) => {
+      const ids: string[] = [];
+      for (const group of groups) {
+        for (const card of group) {
+          if (!card.skipAttack) ids.push(card.id);
+        }
+      }
+      return ids;
+    };
+
+    const pickRandomCardId = (groups: BrawlAttackCard[][]) => {
+      const ids = attackableCardIds(groups);
+      if (ids.length === 0) return null;
+      return ids[Math.floor(Math.random() * ids.length)] ?? null;
+    };
+
+    const pauseCardCooldown = (cardId: string) => {
+      const now = performance.now();
+      cardPauseUntil[cardId] = Math.max(cardPauseUntil[cardId] ?? 0, now) +
+        FREEZE_COOLDOWN_PAUSE_MS;
+    };
+
+    const noteFreezeApplied = (state: ElementCombatState) => {
+      if (state.freezeOnPlayer > lastFreezeOnPlayer) {
+        const cardId = pickRandomCardId(userAttackGroups);
+        if (cardId) pauseCardCooldown(cardId);
+      }
+      if (state.freezeOnCpu > lastFreezeOnCpu) {
+        const cardId = pickRandomCardId(opponentAttackGroups);
+        if (cardId) pauseCardCooldown(cardId);
+      }
+      lastFreezeOnPlayer = state.freezeOnPlayer;
+      lastFreezeOnCpu = state.freezeOnCpu;
+    };
+
+    const syncCardCooldownOverlays = () => {
+      setCardCooldowns((prev) => {
+        if (Object.keys(prev).length === 0) return prev;
+        let changed = false;
+        const next = { ...prev };
+        for (const [id, pulse] of Object.entries(prev)) {
+          const frozen = isCardCooldownPaused(id) && pulse.durationMs > 0;
+          if (pulse.frozen !== frozen) {
+            next[id] = { ...pulse, frozen };
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+    };
+
+    const syncDisplayInstant = (state: ElementCombatState) => {
+      const batterHp = userIsBatting ? state.playerHP : state.cpuHP;
+      const pitcherHp = userIsBatting ? state.cpuHP : state.playerHP;
+      const batterShield = userIsBatting ? state.shieldOnPlayer : state.shieldOnCpu;
+      const pitcherShield = userIsBatting ? state.shieldOnCpu : state.shieldOnPlayer;
+      const batterBurn = userIsBatting ? state.burnOnPlayer : state.burnOnCpu;
+      const pitcherBurn = userIsBatting ? state.burnOnCpu : state.burnOnPlayer;
+      const batterPoison = userIsBatting ? state.poisonOnPlayer : state.poisonOnCpu;
+      const pitcherPoison = userIsBatting ? state.poisonOnCpu : state.poisonOnPlayer;
+      setDisplayedBatterHP(batterHp);
+      setDisplayedPitcherHP(pitcherHp);
+      setDisplayedBatterShield(batterShield);
+      setDisplayedPitcherShield(pitcherShield);
+      setDisplayedBatterBurn(batterBurn);
+      setDisplayedPitcherBurn(pitcherBurn);
+      setDisplayedBatterPoison(batterPoison);
+      setDisplayedPitcherPoison(pitcherPoison);
+      noteFreezeApplied(state);
+      syncCardCooldownOverlays();
+    };
+
     const pushGroupCooldown = (
       group: BrawlAttackCard[],
       side: "user" | "opponent",
-      durationMs: number,
     ) => {
-      const frozen =
-        side === "user"
-          ? combat.freezeOnPlayer > 0
-          : combat.freezeOnCpu > 0;
+      const durationMs = brawlCardOverlayCooldownMs(group.length);
       setCardCooldowns((prev) => {
         const next = { ...prev };
         const pulseKey =
@@ -573,42 +626,43 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
             ...group.map((c) => prev[c.id]?.pulseKey ?? 0),
           ) + 1;
         for (const card of group) {
-          next[card.id] = { pulseKey, durationMs, side, frozen };
+          next[card.id] = {
+            pulseKey,
+            durationMs,
+            side,
+            frozen: isCardCooldownPaused(card.id),
+          };
         }
         return next;
       });
     };
 
-    const seedAllGroupCooldowns = (combatLeadMs: number) => {
+    const seedAllGroupCooldowns = () => {
       setCardCooldowns(() => {
         const next: Record<string, CardCooldownPulse> = {};
         const seedSide = (
           side: "user" | "opponent",
           groups: BrawlAttackCard[][],
         ) => {
-          const sideCooldownMs =
-            side === "user" ? userAttackCooldownMs : opponentAttackCooldownMs;
-          const frozen =
-            side === "user"
-              ? combat.freezeOnPlayer > 0
-              : combat.freezeOnCpu > 0;
-          groups.forEach((group, groupIndex) => {
-            const durationMs = brawlGroupInitialCooldownMs(
-              groupIndex,
-              sideCooldownMs,
-              combatLeadMs,
-              side === "user" ? combat.freezeOnPlayer : combat.freezeOnCpu,
-            );
+          for (const group of groups) {
+            const durationMs = brawlCardOverlayCooldownMs(group.length);
             for (const card of group) {
-              next[card.id] = { pulseKey: 0, durationMs, side, frozen };
+              next[card.id] = {
+                pulseKey: 0,
+                durationMs,
+                side,
+                frozen: isCardCooldownPaused(card.id),
+              };
             }
-          });
+          }
         };
         seedSide("user", userAttackGroups);
         seedSide("opponent", opponentAttackGroups);
         return next;
       });
     };
+
+    syncDisplayInstant(combat);
 
     const resolveCardHit = (card: BrawlAttackCard, isUser: boolean) => {
       combat = applyHitAndLog(combat, card, isUser);
@@ -750,16 +804,8 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       if (combatOver || group.length === 0) return;
 
       const isUser = side === "user";
-      const sideCooldownMs =
-        side === "user" ? userAttackCooldownMs : opponentAttackCooldownMs;
-      const freezeOnSide = isUser ? combat.freezeOnPlayer : combat.freezeOnCpu;
       const groups = isUser ? userAttackGroups : opponentAttackGroups;
-      const reattackMs = brawlGroupReattackMs(
-        groups.length,
-        sideCooldownMs,
-        freezeOnSide,
-      );
-      pushGroupCooldown(group, side, reattackMs);
+      pushGroupCooldown(group, side);
 
       let groupPower = 0;
       for (let cardIdx = 0; cardIdx < group.length; cardIdx++) {
@@ -775,54 +821,56 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       }
 
       combat = consumeAttackerFreeze(combat, isUser, groupPower);
+      syncDisplayInstant(combat);
     };
 
     const scheduleGroupLoop = (
       side: "user" | "opponent",
       groupIndex: number,
-      combatLeadMs: number,
     ) => {
       const groups = side === "user" ? userAttackGroups : opponentAttackGroups;
       const group = groups[groupIndex];
       if (!group || group.length === 0 || combatOver) return;
 
-      const runCycle = (delayMs: number) => {
+      const slotMs = () => brawlCardOverlayCooldownMs(group.length);
+
+      const runCycle = (delayMs: number, fireAtMs?: number) => {
+        const targetAt = fireAtMs ?? performance.now() + delayMs;
+
+        const poll = () => {
+          if (combatOver) return;
+          const now = performance.now();
+
+          if (isGroupCooldownPaused(group)) {
+            timers.push(setTimeout(poll, 50));
+            return;
+          }
+
+          const waitMs = targetAt - now;
+          if (waitMs > 0) {
+            timers.push(setTimeout(poll, Math.min(waitMs, 50)));
+            return;
+          }
+
+          fireGroupAttack(group, side, groupIndex);
+          if (combatOver) return;
+          runCycle(slotMs());
+        };
+
         timers.push(
-          setTimeout(() => {
-            if (combatOver) return;
-            fireGroupAttack(group, side, groupIndex);
-            if (combatOver) return;
-            const sideCooldownMs =
-              side === "user" ? userAttackCooldownMs : opponentAttackCooldownMs;
-            const freezeOnSide =
-              side === "user" ? combat.freezeOnPlayer : combat.freezeOnCpu;
-            const reattackMs = brawlGroupReattackMs(
-              groups.length,
-              sideCooldownMs,
-              freezeOnSide,
-            );
-            runCycle(reattackMs);
-          }, delayMs),
+          setTimeout(poll, Math.max(0, Math.min(delayMs, 50))),
         );
       };
 
-      const sideCooldownMs =
-        side === "user" ? userAttackCooldownMs : opponentAttackCooldownMs;
-      const firstFireMs = brawlGroupInitialCooldownMs(
-        groupIndex,
-        sideCooldownMs,
-        combatLeadMs,
-        side === "user" ? combat.freezeOnPlayer : combat.freezeOnCpu,
-      );
-      runCycle(firstFireMs);
+      runCycle(slotMs());
     };
 
-    const scheduleAllGroupLoops = (combatLeadMs: number) => {
+    const scheduleAllGroupLoops = () => {
       for (let i = 0; i < userAttackGroups.length; i++) {
-        scheduleGroupLoop("user", i, combatLeadMs);
+        scheduleGroupLoop("user", i);
       }
       for (let i = 0; i < opponentAttackGroups.length; i++) {
-        scheduleGroupLoop("opponent", i, combatLeadMs);
+        scheduleGroupLoop("opponent", i);
       }
     };
 
@@ -898,9 +946,6 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       PHASE_INTRO_MS +
       (snap.elementMode ? 480 : Math.max(0, opponentRevealDelayMs));
 
-    seedAllGroupCooldowns(combatStartMs);
-    scheduleAllGroupLoops(combatStartMs);
-
     const dotTick = () => {
       if (combatOver) return;
       const beforeDot = combat;
@@ -910,6 +955,10 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       if (isCombatOver()) endCombat();
     };
     const dotInterval = setInterval(dotTick, BRAWL_DOT_TICK_MS);
+    const pauseSyncInterval = setInterval(() => {
+      if (combatOver) return;
+      syncCardCooldownOverlays();
+    }, 100);
 
     timers.push(
       setTimeout(() => {
@@ -919,6 +968,8 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
           endCombat();
           return;
         }
+        seedAllGroupCooldowns();
+        scheduleAllGroupLoops();
         timers.push(
           setTimeout(() => {
             if (combatOver) return;
@@ -932,6 +983,7 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       combatOver = true;
       for (const t of timers) clearTimeout(t);
       clearInterval(dotInterval);
+      clearInterval(pauseSyncInterval);
       if (sandstormInterval) clearInterval(sandstormInterval);
       attackingRef.current = false;
       setAttacking(false);
@@ -992,7 +1044,52 @@ export function BrawlCardCooldownOverlay({
   pulse: CardCooldownPulse;
   compact?: boolean;
 }) {
-  const tone = pulse.frozen
+  const totalMs = pulse.durationMs;
+  const remainingRef = useRef(totalMs);
+  const frozenRef = useRef(!!pulse.frozen);
+  const [remainingMs, setRemainingMs] = useState(totalMs);
+  const [heightPct, setHeightPct] = useState(100);
+
+  useEffect(() => {
+    remainingRef.current = totalMs;
+    setRemainingMs(totalMs);
+    setHeightPct(100);
+    frozenRef.current = !!pulse.frozen;
+  }, [pulse.pulseKey, totalMs]);
+
+  useEffect(() => {
+    frozenRef.current = !!pulse.frozen;
+  }, [pulse.frozen]);
+
+  useEffect(() => {
+    let raf = 0;
+    let last = performance.now();
+
+    const tick = (now: number) => {
+      const paused = frozenRef.current && remainingRef.current > 0;
+      if (!paused) {
+        const dt = now - last;
+        if (dt > 0) {
+          remainingRef.current = Math.max(0, remainingRef.current - dt);
+          setRemainingMs(remainingRef.current);
+          setHeightPct(
+            totalMs > 0 ? (remainingRef.current / totalMs) * 100 : 0,
+          );
+        }
+      }
+      last = now;
+      if (remainingRef.current > 0) {
+        raf = requestAnimationFrame(tick);
+      }
+    };
+
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [pulse.pulseKey, totalMs]);
+
+  const remainingSec = Math.ceil(remainingMs / 1000);
+  const showFrozen = pulse.frozen && remainingSec > 0;
+  const tone = showFrozen
     ? {
         veil: "bg-cyan-950/65",
         edge: "bg-cyan-300/95",
@@ -1003,25 +1100,6 @@ export function BrawlCardCooldownOverlay({
         ...COOLDOWN_TONE[pulse.side],
         text: pulse.side === "user" ? "text-amber-100" : "text-rose-100",
       };
-  const durationSec = pulse.durationMs / 1000;
-  const [remainingSec, setRemainingSec] = useState(() =>
-    Math.ceil(pulse.durationMs / 1000),
-  );
-
-  useEffect(() => {
-    const start = performance.now();
-    const totalMs = pulse.durationMs;
-    setRemainingSec(Math.ceil(totalMs / 1000));
-
-    let frame = 0;
-    const tick = () => {
-      const leftMs = Math.max(0, totalMs - (performance.now() - start));
-      setRemainingSec(Math.ceil(leftMs / 1000));
-      if (leftMs > 0) frame = requestAnimationFrame(tick);
-    };
-    frame = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(frame);
-  }, [pulse.pulseKey, pulse.durationMs]);
 
   return (
     <div
@@ -1030,18 +1108,15 @@ export function BrawlCardCooldownOverlay({
       }`}
       aria-hidden="true"
     >
-      <motion.div
-        key={pulse.pulseKey}
-        className={`absolute inset-x-0 bottom-0 origin-bottom ${tone.veil} backdrop-blur-[1px]`}
-        initial={{ height: "100%" }}
-        animate={{ height: "0%" }}
-        transition={{ duration: durationSec, ease: "linear" }}
+      <div
+        className={`absolute inset-x-0 bottom-0 origin-bottom ${tone.veil} backdrop-blur-[1px] transition-none`}
+        style={{ height: `${heightPct}%` }}
       >
         <div
           className={`absolute inset-x-0 top-0 h-[3px] ${tone.edge}`}
           style={{ boxShadow: tone.glow }}
         />
-      </motion.div>
+      </div>
       {remainingSec > 0 && (
         <div className="absolute inset-x-0 bottom-1.5 z-50 flex justify-center pointer-events-none">
           <span
@@ -1053,7 +1128,7 @@ export function BrawlCardCooldownOverlay({
           </span>
         </div>
       )}
-      {pulse.frozen && (
+      {showFrozen && (
         <div className="absolute inset-x-0 top-1 z-[60] flex justify-center pointer-events-none">
           <span className="px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-widest text-cyan-100 bg-cyan-900/80 border border-cyan-400/50">
             Frozen
@@ -1215,6 +1290,11 @@ const ELEMENT_PROJECTILE_TONE: Record<
     core: "rgba(74,222,128,0.95)",
     glow: "0 0 22px rgba(34,197,94,0.75)",
     trail: "rgba(22,163,74,0.55)",
+  },
+  volt: {
+    core: "rgba(251,191,36,0.95)",
+    glow: "0 0 22px rgba(245,158,11,0.75)",
+    trail: "rgba(217,119,6,0.55)",
   },
 };
 

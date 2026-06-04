@@ -882,6 +882,8 @@ export const CardGameOverlay = () => {
   const brawlElementCombat = useGameStore((s) => s.brawlElementCombat);
   const lastElementBonds = useGameStore((s) => s.lastElementBonds);
   const lastElementCombatStart = useGameStore((s) => s.lastElementCombatStart);
+  const lastUserSideCooldownMs = useGameStore((s) => s.lastUserSideCooldownMs);
+  const lastOpponentSideCooldownMs = useGameStore((s) => s.lastOpponentSideCooldownMs);
   const lastBrawlCombatReport = useGameStore((s) => s.lastBrawlCombatReport);
   const dismissBrawlBattleReport = useGameStore((s) => s.dismissBrawlBattleReport);
   const commitElementCombatResult = useGameStore((s) => s.commitElementCombatResult);
@@ -1151,6 +1153,12 @@ export const CardGameOverlay = () => {
 
   const brawlAttackCooldowns = useMemo(() => {
     if (!brawlMode) return { user: 5000, opponent: 5000 };
+    if (phase === "revealing") {
+      return {
+        user: lastUserSideCooldownMs,
+        opponent: lastOpponentSideCooldownMs,
+      };
+    }
     const userHandLocal = userIsBatting ? batterHand : pitcherHand;
     const oppHandLocal = userIsBatting ? pitcherHand : batterHand;
     const userChain = maxAffirmedChainLength(userHandLocal, affirmedSeams);
@@ -1161,6 +1169,9 @@ export const CardGameOverlay = () => {
     };
   }, [
     brawlMode,
+    phase,
+    lastUserSideCooldownMs,
+    lastOpponentSideCooldownMs,
     userIsBatting,
     batterHand,
     pitcherHand,
@@ -1202,12 +1213,25 @@ export const CardGameOverlay = () => {
   // opponent hand deal-in animation (the CPU strip was hidden until lock-in).
   const brawlOpponentRevealDelayMs = 0;
 
+  const brawlHandCatalogIds = useMemo(() => {
+    if (!brawlMode) {
+      return { user: [] as string[], opponent: [] as string[] };
+    }
+    const userHand = userIsBatting ? batterHand : pitcherHand;
+    const oppHand = userIsBatting ? pitcherHand : batterHand;
+    const toCatalog = (hand: CardDefinition[]) =>
+      hand.map((c) => (c.id.includes("~") ? c.id.slice(0, c.id.indexOf("~")) : c.id));
+    return { user: toCatalog(userHand), opponent: toCatalog(oppHand) };
+  }, [brawlMode, userIsBatting, batterHand, pitcherHand]);
+
   const brawlReveal = useBrawlAttackReveal({
     enabled: brawlMode && phase === 'revealing',
     elementMode: true,
     elementCombatStart: elementAtBatPlan?.start,
     userAttackCooldownMs: brawlAttackCooldowns.user,
     opponentAttackCooldownMs: brawlAttackCooldowns.opponent,
+    userHandCatalogIds: brawlHandCatalogIds.user,
+    opponentHandCatalogIds: brawlHandCatalogIds.opponent,
     batterAttackGroups: brawlAttackGroups.batter,
     pitcherAttackGroups: brawlAttackGroups.pitcher,
     batterHP: brawlRevealStartHp.batter,
@@ -1780,7 +1804,7 @@ export const CardGameOverlay = () => {
           cards stay anchored to the top edge of the screen so the field
           stays visible between the two strips. */}
       <motion.div
-        className="absolute inset-x-0 top-24 pointer-events-none flex flex-col items-center pt-4 pb-3 bg-gradient-to-b from-slate-900/70 via-slate-900/30 to-transparent"
+        className="absolute inset-x-0 top-0 pointer-events-none flex flex-col items-center pt-20 pb-3 bg-gradient-to-b from-slate-900/70 via-slate-900/30 to-transparent"
         initial={false}
         animate={{ y: 0, opacity: 1 }}
         transition={{ duration: 0.55, ease: [0.4, 0, 0.2, 1] }}

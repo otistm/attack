@@ -4,10 +4,16 @@
 import { create } from "zustand";
 import type { CardDefinition } from "./cards";
 import { dealBrawlElementHand } from "./elementDeal";
-import { ELEMENT_CARD_IDS } from "./elementCards";
+import {
+  classPoolIds,
+  randomOpponentClass,
+  type BrawlClass,
+} from "./elementClassPools";
 import { computeElementBondsWithAbilities } from "./elementAbilities";
 import {
+  brawlAttackCooldownMs,
   freshElementCombatState,
+  maxAffirmedChainLength,
   optimizeElementHand,
   type ElementBond,
   type ElementCombatState,
@@ -22,7 +28,9 @@ export type Side = "Player" | "Opponent";
 /** @deprecated Legacy alias used by overlay layout helpers. */
 export type SideLegacy = "Batting" | "Pitching";
 export type GameMode = "brawl" | null;
+export type { BrawlClass } from "./elementClassPools";
 export type Phase =
+  | "class-select"
   | "selecting"
   | "revealing"
   | "between-at-bats"
@@ -109,13 +117,36 @@ function computeBrawlOpponentPrep(
   };
 }
 
-function dealFreshAtBat() {
+function dealClassAtBat(
+  userClass: BrawlClass,
+  opponentClass: BrawlClass,
+  userTeam: Team,
+) {
   const seed = Math.floor(Math.random() * 0x7fffffff);
+  const userHand = dealBrawlElementHand(5, classPoolIds(userClass), seed);
+  const opponentHand = dealBrawlElementHand(
+    5,
+    classPoolIds(opponentClass),
+    seed + 7919,
+  );
+  const playerIsBatter = userTeam === "PLAYER";
   return {
     batter: PLAYER_SEAT,
     pitcher: CPU_SEAT,
-    batterHand: dealBrawlElementHand(5, ELEMENT_CARD_IDS, seed),
-    pitcherHand: dealBrawlElementHand(5, ELEMENT_CARD_IDS, seed + 7919),
+    batterHand: playerIsBatter ? userHand : opponentHand,
+    pitcherHand: playerIsBatter ? opponentHand : userHand,
+    pendingChoices: [] as PendingChoice[],
+    pendingReveals: [] as unknown[],
+    pitcherTransformsImpactingBatter: [] as string[],
+  };
+}
+
+function emptyAtBatHands() {
+  return {
+    batter: PLAYER_SEAT,
+    pitcher: CPU_SEAT,
+    batterHand: [] as CardDefinition[],
+    pitcherHand: [] as CardDefinition[],
     pendingChoices: [] as PendingChoice[],
     pendingReveals: [] as unknown[],
     pitcherTransformsImpactingBatter: [] as string[],
@@ -149,6 +180,9 @@ export interface GameState {
   brawlElementCombat: ElementCombatState;
   lastElementBonds: { user: ElementBond[]; opponent: ElementBond[] } | null;
   lastElementCombatStart: { playerHP: number; cpuHP: number } | null;
+  /** Side attack slot (ms) locked in at reveal — chain-reduced, pre-freeze. */
+  lastUserSideCooldownMs: number;
+  lastOpponentSideCooldownMs: number;
   lastBrawlCombatReport: BrawlCombatReport | null;
   brawlSnapStartedAt: number | null;
 
@@ -187,6 +221,8 @@ export interface GameState {
   sznGamepadFocus: string;
   brawlUserPool: string[];
   brawlOpponentPool: string[];
+  brawlUserClass: BrawlClass | null;
+  brawlOpponentClass: BrawlClass | null;
 
   reorderBatterHand: (cards: CardDefinition[]) => void;
   reorderPitcherHand: (cards: CardDefinition[]) => void;
@@ -200,6 +236,8 @@ export interface GameState {
   dismissBrawlBattleReport: () => void;
   startNextAtBat: () => void;
   prepareBrawlOpponent: () => void;
+  selectBrawlClass: (brawlClass: BrawlClass) => void;
+  returnToClassSelect: () => void;
   startBrawl: (team: Team) => void;
   returnToBrawlMenu: () => void;
   reset: (team?: Team) => void;
@@ -220,12 +258,12 @@ export interface GameState {
   ) => void;
 }
 
-const INITIAL = dealFreshAtBat();
+const INITIAL = emptyAtBatHands();
 
 export const useGameStore = create<GameState>((set, get) => ({
   userTeam: "PLAYER",
-  gameMode: "brawl",
-  phase: "selecting",
+  gameMode: null,
+  phase: "class-select",
   ...INITIAL,
   atBatId: 1,
 
@@ -245,6 +283,8 @@ export const useGameStore = create<GameState>((set, get) => ({
   brawlElementCombat: freshElementCombatState(),
   lastElementBonds: null,
   lastElementCombatStart: null,
+  lastUserSideCooldownMs: 5000,
+  lastOpponentSideCooldownMs: 5000,
   lastBrawlCombatReport: null,
   brawlSnapStartedAt: Date.now(),
 
@@ -278,8 +318,10 @@ export const useGameStore = create<GameState>((set, get) => ({
   tutorialActive: false,
   run: null,
   sznGamepadFocus: "screen",
-  brawlUserPool: [...ELEMENT_CARD_IDS],
-  brawlOpponentPool: [...ELEMENT_CARD_IDS],
+  brawlUserPool: [],
+  brawlOpponentPool: [],
+  brawlUserClass: null,
+  brawlOpponentClass: null,
 
   reorderBatterHand: (cards) => set({ batterHand: cards }),
   reorderPitcherHand: (cards) => set({ pitcherHand: cards }),
@@ -349,6 +391,8 @@ export const useGameStore = create<GameState>((set, get) => ({
       state.brawlOpponentSeams,
     );
     const combatStart = state.brawlElementCombat;
+    const userChain = maxAffirmedChainLength(userHand, state.affirmedSeams);
+    const oppChain = maxAffirmedChainLength(oppHand, state.brawlOpponentSeams);
 
     set({
       lastElementBonds: { user: userBonds, opponent: oppBonds },
@@ -356,6 +400,8 @@ export const useGameStore = create<GameState>((set, get) => ({
         playerHP: combatStart.playerHP,
         cpuHP: combatStart.cpuHP,
       },
+      lastUserSideCooldownMs: brawlAttackCooldownMs(userChain),
+      lastOpponentSideCooldownMs: brawlAttackCooldownMs(oppChain),
       lastBatterScore: combatStart.playerHP,
       lastPitcherScore: combatStart.cpuHP,
       phase: "revealing",
@@ -404,7 +450,12 @@ export const useGameStore = create<GameState>((set, get) => ({
     const s = get();
     if (s.phase === "game-over") return;
     if (s.phase !== "between-at-bats") return;
-    const ab = dealFreshAtBat();
+    if (!s.brawlUserClass || !s.brawlOpponentClass) return;
+    const ab = dealClassAtBat(
+      s.brawlUserClass,
+      s.brawlOpponentClass,
+      s.userTeam,
+    );
     set({
       ...ab,
       atBatId: s.atBatId + 1,
@@ -422,6 +473,8 @@ export const useGameStore = create<GameState>((set, get) => ({
       revealScript: [],
       pendingResolvedPhase: null,
       revealUiUserSide: null,
+      brawlUserPool: [...classPoolIds(s.brawlUserClass)],
+      brawlOpponentPool: [...classPoolIds(s.brawlOpponentClass)],
     });
     const prep = computeBrawlOpponentPrep(get());
     if (prep) set(prep);
@@ -434,14 +487,41 @@ export const useGameStore = create<GameState>((set, get) => ({
     if (prep) set(prep);
   },
 
-  startBrawl: (team) => {
-    const ab = dealFreshAtBat();
+  selectBrawlClass: (brawlClass) => {
+    const opponentClass = randomOpponentClass(brawlClass);
+    const ab = dealClassAtBat(brawlClass, opponentClass, get().userTeam);
     set({
       gameMode: "brawl",
       phase: "selecting",
-      userTeam: team,
       ...ab,
-      atBatId: get().atBatId + 1,
+      atBatId: 1,
+      affirmedSeams: new Set(),
+      brawlOpponentSeams: new Set(),
+      brawlOpponentPlanHand: [],
+      brawlElementCombat: freshElementCombatState(),
+      lastElementBonds: null,
+      lastElementCombatStart: null,
+      lastUserSideCooldownMs: 5000,
+      lastOpponentSideCooldownMs: 5000,
+      lastBrawlCombatReport: null,
+      brawlSnapStartedAt: Date.now(),
+      lastBatterScore: 100,
+      lastPitcherScore: 100,
+      brawlUserClass: brawlClass,
+      brawlOpponentClass: opponentClass,
+      brawlUserPool: [...classPoolIds(brawlClass)],
+      brawlOpponentPool: [...classPoolIds(opponentClass)],
+    });
+    const prep = computeBrawlOpponentPrep(get());
+    if (prep) set(prep);
+    startStadiumAmbience();
+  },
+
+  returnToClassSelect: () => {
+    set({
+      gameMode: null,
+      phase: "class-select",
+      ...emptyAtBatHands(),
       affirmedSeams: new Set(),
       brawlOpponentSeams: new Set(),
       brawlOpponentPlanHand: [],
@@ -449,19 +529,24 @@ export const useGameStore = create<GameState>((set, get) => ({
       lastElementBonds: null,
       lastElementCombatStart: null,
       lastBrawlCombatReport: null,
-      brawlSnapStartedAt: Date.now(),
-      lastBatterScore: 100,
-      lastPitcherScore: 100,
-      brawlUserPool: [...ELEMENT_CARD_IDS],
-      brawlOpponentPool: [...ELEMENT_CARD_IDS],
+      brawlSnapStartedAt: null,
+      brawlUserClass: null,
+      brawlOpponentClass: null,
+      brawlUserPool: [],
+      brawlOpponentPool: [],
+      revealScript: [],
+      pendingResolvedPhase: null,
+      revealUiUserSide: null,
     });
-    const prep = computeBrawlOpponentPrep(get());
-    if (prep) set(prep);
-    startStadiumAmbience();
+  },
+
+  startBrawl: (team) => {
+    set({ userTeam: team });
+    get().returnToClassSelect();
   },
 
   returnToBrawlMenu: () => {
-    get().startBrawl(get().userTeam);
+    get().returnToClassSelect();
   },
 
   reset: (team) => {

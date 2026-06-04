@@ -44,6 +44,7 @@ const ELEMENT_CHIP: Record<Element, string> = {
   freeze: "bg-sky-500/20 text-sky-100 ring-sky-400/40",
   shield: "bg-slate-400/20 text-slate-100 ring-slate-300/40",
   heal: "bg-emerald-500/20 text-emerald-100 ring-emerald-400/40",
+  volt: "bg-amber-500/20 text-amber-100 ring-amber-400/40",
 };
 
 function CardBreakdownRow({ row }: { row: BrawlCardBreakdown }) {

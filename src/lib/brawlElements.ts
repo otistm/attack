@@ -11,7 +11,7 @@ import { canConnectAny, seamKey } from "./connect";
 import { printedNumericValue } from "./cardModel";
 import { buildGroups } from "./scoring";
 
-export type Element = "fire" | "freeze" | "poison" | "shield" | "heal";
+export type Element = "fire" | "freeze" | "poison" | "shield" | "heal" | "volt";
 
 /** Shapes that participate in brawl element bonds. */
 export const ELEMENT_SHAPES: ShapeType[] = [
@@ -20,6 +20,7 @@ export const ELEMENT_SHAPES: ShapeType[] = [
   "triangle",
   "diamond",
   "hexagon",
+  "star",
 ];
 
 export const ELEMENT_LABEL: Record<Element, string> = {
@@ -28,6 +29,7 @@ export const ELEMENT_LABEL: Record<Element, string> = {
   poison: "Poison",
   shield: "Shield",
   heal: "Heal",
+  volt: "Volt",
 };
 
 export function shapeToElement(shape: ShapeType): Element | null {
@@ -42,6 +44,8 @@ export function shapeToElement(shape: ShapeType): Element | null {
       return "shield";
     case "hexagon":
       return "heal";
+    case "star":
+      return "volt";
     default:
       return null;
   }
@@ -81,6 +85,12 @@ export const BRAWL_ELEMENT_BORDER: Record<
     pulse: "#34d399",
     shadowLow: "rgba(16,185,129,0.4)",
     shadowHigh: "rgba(16,185,129,0.75)",
+  },
+  volt: {
+    rest: SHAPE_COLORS.star,
+    pulse: "#fbbf24",
+    shadowLow: "rgba(245,158,11,0.4)",
+    shadowHigh: "rgba(245,158,11,0.75)",
   },
 };
 
@@ -167,43 +177,91 @@ export function brawlAttackCooldownMs(maxChainLength: number): number {
   return Math.max(0, BRAWL_ATTACK_COOLDOWN_BASE_MS - reductionSec * 1000);
 }
 
-/** Extra ms added per freeze stack point when a side is chilled. */
-export const FREEZE_COOLDOWN_MS_PER_POWER = 250;
+/** Cooldown slot for one attack group from its card count (solo = 5s, pair = 4s, …). */
+export function brawlGroupSlotCooldownMs(groupLength: number): number {
+  return brawlAttackCooldownMs(Math.max(1, groupLength));
+}
 
-/** Side attack interval including freeze slow on that side. */
+/**
+ * Per-card cooldown overlay duration — always ≤ 5s (chain-reduced), never the
+ * full multi-group rotation period.
+ */
+export function brawlCardOverlayCooldownMs(groupLength: number): number {
+  return Math.min(
+    BRAWL_ATTACK_COOLDOWN_BASE_MS,
+    brawlGroupSlotCooldownMs(groupLength),
+  );
+}
+
+/** Full side rotation — sum of each attack group's slot. */
+export function brawlSideRotationPeriodMs(
+  groups: ReadonlyArray<{ length: number }>,
+): number {
+  if (groups.length === 0) return brawlAttackCooldownMs(1);
+  return groups.reduce(
+    (sum, group) => sum + brawlGroupSlotCooldownMs(group.length),
+    0,
+  );
+}
+
+/** Ms from lock-in until an attack group's first fire (intro + staggered slots). */
+export function brawlGroupFirstFireMs(
+  groupIndex: number,
+  groups: ReadonlyArray<{ length: number }>,
+  combatLeadMs: number,
+): number {
+  let ms = combatLeadMs;
+  for (let i = 0; i <= groupIndex; i++) {
+    ms += brawlGroupSlotCooldownMs(groups[i]?.length ?? 1);
+  }
+  return ms;
+}
+
+/** Ms added to one random defender card's cooldown each time freeze lands. */
+export const FREEZE_COOLDOWN_PAUSE_MS = 1500;
+
+/** Side attack slot duration (chain-reduced base). Freeze pauses timers separately. */
 export function brawlEffectiveAttackCooldownMs(
   baseMs: number,
-  freezeStack: number,
+  _freezeStack: number = 0,
 ): number {
-  return baseMs + Math.max(0, freezeStack) * FREEZE_COOLDOWN_MS_PER_POWER;
+  return baseMs;
 }
 
 /**
- * Ms until an attack group fires again. The side rotates one group per slot,
- * so a fully connected hand (1 group) re-attacks every side interval; each
- * extra isolated segment adds another slot to the rotation.
+ * Cooldown overlay duration on each card — one side slot (~5s base), not the
+ * full multi-group rotation period. Freeze pauses the countdown; it does not
+ * add extra ms to this value.
+ */
+export function brawlCooldownDisplayMs(
+  sideCooldownMs: number,
+  _freezeStack: number = 0,
+): number {
+  return sideCooldownMs;
+}
+
+/**
+ * Ms until an attack group fires again. Each group slot uses its own chain
+ * length; a fully connected hand is one group and re-attacks every slot.
  */
 export function brawlGroupReattackMs(
-  attackGroupCount: number,
-  sideCooldownMs: number,
-  freezeStack: number = 0,
+  groups: ReadonlyArray<{ length: number }>,
+  _legacyGroupCount?: number,
+  _legacySideCooldownMs?: number,
 ): number {
-  const slots = Math.max(1, attackGroupCount);
-  const slotMs = brawlEffectiveAttackCooldownMs(sideCooldownMs, freezeStack);
-  return slots * slotMs;
+  return brawlSideRotationPeriodMs(groups);
 }
 
 /**
- * Ms until an attack group's first fire after lock-in (intro lead + staggered slot).
+ * @deprecated Use {@link brawlGroupFirstFireMs} with attack groups.
  */
 export function brawlGroupInitialCooldownMs(
   groupIndex: number,
   sideCooldownMs: number,
   combatLeadMs: number,
-  freezeStack: number = 0,
+  _freezeStack: number = 0,
 ): number {
-  const slotMs = brawlEffectiveAttackCooldownMs(sideCooldownMs, freezeStack);
-  return combatLeadMs + (groupIndex + 1) * slotMs;
+  return combatLeadMs + (groupIndex + 1) * sideCooldownMs;
 }
 
 /** Freeze wears down as the chilled side attacks. */
@@ -284,6 +342,39 @@ export interface BrawlHandAttack {
    * does not attack on its own when the chain fires together.
    */
   skipAttack?: boolean;
+  /** Cards in the affirmed attack group — drives freeze chip scaling. */
+  combineCount?: number;
+}
+
+/** Extra chip on freeze chains so long Ren weaves still pressure HP. */
+export const FREEZE_CHIP_CHAIN_BUFFER = 2;
+
+/** Chip damage from a freeze bond or solo freeze card. */
+export function freezeChipDamage(
+  power: number,
+  combineCount: number,
+): number {
+  if (combineCount <= 1) return Math.max(0, power);
+  return Math.max(1, power - combineCount + FREEZE_CHIP_CHAIN_BUFFER);
+}
+
+/** Apply freeze stacks plus scaled chip damage. */
+export function applyFreezeBondEffect(
+  state: ElementCombatState,
+  attackerIsPlayer: boolean,
+  bondPower: number,
+  freezeStacks: number,
+  combineCount: number = 2,
+): ElementCombatState {
+  const chip = freezeChipDamage(bondPower, combineCount);
+  let next: ElementCombatState = { ...state };
+  if (chip > 0) {
+    next = applyDamageToDefender(next, attackerIsPlayer, chip);
+  }
+  const stacks = Math.max(0, freezeStacks);
+  if (attackerIsPlayer) next.freezeOnCpu += stacks;
+  else next.freezeOnPlayer += stacks;
+  return next;
 }
 
 /**
@@ -293,11 +384,19 @@ export interface BrawlHandAttack {
 export function buildHandAttackQueue(
   hand: CardDefinition[],
   bonds: ElementBond[],
+  affirmedSeams: ReadonlySet<string> | null = null,
 ): BrawlHandAttack[] {
   const bondByLeft = new Map(bonds.map((b) => [b.leftCardId, b]));
   const bondRightIds = new Set(bonds.map((b) => b.rightCardId));
   const bondLeftIds = new Set(bonds.map((b) => b.leftCardId));
+  const groupSizeByCard = new Map<string, number>();
+  for (const group of buildGroups(hand, affirmedSeams)) {
+    for (const card of group) {
+      groupSizeByCard.set(card.id, group.length);
+    }
+  }
   return hand.map((card) => {
+    const combineCount = groupSizeByCard.get(card.id) ?? 1;
     const bond = bondByLeft.get(card.id);
     if (bond) {
       return {
@@ -306,6 +405,7 @@ export function buildHandAttackQueue(
         power: bond.power,
         element: bond.element,
         label: ELEMENT_LABEL[bond.element],
+        combineCount,
       };
     }
     const power = printedNumericValue(card);
@@ -315,6 +415,7 @@ export function buildHandAttackQueue(
       power,
       label: "Hit",
       skipAttack,
+      combineCount,
     };
   });
 }
@@ -329,7 +430,7 @@ export function buildHandAttackGroups(
   affirmedSeams: ReadonlySet<string> | null,
 ): BrawlHandAttack[][] {
   const byId = new Map(
-    buildHandAttackQueue(hand, bonds).map((a) => [a.id, a]),
+    buildHandAttackQueue(hand, bonds, affirmedSeams).map((a) => [a.id, a]),
   );
   return buildGroups(hand, affirmedSeams).map((group) =>
     group
@@ -482,6 +583,8 @@ export function resolveBondHit(
         immediateHpDelta: 0,
         healOnAttacker: power,
       };
+    case "volt":
+      return { immediateHpDelta: power };
     default:
       return { immediateHpDelta: 0 };
   }
@@ -540,9 +643,11 @@ export function applyInstantCombatBond(
   state: ElementCombatState,
   bond: ElementBond,
   attackerIsPlayer: boolean,
+  options?: { combineCount?: number },
 ): ElementCombatState {
   const power = Math.max(0, bond.power);
   const next: ElementCombatState = { ...state };
+  const combineCount = options?.combineCount ?? 2;
 
   switch (bond.element) {
     case "fire":
@@ -559,9 +664,13 @@ export function applyInstantCombatBond(
       return afterHit;
     }
     case "freeze":
-      if (attackerIsPlayer) next.freezeOnCpu += power;
-      else next.freezeOnPlayer += power;
-      break;
+      return applyFreezeBondEffect(
+        next,
+        attackerIsPlayer,
+        power,
+        power,
+        combineCount,
+      );
     case "shield":
       if (attackerIsPlayer) next.shieldOnPlayer += power;
       else next.shieldOnCpu += power;
@@ -573,6 +682,8 @@ export function applyInstantCombatBond(
         next.cpuHP = Math.min(BRAWL_START_HP, next.cpuHP + power);
       }
       break;
+    case "volt":
+      return applyDamageToDefender(next, attackerIsPlayer, power);
   }
   return next;
 }

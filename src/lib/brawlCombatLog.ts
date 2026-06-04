@@ -6,6 +6,16 @@ import { ELEMENT_LABEL } from "./brawlElements";
 import { elementCardById } from "./elementCards";
 import { elementCatalogId } from "./elementDeal";
 
+function bondIncludesCatalogId(
+  leftCardId: string,
+  rightCardId: string | undefined,
+  catalogId: string,
+): boolean {
+  if (elementCatalogId(leftCardId) === catalogId) return true;
+  if (rightCardId && elementCatalogId(rightCardId) === catalogId) return true;
+  return false;
+}
+
 export type BrawlCombatEventKind =
   | "card_hit"
   | "dot_tick"
@@ -273,6 +283,7 @@ export function logCardCombatEvent(
   after: ElementCombatState,
   params: {
     cardId: string;
+    rightCardId?: string;
     power: number;
     element?: Element;
     label?: string;
@@ -341,6 +352,12 @@ export function logCardCombatEvent(
         parts.push("stacked poison bonus");
       }
     }
+    if (bondIncludesCatalogId(params.cardId, params.rightCardId, "el-26")) {
+      parts.push("+2 volt chip (Fuse)");
+    }
+    if (bondIncludesCatalogId(params.cardId, params.rightCardId, "el-25")) {
+      parts.push("DoT stack bonus (Grind)");
+    }
   } else if (el === "heal") {
     if (heal > 0) parts.push(`+${heal} HP`);
     if (cleanse > 0) parts.push(`cleansed ${cleanse}`);
@@ -350,9 +367,26 @@ export function logCardCombatEvent(
       parts.push("includes Aegis bonus");
     }
   } else if (el === "freeze") {
-    if (freezeApplied > 0) parts.push(`+${freezeApplied} freeze slow`);
+    if (hpDamage > 0) parts.push(`${hpDamage} chill damage`);
+    if (shieldAbsorbed > 0) parts.push(`${shieldAbsorbed} absorbed by shield`);
+    if (freezeApplied > 0) parts.push(`+${freezeApplied} freeze slow (1 card)`);
     if (elementCatalogId(params.cardId) === "el-11" && freezeApplied > 0) {
       parts.push("double freeze (Glacia)");
+    }
+  } else if (el === "volt") {
+    if (hpDamage > 0) parts.push(`${hpDamage} instant shock`);
+    if (shieldAbsorbed > 0) parts.push(`${shieldAbsorbed} absorbed by shield`);
+    if (elementCatalogId(params.cardId) === "el-22") {
+      parts.push("double volt (Surge)");
+    }
+    if (
+      bondIncludesCatalogId(params.cardId, params.rightCardId, "el-24") &&
+      hpDamage > 0
+    ) {
+      parts.push("shield pierce (Arc)");
+    }
+    if (bondIncludesCatalogId(params.cardId, params.rightCardId, "el-23")) {
+      parts.push("thawed freeze (Static)");
     }
   }
 

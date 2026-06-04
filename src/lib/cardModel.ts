@@ -13,6 +13,7 @@ export type EdgeColor =
   | "blue"
   | "purple"
   | "emerald"
+  | "amber"
   | "wildcard"
   | "none";
 
@@ -22,6 +23,7 @@ export const EDGE_COLORS: Record<EdgeColor, string> = {
   blue: "#3b82f6",
   purple: "#a855f7",
   emerald: "#10b981",
+  amber: "#f59e0b",
   wildcard: "#10b981",
   none: "transparent",
 };
@@ -32,6 +34,7 @@ export const EDGE_COLOR_LABEL: Record<EdgeColor, string> = {
   blue: "Blue",
   purple: "Purple",
   emerald: "Emerald",
+  amber: "Amber",
   wildcard: "Wildcard",
   none: "None",
 };
@@ -48,6 +51,7 @@ export function shapeToDefaultColor(shape: ShapeType): EdgeColor {
     case "circle":
       return "blue";
     case "star":
+      return "amber";
     case "triangle":
       return "purple";
     case "wildcard":

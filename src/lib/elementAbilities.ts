@@ -1,5 +1,5 @@
 /**
- * Per-card snap and fight abilities for the 20-card element brawl deck.
+ * Per-card snap and fight abilities for the 52-card element brawl deck.
  */
 import type { CardDefinition } from "./cards";
 import { printedNumericValue } from "./cardModel";
@@ -10,6 +10,7 @@ import {
   applyGenericCombatHit,
   applyInstantCombatBond,
   applyDamageToDefender,
+  applyFreezeBondEffect,
   buildHandAttackQueue,
   computeElementBonds,
   BRAWL_START_HP,
@@ -34,17 +35,80 @@ export const ELEMENT_ABILITY_CATALOG = {
   flint: "el-16",
   nightshade: "el-17",
   hoarfrost: "el-18",
+  surge: "el-22",
+  static: "el-23",
+  arc: "el-24",
+  grind: "el-25",
+  fuse: "el-26",
+  tailwind: "el-27",
+  snipe: "el-28",
+  cinder: "el-31",
+  brand: "el-32",
+  wildfire: "el-33",
+  scorch: "el-34",
+  inferno: "el-35",
+  rime: "el-36",
+  bitter: "el-37",
+  frostbite: "el-38",
+  hail: "el-39",
+  avalanche: "el-40",
+  spark: "el-41",
+  conduit: "el-42",
+  cascade: "el-43",
+  overload: "el-44",
+  breaker: "el-45",
+  venin: "el-46",
+  rot: "el-47",
+  toxicity: "el-48",
+  plague: "el-49",
+  miasma: "el-50",
+  tinderbox: "el-51",
+  matchstick: "el-52",
+  kindling: "el-57",
+  oilFlask: "el-58",
+  snowglobe: "el-53",
+  icicle: "el-54",
+  chilltouch: "el-55",
+  blackIce: "el-56",
+  shiver: "el-59",
+  permafrost: "el-60",
+  rimeShard: "el-61",
 } as const;
 
 const BANE_SOLO_POWER = 6;
+const SNIPE_SOLO_POWER = 6;
+const CLASS_SOLO_POWER = 5;
+const MATCHSTICK_SOLO_POWER = 2;
+const MATCHSTICK_SOLO_BURN = 1;
+const ICICLE_SOLO_POWER = 2;
+const ICICLE_SOLO_FREEZE = 1;
+const SHIVER_SOLO_POWER = 2;
+const SHIVER_SOLO_FREEZE = 1;
+const CHILLTOUCH_FREEZE_BONUS = 1;
+const PERMAFROST_CHIP_BONUS = 1;
 const TOXIN_SHIELD_PIERCE = 2;
+const ARC_SHIELD_PIERCE = 2;
+const BRAND_SHIELD_PIERCE = 1;
+const BLACK_ICE_SHIELD_PIERCE = 1;
+const ROT_SHIELD_PIERCE = 1;
 const MEND_CLEANSE = 2;
 const AEGIS_BONUS_SHIELD = 2;
 const EMBER_CHAIN_VALUE = 2;
+const TAILWIND_CHAIN_TAIL_VALUE = 2;
 const NIGHTSHADE_POISON_BONUS_CAP = 4;
+const GRIND_DOT_BONUS_CAP = 4;
+const HAIL_FREEZE_BONUS_CAP = 2;
 const PURGE_FREEZE_CLEANSE = 2;
 const FLINT_CHAIN_HEAD_VALUE = 3;
 const BASTION_HEAL = 1;
+const STATIC_FREEZE_THAW = 1;
+const FUSE_VOLT_BONUS = 2;
+const WILDFIRE_EXTRA_BURN = 1;
+export const OIL_FLASK_BURN_BONUS = 1;
+const SCORCH_BURN_BONUS = 1;
+const CASCADE_CHIP_BONUS = 2;
+const AVALANCHE_CHIP_BONUS = 2;
+const HEAL_ON_HIT = 1;
 
 /** Card is part of an affirmed chain (group ≥ 2 with a seam touching it). */
 export function isInAffirmedChain(
@@ -81,6 +145,23 @@ export function isLeftmostInAffirmedChain(
   return false;
 }
 
+/** True when the card is the rightmost card in an affirmed group of length ≥ 2. */
+export function isRightmostInAffirmedChain(
+  cardId: string,
+  hand: CardDefinition[],
+  affirmedSeams: ReadonlySet<string> | null,
+): boolean {
+  if (!affirmedSeams || affirmedSeams.size === 0) return false;
+  for (const group of buildGroups(hand, affirmedSeams)) {
+    if (group.length < 2) continue;
+    const last = group[group.length - 1];
+    if (last.id !== cardId) continue;
+    const prev = group[group.length - 2];
+    if (affirmedSeams.has(seamKey(prev.id, last.id))) return true;
+  }
+  return false;
+}
+
 function snapBondContribution(
   card: CardDefinition,
   hand: CardDefinition[],
@@ -99,7 +180,7 @@ export function resolvedSnapDisplayValue(
   const inChain = isInAffirmedChain(card.id, hand, affirmedSeams);
   const catalogId = elementCatalogId(card.id);
 
-  if (catalogId === ELEMENT_ABILITY_CATALOG.ember && inChain) {
+  if (isChainEnabler(catalogId) && inChain) {
     return {
       value: EMBER_CHAIN_VALUE,
       boosted: EMBER_CHAIN_VALUE > base,
@@ -111,6 +192,18 @@ export function resolvedSnapDisplayValue(
       boosted: BANE_SOLO_POWER > base,
     };
   }
+  if (isClassSoloFinisher(catalogId) && !inChain) {
+    return {
+      value: CLASS_SOLO_POWER,
+      boosted: CLASS_SOLO_POWER > base,
+    };
+  }
+  if (isSoloChipFinisher(catalogId) && !inChain) {
+    return {
+      value: MATCHSTICK_SOLO_POWER,
+      boosted: MATCHSTICK_SOLO_POWER > base,
+    };
+  }
   if (
     catalogId === ELEMENT_ABILITY_CATALOG.flint &&
     isLeftmostInAffirmedChain(card.id, hand, affirmedSeams)
@@ -118,6 +211,15 @@ export function resolvedSnapDisplayValue(
     return {
       value: FLINT_CHAIN_HEAD_VALUE,
       boosted: FLINT_CHAIN_HEAD_VALUE > base,
+    };
+  }
+  if (
+    catalogId === ELEMENT_ABILITY_CATALOG.tailwind &&
+    isRightmostInAffirmedChain(card.id, hand, affirmedSeams)
+  ) {
+    return {
+      value: TAILWIND_CHAIN_TAIL_VALUE,
+      boosted: TAILWIND_CHAIN_TAIL_VALUE > base,
     };
   }
   return { value: base, boosted: false };
@@ -148,12 +250,49 @@ export function buildHandAttackQueueWithAbilities(
   bonds: ElementBond[],
   affirmedSeams: ReadonlySet<string> | null,
 ): BrawlHandAttack[] {
-  const queue = buildHandAttackQueue(hand, bonds);
+  const queue = buildHandAttackQueue(hand, bonds, affirmedSeams);
   return queue.map((attack) => {
     if (attack.element || attack.skipAttack) return attack;
-    if (elementCatalogId(attack.id) !== ELEMENT_ABILITY_CATALOG.bane) return attack;
-    if (isInAffirmedChain(attack.id, hand, affirmedSeams)) return attack;
-    return { ...attack, power: BANE_SOLO_POWER, label: "Solo Hit" };
+    const catalogId = elementCatalogId(attack.id);
+    if (catalogId === ELEMENT_ABILITY_CATALOG.bane && !isInAffirmedChain(attack.id, hand, affirmedSeams)) {
+      return { ...attack, power: BANE_SOLO_POWER, label: "Solo Hit" };
+    }
+    if (catalogId === ELEMENT_ABILITY_CATALOG.snipe && !isInAffirmedChain(attack.id, hand, affirmedSeams)) {
+      return { ...attack, power: SNIPE_SOLO_POWER, label: "Solo Shock" };
+    }
+    if (
+      isClassSoloFinisher(catalogId) &&
+      !isInAffirmedChain(attack.id, hand, affirmedSeams)
+    ) {
+      const label =
+        catalogId === ELEMENT_ABILITY_CATALOG.inferno
+          ? "Solo Fire"
+          : catalogId === ELEMENT_ABILITY_CATALOG.avalanche
+            ? "Solo Freeze"
+            : catalogId === ELEMENT_ABILITY_CATALOG.breaker
+              ? "Solo Shock"
+              : "Solo Poison";
+      return { ...attack, power: CLASS_SOLO_POWER, label };
+    }
+    if (
+      catalogId === ELEMENT_ABILITY_CATALOG.matchstick &&
+      !isInAffirmedChain(attack.id, hand, affirmedSeams)
+    ) {
+      return { ...attack, power: MATCHSTICK_SOLO_POWER, label: "Solo Spark" };
+    }
+    if (
+      catalogId === ELEMENT_ABILITY_CATALOG.icicle &&
+      !isInAffirmedChain(attack.id, hand, affirmedSeams)
+    ) {
+      return { ...attack, power: ICICLE_SOLO_POWER, label: "Solo Chill" };
+    }
+    if (
+      catalogId === ELEMENT_ABILITY_CATALOG.shiver &&
+      !isInAffirmedChain(attack.id, hand, affirmedSeams)
+    ) {
+      return { ...attack, power: SHIVER_SOLO_POWER, label: "Solo Shiver" };
+    }
+    return attack;
   });
 }
 
@@ -248,6 +387,16 @@ function defenderPoisonStack(
   return attackerIsPlayer ? state.poisonOnCpu : state.poisonOnPlayer;
 }
 
+function defenderDotStackTotal(
+  state: ElementCombatState,
+  attackerIsPlayer: boolean,
+): number {
+  if (attackerIsPlayer) {
+    return state.burnOnCpu + state.poisonOnCpu;
+  }
+  return state.burnOnPlayer + state.poisonOnPlayer;
+}
+
 function bondIncludesCatalog(
   catalogKey: keyof typeof ELEMENT_ABILITY_CATALOG,
   leftCardId: string,
@@ -259,6 +408,103 @@ function bondIncludesCatalog(
   return false;
 }
 
+function isChainEnabler(catalogId: string): boolean {
+  return (
+    catalogId === ELEMENT_ABILITY_CATALOG.ember ||
+    catalogId === ELEMENT_ABILITY_CATALOG.cinder ||
+    catalogId === ELEMENT_ABILITY_CATALOG.rime ||
+    catalogId === ELEMENT_ABILITY_CATALOG.spark ||
+    catalogId === ELEMENT_ABILITY_CATALOG.venin
+  );
+}
+
+function isClassSoloFinisher(catalogId: string): boolean {
+  return (
+    catalogId === ELEMENT_ABILITY_CATALOG.inferno ||
+    catalogId === ELEMENT_ABILITY_CATALOG.avalanche ||
+    catalogId === ELEMENT_ABILITY_CATALOG.breaker ||
+    catalogId === ELEMENT_ABILITY_CATALOG.miasma
+  );
+}
+
+function isSoloChipFinisher(catalogId: string): boolean {
+  return (
+    catalogId === ELEMENT_ABILITY_CATALOG.matchstick ||
+    catalogId === ELEMENT_ABILITY_CATALOG.icicle ||
+    catalogId === ELEMENT_ABILITY_CATALOG.shiver
+  );
+}
+
+function defenderBurnStack(
+  state: ElementCombatState,
+  attackerIsPlayer: boolean,
+): number {
+  return attackerIsPlayer ? state.burnOnCpu : state.burnOnPlayer;
+}
+
+function defenderFreezeStack(
+  state: ElementCombatState,
+  attackerIsPlayer: boolean,
+): number {
+  return attackerIsPlayer ? state.freezeOnCpu : state.freezeOnPlayer;
+}
+
+function defenderWasChipped(
+  state: ElementCombatState,
+  attackerIsPlayer: boolean,
+): boolean {
+  return attackerIsPlayer
+    ? state.cpuHP < BRAWL_START_HP
+    : state.playerHP < BRAWL_START_HP;
+}
+
+function attackerHandHasOilFlask(handCatalogIds?: readonly string[]): boolean {
+  return handCatalogIds?.includes(ELEMENT_ABILITY_CATALOG.oilFlask) ?? false;
+}
+
+/** +1 burn when Oil Flask is in the attacker's locked hand and a fire hit applied burn. */
+function applyOilFlaskBurnBonus(
+  before: ElementCombatState,
+  after: ElementCombatState,
+  params: {
+    element?: Element;
+    leftCardId: string;
+  },
+  attackerIsPlayer: boolean,
+  handCatalogIds?: readonly string[],
+): ElementCombatState {
+  if (!attackerHandHasOilFlask(handCatalogIds)) return after;
+  const burnBefore = defenderBurnStack(before, attackerIsPlayer);
+  const burnAfter = defenderBurnStack(after, attackerIsPlayer);
+  if (burnAfter <= burnBefore) return after;
+  const next = { ...after };
+  if (attackerIsPlayer) {
+    next.burnOnCpu += OIL_FLASK_BURN_BONUS;
+  } else {
+    next.burnOnPlayer += OIL_FLASK_BURN_BONUS;
+  }
+  return next;
+}
+
+function finishCombatHit(
+  before: ElementCombatState,
+  after: ElementCombatState,
+  params: {
+    element?: Element;
+    leftCardId: string;
+    attackerHandCatalogIds?: readonly string[];
+  },
+  attackerIsPlayer: boolean,
+): ElementCombatState {
+  return applyOilFlaskBurnBonus(
+    before,
+    after,
+    params,
+    attackerIsPlayer,
+    params.attackerHandCatalogIds,
+  );
+}
+
 /** Resolve one card hit with catalog fight abilities. */
 export function applyElementCombatHit(
   state: ElementCombatState,
@@ -267,10 +513,64 @@ export function applyElementCombatHit(
     power: number;
     leftCardId: string;
     rightCardId?: string;
+    /** Affirmed group size for freeze chip scaling (solo = 1, chain = N). */
+    combineCount?: number;
+    /** Catalog ids in the attacker's locked hand (Oil Flask passive). */
+    attackerHandCatalogIds?: readonly string[];
   },
   attackerIsPlayer: boolean,
 ): ElementCombatState {
+  const before = state;
+  const after = resolveElementCombatHit(state, params, attackerIsPlayer);
+  return finishCombatHit(before, after, params, attackerIsPlayer);
+}
+
+function resolveElementCombatHit(
+  state: ElementCombatState,
+  params: {
+    element?: Element;
+    power: number;
+    leftCardId: string;
+    rightCardId?: string;
+    combineCount?: number;
+    attackerHandCatalogIds?: readonly string[];
+  },
+  attackerIsPlayer: boolean,
+): ElementCombatState {
+  const freezeOpts =
+    params.combineCount != null
+      ? { combineCount: params.combineCount }
+      : undefined;
+
   if (!params.element) {
+    const catalogId = elementCatalogId(params.leftCardId);
+    if (catalogId === ELEMENT_ABILITY_CATALOG.matchstick) {
+      const hit = applyGenericCombatHit(state, params.power, attackerIsPlayer);
+      if (attackerIsPlayer) {
+        hit.burnOnCpu += MATCHSTICK_SOLO_BURN;
+      } else {
+        hit.burnOnPlayer += MATCHSTICK_SOLO_BURN;
+      }
+      return hit;
+    }
+    if (catalogId === ELEMENT_ABILITY_CATALOG.icicle) {
+      const hit = applyGenericCombatHit(state, params.power, attackerIsPlayer);
+      if (attackerIsPlayer) {
+        hit.freezeOnCpu += ICICLE_SOLO_FREEZE;
+      } else {
+        hit.freezeOnPlayer += ICICLE_SOLO_FREEZE;
+      }
+      return hit;
+    }
+    if (catalogId === ELEMENT_ABILITY_CATALOG.shiver) {
+      const hit = applyGenericCombatHit(state, params.power, attackerIsPlayer);
+      if (attackerIsPlayer) {
+        hit.freezeOnCpu += SHIVER_SOLO_FREEZE;
+      } else {
+        hit.freezeOnPlayer += SHIVER_SOLO_FREEZE;
+      }
+      return hit;
+    }
     return applyGenericCombatHit(state, params.power, attackerIsPlayer);
   }
 
@@ -294,6 +594,73 @@ export function applyElementCombatHit(
   }
 
   if (
+    catalogId === ELEMENT_ABILITY_CATALOG.surge &&
+    bond.element === "volt"
+  ) {
+    return applyDamageToDefender(
+      state,
+      attackerIsPlayer,
+      bond.power * 2,
+    );
+  }
+
+  if (
+    catalogId === ELEMENT_ABILITY_CATALOG.overload &&
+    bond.element === "volt"
+  ) {
+    return applyDamageToDefender(
+      state,
+      attackerIsPlayer,
+      bond.power * 2,
+    );
+  }
+
+  if (
+    bond.element === "fire" &&
+    bondIncludesCatalog("brand", params.leftCardId, params.rightCardId)
+  ) {
+    const pierced = pierceDefenderShield(
+      state,
+      attackerIsPlayer,
+      BRAND_SHIELD_PIERCE,
+    );
+    return applyInstantCombatBond(pierced, bond, attackerIsPlayer);
+  }
+
+  if (
+    bond.element === "fire" &&
+    bondIncludesCatalog("wildfire", params.leftCardId, params.rightCardId)
+  ) {
+    const fired = applyInstantCombatBond(state, bond, attackerIsPlayer);
+    if (attackerIsPlayer) {
+      fired.burnOnCpu += WILDFIRE_EXTRA_BURN;
+    } else {
+      fired.burnOnPlayer += WILDFIRE_EXTRA_BURN;
+    }
+    return fired;
+  }
+
+  if (
+    bond.element === "fire" &&
+    bondIncludesCatalog("scorch", params.leftCardId, params.rightCardId) &&
+    defenderBurnStack(state, attackerIsPlayer) > 0
+  ) {
+    return applyInstantCombatBond(
+      state,
+      { ...bond, power: bond.power + SCORCH_BURN_BONUS },
+      attackerIsPlayer,
+    );
+  }
+
+  if (
+    bond.element === "fire" &&
+    bondIncludesCatalog("fuse", params.leftCardId, params.rightCardId)
+  ) {
+    const fired = applyInstantCombatBond(state, bond, attackerIsPlayer);
+    return applyDamageToDefender(fired, attackerIsPlayer, FUSE_VOLT_BONUS);
+  }
+
+  if (
     bond.element === "fire" &&
     bondIncludesCatalog("kindle", params.leftCardId, params.rightCardId)
   ) {
@@ -308,24 +675,112 @@ export function applyElementCombatHit(
 
   if (
     bond.element === "freeze" &&
+    bondIncludesCatalog("blackIce", params.leftCardId, params.rightCardId)
+  ) {
+    const pierced = pierceDefenderShield(
+      state,
+      attackerIsPlayer,
+      BLACK_ICE_SHIELD_PIERCE,
+    );
+    return applyInstantCombatBond(pierced, bond, attackerIsPlayer, freezeOpts);
+  }
+
+  if (
+    bond.element === "freeze" &&
+    bondIncludesCatalog("frostbite", params.leftCardId, params.rightCardId)
+  ) {
+    const frozen = applyInstantCombatBond(
+      state,
+      bond,
+      attackerIsPlayer,
+      freezeOpts,
+    );
+    return healAttacker(frozen, attackerIsPlayer, HEAL_ON_HIT);
+  }
+
+  if (
+    bond.element === "freeze" &&
+    bondIncludesCatalog("hail", params.leftCardId, params.rightCardId)
+  ) {
+    const bonus = Math.min(
+      HAIL_FREEZE_BONUS_CAP,
+      Math.floor(defenderFreezeStack(state, attackerIsPlayer) / 4),
+    );
+    return applyFreezeBondEffect(
+      state,
+      attackerIsPlayer,
+      bond.power,
+      bond.power + bonus,
+      params.combineCount ?? 2,
+    );
+  }
+
+  if (
+    bond.element === "freeze" &&
+    bondIncludesCatalog("chilltouch", params.leftCardId, params.rightCardId) &&
+    defenderFreezeStack(state, attackerIsPlayer) > 0
+  ) {
+    return applyInstantCombatBond(
+      state,
+      { ...bond, power: bond.power + CHILLTOUCH_FREEZE_BONUS },
+      attackerIsPlayer,
+      freezeOpts,
+    );
+  }
+
+  if (
+    bond.element === "freeze" &&
+    bondIncludesCatalog("permafrost", params.leftCardId, params.rightCardId) &&
+    defenderFreezeStack(state, attackerIsPlayer) > 0
+  ) {
+    const frozen = applyInstantCombatBond(
+      state,
+      bond,
+      attackerIsPlayer,
+      freezeOpts,
+    );
+    return applyDamageToDefender(
+      frozen,
+      attackerIsPlayer,
+      PERMAFROST_CHIP_BONUS,
+    );
+  }
+
+  if (
+    bond.element === "freeze" &&
+    bondIncludesCatalog("avalanche", params.leftCardId, params.rightCardId)
+  ) {
+    const frozen = applyInstantCombatBond(
+      state,
+      bond,
+      attackerIsPlayer,
+      freezeOpts,
+    );
+    return applyDamageToDefender(
+      frozen,
+      attackerIsPlayer,
+      AVALANCHE_CHIP_BONUS,
+    );
+  }
+
+  if (
+    bond.element === "freeze" &&
     bondIncludesCatalog("glacia", params.leftCardId, params.rightCardId)
   ) {
-    const next = { ...state };
-    const freezePower = bond.power * 2;
-    if (attackerIsPlayer) {
-      next.freezeOnCpu += freezePower;
-    } else {
-      next.freezeOnPlayer += freezePower;
-    }
-    return next;
+    return applyFreezeBondEffect(
+      state,
+      attackerIsPlayer,
+      bond.power,
+      bond.power * 2,
+      params.combineCount ?? 2,
+    );
   }
 
   if (
     bond.element === "freeze" &&
     bondIncludesCatalog("hoarfrost", params.leftCardId, params.rightCardId)
   ) {
-    const frozen = applyInstantCombatBond(state, bond, attackerIsPlayer);
-    return applyDamageToDefender(frozen, attackerIsPlayer, bond.power);
+    return applyInstantCombatBond(state, bond, attackerIsPlayer, freezeOpts);
   }
 
   if (
@@ -338,6 +793,51 @@ export function applyElementCombatHit(
       TOXIN_SHIELD_PIERCE,
     );
     return applyInstantCombatBond(pierced, bond, attackerIsPlayer);
+  }
+
+  if (
+    bond.element === "poison" &&
+    bondIncludesCatalog("rot", params.leftCardId, params.rightCardId)
+  ) {
+    const pierced = pierceDefenderShield(
+      state,
+      attackerIsPlayer,
+      ROT_SHIELD_PIERCE,
+    );
+    return applyInstantCombatBond(pierced, bond, attackerIsPlayer);
+  }
+
+  if (
+    bond.element === "poison" &&
+    bondIncludesCatalog("toxicity", params.leftCardId, params.rightCardId) &&
+    defenderDotStackTotal(state, attackerIsPlayer) > 0
+  ) {
+    return applyInstantCombatBond(
+      state,
+      { ...bond, power: bond.power + 1 },
+      attackerIsPlayer,
+    );
+  }
+
+  if (
+    bond.element === "poison" &&
+    bondIncludesCatalog("plague", params.leftCardId, params.rightCardId)
+  ) {
+    const poisoned = applyInstantCombatBond(state, bond, attackerIsPlayer);
+    return healAttacker(poisoned, attackerIsPlayer, HEAL_ON_HIT);
+  }
+
+  if (
+    bond.element === "poison" &&
+    bondIncludesCatalog("miasma", params.leftCardId, params.rightCardId)
+  ) {
+    const poisoned = applyInstantCombatBond(state, bond, attackerIsPlayer);
+    if (attackerIsPlayer) {
+      poisoned.poisonOnCpu += bond.power;
+    } else {
+      poisoned.poisonOnPlayer += bond.power;
+    }
+    return poisoned;
   }
 
   if (
@@ -365,6 +865,70 @@ export function applyElementCombatHit(
       attackerIsPlayer,
       Math.floor(bond.power / 2),
     );
+  }
+
+  if (bondIncludesCatalog("grind", params.leftCardId, params.rightCardId)) {
+    const bonus = Math.min(
+      defenderDotStackTotal(state, attackerIsPlayer),
+      GRIND_DOT_BONUS_CAP,
+    );
+    return applyInstantCombatBond(
+      state,
+      { ...bond, power: bond.power + bonus },
+      attackerIsPlayer,
+    );
+  }
+
+  if (
+    bond.element === "volt" &&
+    bondIncludesCatalog("conduit", params.leftCardId, params.rightCardId)
+  ) {
+    const shocked = applyDamageToDefender(state, attackerIsPlayer, bond.power);
+    return healAttacker(shocked, attackerIsPlayer, HEAL_ON_HIT);
+  }
+
+  if (
+    bond.element === "volt" &&
+    bondIncludesCatalog("cascade", params.leftCardId, params.rightCardId) &&
+    defenderWasChipped(state, attackerIsPlayer)
+  ) {
+    return applyDamageToDefender(
+      state,
+      attackerIsPlayer,
+      bond.power + CASCADE_CHIP_BONUS,
+    );
+  }
+
+  if (
+    bond.element === "volt" &&
+    bondIncludesCatalog("breaker", params.leftCardId, params.rightCardId)
+  ) {
+    const pierced = pierceDefenderShield(
+      state,
+      attackerIsPlayer,
+      ARC_SHIELD_PIERCE,
+    );
+    return applyDamageToDefender(pierced, attackerIsPlayer, bond.power);
+  }
+
+  if (
+    bond.element === "volt" &&
+    bondIncludesCatalog("arc", params.leftCardId, params.rightCardId)
+  ) {
+    const pierced = pierceDefenderShield(
+      state,
+      attackerIsPlayer,
+      ARC_SHIELD_PIERCE,
+    );
+    return applyDamageToDefender(pierced, attackerIsPlayer, bond.power);
+  }
+
+  if (
+    bond.element === "volt" &&
+    bondIncludesCatalog("static", params.leftCardId, params.rightCardId)
+  ) {
+    const shocked = applyDamageToDefender(state, attackerIsPlayer, bond.power);
+    return thawAttacker(shocked, attackerIsPlayer, STATIC_FREEZE_THAW);
   }
 
   if (catalogId === ELEMENT_ABILITY_CATALOG.mend && bond.element === "heal") {
@@ -397,8 +961,17 @@ export function applyElementCombatHit(
     if (bastionInBond) {
       result = healAttacker(result, attackerIsPlayer, BASTION_HEAL);
     }
+    if (
+      bondIncludesCatalog("bitter", params.leftCardId, params.rightCardId)
+    ) {
+      if (attackerIsPlayer) {
+        result.freezeOnCpu += HEAL_ON_HIT;
+      } else {
+        result.freezeOnPlayer += HEAL_ON_HIT;
+      }
+    }
     return result;
   }
 
-  return applyInstantCombatBond(state, bond, attackerIsPlayer);
+  return applyInstantCombatBond(state, bond, attackerIsPlayer, freezeOpts);
 }
