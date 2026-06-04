@@ -1,16 +1,20 @@
 /**
- * Per-card snap and fight abilities for the 61-card mage arena deck.
+ * Per-card snap and fight abilities for the 67-card mage arena deck.
  */
 import type { CardDefinition } from "./cards";
 import { printedNumericValue } from "./cardModel";
 import { seamKey } from "./connect";
 import { buildGroups } from "./scoring";
 import { elementCatalogId } from "./elementDeal";
+import { isWildcardBridgeCatalogId } from "./elementClassPools";
 import {
   applyGenericCombatHit,
   applyInstantCombatBond,
   applyDamageToDefender,
   applyFreezeBondEffect,
+  applyFreezeStrike,
+  applyPoisonStrike,
+  grantVoltBarrier,
   buildHandAttackQueue,
   computeElementBonds,
   BRAWL_START_HP,
@@ -76,19 +80,42 @@ export const ELEMENT_ABILITY_CATALOG = {
   rimeShard: "el-61",
   gridSurge: "el-62",
   chainLightning: "el-63",
+  viperFang: "el-64",
+  hemlockNeedle: "el-65",
+  snowHare: "el-66",
+  frostMite: "el-67",
+  faradayCage: "el-68",
+  staticWard: "el-69",
 } as const;
 
-const BANE_SOLO_POWER = 6;
+const BANE_SOLO_POWER = 5;
 const SNIPE_SOLO_POWER = 6;
 const CLASS_SOLO_POWER = 5;
+const MIASMA_POISON_STACK_MULT = 0.75;
 const MATCHSTICK_SOLO_POWER = 2;
 const MATCHSTICK_SOLO_BURN = 1;
-const ICICLE_SOLO_POWER = 2;
+const ICICLE_SOLO_POWER = 3;
 const ICICLE_SOLO_FREEZE = 1;
-const SHIVER_SOLO_POWER = 2;
+const SHIVER_SOLO_POWER = 3;
 const SHIVER_SOLO_FREEZE = 2;
+const VIPER_FANG_SOLO_POWER = 2;
+const VIPER_FANG_SOLO_POISON = 1;
+const VIPER_FANG_ACTIVATED_POISON = 2;
+const HEMLOCK_ACTIVATED_POISON = 1;
+const SNOW_HARE_SOLO_POWER = 2;
+const SNOW_HARE_SOLO_CHILL = 1;
+const SNOW_HARE_ACTIVATED_CHILL = 1;
+const FROST_MITE_SOLO_POWER = 2;
+const FROST_MITE_SOLO_CHILL = 1;
+const FROST_MITE_ACTIVATED_CHILL = 2;
+const JOLT_SOLO_POWER = 3;
+const FARADAY_SOLO_POWER = 3;
+const FARADAY_BARRIER = 4;
+const FARADAY_ACTIVATE_CHIP = 2;
+const STATIC_BARRIER = 3;
+const STATIC_ACTIVATE_CHIP = 2;
 const CHILLTOUCH_FREEZE_BONUS = 1;
-const PERMAFROST_CHIP_BONUS = 1;
+const PERMAFROST_CHIP_BONUS = 2;
 const TOXIN_SHIELD_PIERCE = 2;
 const ARC_SHIELD_PIERCE = 2;
 const BRAND_SHIELD_PIERCE = 1;
@@ -98,8 +125,8 @@ const MEND_CLEANSE = 2;
 const AEGIS_BONUS_SHIELD = 2;
 const EMBER_CHAIN_VALUE = 2;
 const TAILWIND_CHAIN_TAIL_VALUE = 2;
-const NIGHTSHADE_POISON_BONUS_CAP = 4;
-const GRIND_DOT_BONUS_CAP = 4;
+const NIGHTSHADE_POISON_BONUS_CAP = 3;
+const GRIND_DOT_BONUS_CAP = 3;
 const HAIL_FREEZE_BONUS_CAP = 2;
 const PURGE_FREEZE_CLEANSE = 2;
 const FLINT_CHAIN_HEAD_VALUE = 3;
@@ -110,10 +137,12 @@ const WILDFIRE_EXTRA_BURN = 1;
 export const OIL_FLASK_BURN_BONUS = 1;
 const SCORCH_BURN_BONUS = 1;
 const FLARE_BURN_BONUS = 1;
-const CASCADE_CHIP_BONUS = 2;
-const CHAIN_LIGHTNING_PER_CARD = 2;
-const AVALANCHE_CHIP_BONUS = 2;
+const CASCADE_CHIP_BONUS = 3;
+const CHAIN_LIGHTNING_PER_CARD = 3;
+const AVALANCHE_CHIP_BONUS = 3;
 const HEAL_ON_HIT = 1;
+/** Bond power reduction when a wildcard bridge card is on the seam. */
+export const WILDCARD_BRIDGE_BOND_PENALTY = 1;
 
 /** Card is part of an affirmed chain (group ≥ 2 with a seam touching it). */
 export function isInAffirmedChain(
@@ -204,10 +233,8 @@ export function resolvedSnapDisplayValue(
     };
   }
   if (isSoloChipFinisher(catalogId) && !inChain) {
-    return {
-      value: MATCHSTICK_SOLO_POWER,
-      boosted: MATCHSTICK_SOLO_POWER > base,
-    };
+    const solo = soloChipFinisherPower(catalogId);
+    return { value: solo, boosted: solo > base };
   }
   if (
     catalogId === ELEMENT_ABILITY_CATALOG.flint &&
@@ -230,6 +257,24 @@ export function resolvedSnapDisplayValue(
   return { value: base, boosted: false };
 }
 
+function bondPowerAfterSnap(
+  left: CardDefinition,
+  right: CardDefinition,
+  hand: CardDefinition[],
+  affirmedSeams: ReadonlySet<string> | null,
+): number {
+  let power =
+    snapBondContribution(left, hand, affirmedSeams) +
+    snapBondContribution(right, hand, affirmedSeams);
+  if (
+    isWildcardBridgeCatalogId(elementCatalogId(left.id)) ||
+    isWildcardBridgeCatalogId(elementCatalogId(right.id))
+  ) {
+    power = Math.max(1, power - WILDCARD_BRIDGE_BOND_PENALTY);
+  }
+  return power;
+}
+
 /** Bonds with Ember chain value and other snap adjustments applied. */
 export function computeElementBondsWithAbilities(
   hand: CardDefinition[],
@@ -242,9 +287,7 @@ export function computeElementBondsWithAbilities(
     if (!left || !right) return bond;
     return {
       ...bond,
-      power:
-        snapBondContribution(left, hand, affirmedSeams) +
-        snapBondContribution(right, hand, affirmedSeams),
+      power: bondPowerAfterSnap(left, right, hand, affirmedSeams),
     };
   });
 }
@@ -296,6 +339,22 @@ export function buildHandAttackQueueWithAbilities(
       !isInAffirmedChain(attack.id, hand, affirmedSeams)
     ) {
       return { ...attack, power: SHIVER_SOLO_POWER, label: "Deep Shiver" };
+    }
+    if (isSoloChipFinisher(catalogId) && !isInAffirmedChain(attack.id, hand, affirmedSeams)) {
+      const power = soloChipFinisherPower(catalogId);
+      const label =
+        catalogId === ELEMENT_ABILITY_CATALOG.viperFang
+          ? "Solo Venom"
+          : catalogId === ELEMENT_ABILITY_CATALOG.snowHare
+            ? "Solo Chill"
+            : catalogId === ELEMENT_ABILITY_CATALOG.frostMite
+              ? "Solo Chill"
+              : catalogId === ELEMENT_ABILITY_CATALOG.faradayCage
+                ? "Solo Shock"
+                : catalogId === ELEMENT_ABILITY_CATALOG.jolt
+                  ? "Solo Shock"
+                  : "Solo Hit";
+      return { ...attack, power, label };
     }
     return attack;
   });
@@ -436,8 +495,24 @@ function isSoloChipFinisher(catalogId: string): boolean {
   return (
     catalogId === ELEMENT_ABILITY_CATALOG.matchstick ||
     catalogId === ELEMENT_ABILITY_CATALOG.icicle ||
-    catalogId === ELEMENT_ABILITY_CATALOG.shiver
+    catalogId === ELEMENT_ABILITY_CATALOG.shiver ||
+    catalogId === ELEMENT_ABILITY_CATALOG.viperFang ||
+    catalogId === ELEMENT_ABILITY_CATALOG.snowHare ||
+    catalogId === ELEMENT_ABILITY_CATALOG.frostMite ||
+    catalogId === ELEMENT_ABILITY_CATALOG.faradayCage ||
+    catalogId === ELEMENT_ABILITY_CATALOG.jolt
   );
+}
+
+function soloChipFinisherPower(catalogId: string): number {
+  if (catalogId === ELEMENT_ABILITY_CATALOG.icicle) return ICICLE_SOLO_POWER;
+  if (catalogId === ELEMENT_ABILITY_CATALOG.shiver) return SHIVER_SOLO_POWER;
+  if (catalogId === ELEMENT_ABILITY_CATALOG.viperFang) return VIPER_FANG_SOLO_POWER;
+  if (catalogId === ELEMENT_ABILITY_CATALOG.snowHare) return SNOW_HARE_SOLO_POWER;
+  if (catalogId === ELEMENT_ABILITY_CATALOG.frostMite) return FROST_MITE_SOLO_POWER;
+  if (catalogId === ELEMENT_ABILITY_CATALOG.faradayCage) return FARADAY_SOLO_POWER;
+  if (catalogId === ELEMENT_ABILITY_CATALOG.jolt) return JOLT_SOLO_POWER;
+  return MATCHSTICK_SOLO_POWER;
 }
 
 function defenderBurnStack(
@@ -585,6 +660,46 @@ function resolveElementCombatHit(
       }
       return hit;
     }
+    if (catalogId === ELEMENT_ABILITY_CATALOG.viperFang) {
+      return applyPoisonStrike(
+        state,
+        attackerIsPlayer,
+        VIPER_FANG_SOLO_POWER,
+        VIPER_FANG_SOLO_POISON,
+      );
+    }
+    if (catalogId === ELEMENT_ABILITY_CATALOG.snowHare) {
+      return applyFreezeStrike(
+        state,
+        attackerIsPlayer,
+        SNOW_HARE_SOLO_POWER,
+        SNOW_HARE_SOLO_CHILL,
+        1,
+      );
+    }
+    if (catalogId === ELEMENT_ABILITY_CATALOG.frostMite) {
+      return applyFreezeStrike(
+        state,
+        attackerIsPlayer,
+        FROST_MITE_SOLO_POWER,
+        FROST_MITE_SOLO_CHILL,
+        1,
+      );
+    }
+    if (catalogId === ELEMENT_ABILITY_CATALOG.faradayCage) {
+      return applyGenericCombatHit(
+        state,
+        FARADAY_SOLO_POWER,
+        attackerIsPlayer,
+      );
+    }
+    if (catalogId === ELEMENT_ABILITY_CATALOG.jolt) {
+      return applyGenericCombatHit(
+        state,
+        JOLT_SOLO_POWER,
+        attackerIsPlayer,
+      );
+    }
     return applyGenericCombatHit(state, params.power, attackerIsPlayer);
   }
 
@@ -600,33 +715,27 @@ function resolveElementCombatHit(
     catalogId === ELEMENT_ABILITY_CATALOG.blaze &&
     bond.element === "fire"
   ) {
-    return applyDamageToDefender(
-      state,
-      attackerIsPlayer,
-      bond.power * 2,
-    );
+    return applyDamageToDefender(state, attackerIsPlayer, bond.power * 2, {
+      fromCardAttack: true,
+    });
   }
 
   if (
     catalogId === ELEMENT_ABILITY_CATALOG.surge &&
     bond.element === "volt"
   ) {
-    return applyDamageToDefender(
-      state,
-      attackerIsPlayer,
-      bond.power * 2,
-    );
+    return applyDamageToDefender(state, attackerIsPlayer, bond.power * 2, {
+      fromCardAttack: true,
+    });
   }
 
   if (
     catalogId === ELEMENT_ABILITY_CATALOG.overload &&
     bond.element === "volt"
   ) {
-    return applyDamageToDefender(
-      state,
-      attackerIsPlayer,
-      bond.power * 2,
-    );
+    return applyDamageToDefender(state, attackerIsPlayer, bond.power * 2, {
+      fromCardAttack: true,
+    });
   }
 
   if (
@@ -685,7 +794,9 @@ function resolveElementCombatHit(
     bondIncludesCatalog("fuse", params.leftCardId, params.rightCardId)
   ) {
     const fired = applyInstantCombatBond(state, bond, attackerIsPlayer);
-    return applyDamageToDefender(fired, attackerIsPlayer, FUSE_VOLT_BONUS);
+    return applyDamageToDefender(fired, attackerIsPlayer, FUSE_VOLT_BONUS, {
+      fromCardAttack: true,
+    });
   }
 
   if (
@@ -771,6 +882,7 @@ function resolveElementCombatHit(
       frozen,
       attackerIsPlayer,
       PERMAFROST_CHIP_BONUS,
+      { fromCardAttack: true },
     );
   }
 
@@ -788,6 +900,7 @@ function resolveElementCombatHit(
       frozen,
       attackerIsPlayer,
       AVALANCHE_CHIP_BONUS,
+      { fromCardAttack: true },
     );
   }
 
@@ -809,6 +922,82 @@ function resolveElementCombatHit(
     bondIncludesCatalog("hoarfrost", params.leftCardId, params.rightCardId)
   ) {
     return applyInstantCombatBond(state, bond, attackerIsPlayer, freezeOpts);
+  }
+
+  if (
+    catalogId === ELEMENT_ABILITY_CATALOG.viperFang &&
+    bond.element === "poison"
+  ) {
+    return applyPoisonStrike(
+      state,
+      attackerIsPlayer,
+      bond.power,
+      VIPER_FANG_ACTIVATED_POISON,
+    );
+  }
+
+  if (
+    catalogId === ELEMENT_ABILITY_CATALOG.hemlockNeedle &&
+    bond.element === "poison"
+  ) {
+    return applyPoisonStrike(
+      state,
+      attackerIsPlayer,
+      bond.power,
+      HEMLOCK_ACTIVATED_POISON,
+    );
+  }
+
+  if (
+    catalogId === ELEMENT_ABILITY_CATALOG.snowHare &&
+    bond.element === "freeze"
+  ) {
+    return applyFreezeStrike(
+      state,
+      attackerIsPlayer,
+      bond.power,
+      SNOW_HARE_ACTIVATED_CHILL,
+      params.combineCount ?? 2,
+    );
+  }
+
+  if (
+    catalogId === ELEMENT_ABILITY_CATALOG.frostMite &&
+    bond.element === "freeze"
+  ) {
+    return applyFreezeStrike(
+      state,
+      attackerIsPlayer,
+      bond.power,
+      FROST_MITE_ACTIVATED_CHILL,
+      params.combineCount ?? 2,
+    );
+  }
+
+  if (
+    catalogId === ELEMENT_ABILITY_CATALOG.faradayCage &&
+    bond.element === "volt"
+  ) {
+    const barrier = grantVoltBarrier(state, attackerIsPlayer, FARADAY_BARRIER);
+    return applyDamageToDefender(
+      barrier,
+      attackerIsPlayer,
+      Math.max(FARADAY_ACTIVATE_CHIP, bond.power),
+      { fromCardAttack: true },
+    );
+  }
+
+  if (
+    catalogId === ELEMENT_ABILITY_CATALOG.staticWard &&
+    bond.element === "volt"
+  ) {
+    const barrier = grantVoltBarrier(state, attackerIsPlayer, STATIC_BARRIER);
+    return applyDamageToDefender(
+      barrier,
+      attackerIsPlayer,
+      Math.max(STATIC_ACTIVATE_CHIP, bond.power),
+      { fromCardAttack: true },
+    );
   }
 
   if (
@@ -860,10 +1049,11 @@ function resolveElementCombatHit(
     bondIncludesCatalog("miasma", params.leftCardId, params.rightCardId)
   ) {
     const poisoned = applyInstantCombatBond(state, bond, attackerIsPlayer);
+    const extra = Math.max(1, Math.floor(bond.power * MIASMA_POISON_STACK_MULT));
     if (attackerIsPlayer) {
-      poisoned.poisonOnCpu += bond.power;
+      poisoned.poisonOnCpu += extra;
     } else {
-      poisoned.poisonOnPlayer += bond.power;
+      poisoned.poisonOnPlayer += extra;
     }
     return poisoned;
   }
@@ -911,7 +1101,9 @@ function resolveElementCombatHit(
     bond.element === "volt" &&
     bondIncludesCatalog("conduit", params.leftCardId, params.rightCardId)
   ) {
-    const shocked = applyDamageToDefender(state, attackerIsPlayer, bond.power);
+    const shocked = applyDamageToDefender(state, attackerIsPlayer, bond.power, {
+      fromCardAttack: true,
+    });
     return healAttacker(shocked, attackerIsPlayer, HEAL_ON_HIT);
   }
 
@@ -924,6 +1116,7 @@ function resolveElementCombatHit(
       state,
       attackerIsPlayer,
       bond.power + seams,
+      { fromCardAttack: true },
     );
   }
 
@@ -936,6 +1129,7 @@ function resolveElementCombatHit(
       state,
       attackerIsPlayer,
       bond.power + chain * CHAIN_LIGHTNING_PER_CARD,
+      { fromCardAttack: true },
     );
   }
 
@@ -948,6 +1142,7 @@ function resolveElementCombatHit(
       state,
       attackerIsPlayer,
       bond.power + CASCADE_CHIP_BONUS,
+      { fromCardAttack: true },
     );
   }
 
@@ -960,7 +1155,9 @@ function resolveElementCombatHit(
       attackerIsPlayer,
       ARC_SHIELD_PIERCE,
     );
-    return applyDamageToDefender(pierced, attackerIsPlayer, bond.power);
+    return applyDamageToDefender(pierced, attackerIsPlayer, bond.power, {
+      fromCardAttack: true,
+    });
   }
 
   if (
@@ -972,14 +1169,18 @@ function resolveElementCombatHit(
       attackerIsPlayer,
       ARC_SHIELD_PIERCE,
     );
-    return applyDamageToDefender(pierced, attackerIsPlayer, bond.power);
+    return applyDamageToDefender(pierced, attackerIsPlayer, bond.power, {
+      fromCardAttack: true,
+    });
   }
 
   if (
     bond.element === "volt" &&
     bondIncludesCatalog("static", params.leftCardId, params.rightCardId)
   ) {
-    const shocked = applyDamageToDefender(state, attackerIsPlayer, bond.power);
+    const shocked = applyDamageToDefender(state, attackerIsPlayer, bond.power, {
+      fromCardAttack: true,
+    });
     return thawAttacker(shocked, attackerIsPlayer, STATIC_FREEZE_THAW);
   }
 

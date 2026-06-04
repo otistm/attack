@@ -1,5 +1,6 @@
 import type { CardDefinition } from "./cards";
 import { ELEMENT_CARDS, ELEMENT_CARD_IDS } from "./elementCards";
+import { isWildcardBridgeCatalogId, poolDealWeight } from "./elementClassPools";
 
 /** Strip the runtime instance suffix from a dealt element card id. */
 export function elementCatalogId(id: string): string {
@@ -17,8 +18,49 @@ function mulberry32(seed: number) {
   };
 }
 
+function pickWeighted(
+  pool: readonly CardDefinition[],
+  rng: () => number,
+): CardDefinition {
+  let total = 0;
+  for (const c of pool) total += poolDealWeight(c.id);
+  let roll = rng() * total;
+  for (const c of pool) {
+    roll -= poolDealWeight(c.id);
+    if (roll <= 0) return c;
+  }
+  return pool[pool.length - 1]!;
+}
+
+function wildcardCountInCatalogIds(catalogIds: readonly string[]): number {
+  let n = 0;
+  for (const id of catalogIds) {
+    if (isWildcardBridgeCatalogId(id)) n++;
+  }
+  return n;
+}
+
+function dealOneFromPool(
+  pool: readonly CardDefinition[],
+  rng: () => number,
+  excludeCatalogIds: ReadonlySet<string>,
+  wildcardAlreadyInHand: boolean,
+): CardDefinition {
+  const available = pool.filter((c) => !excludeCatalogIds.has(c.id));
+  const source = available.length > 0 ? available : pool;
+  for (let attempt = 0; attempt < 64; attempt++) {
+    const template = pickWeighted(source, rng);
+    if (wildcardAlreadyInHand && isWildcardBridgeCatalogId(template.id)) {
+      continue;
+    }
+    return template;
+  }
+  return pickWeighted(source, rng);
+}
+
 /**
  * Deal `count` element cards from the shared pool (no signatures).
+ * At most one wildcard bridge per hand; optional per-card deal weights.
  */
 export function dealBrawlElementHand(
   count = 5,
@@ -31,11 +73,13 @@ export function dealBrawlElementHand(
   if (pool.length === 0) throw new Error("dealBrawlElementHand: empty pool");
   const rng = mulberry32(seed);
   const hand: CardDefinition[] = [];
+  const dealtCatalog = new Set<string>();
+  let wildcardDealt = false;
+
   for (let i = 0; i < count; i++) {
-    const idx = Math.floor(rng() * pool.length);
-    const template = pool[idx];
-    // Each dealt copy needs a unique id so React keys, Reorder.Item values,
-    // affirmed seam keys, and entry-animation tracking stay 1:1 with slots.
+    const template = dealOneFromPool(pool, rng, dealtCatalog, wildcardDealt);
+    if (isWildcardBridgeCatalogId(template.id)) wildcardDealt = true;
+    dealtCatalog.add(template.id);
     hand.push({ ...template, id: `${template.id}~${seed}-${i}` });
   }
   return hand;
@@ -57,7 +101,8 @@ export function dealBrawlReplacementCard(
     throw new Error("dealBrawlReplacementCard: no cards left in pool");
   }
   const rng = mulberry32(seed);
-  const idx = Math.floor(rng() * pool.length);
-  const template = pool[idx]!;
+  const wildcardAlready =
+    wildcardCountInCatalogIds(excludeCatalogIds) >= 1;
+  const template = dealOneFromPool(pool, rng, new Set(), wildcardAlready);
   return { ...template, id: `${template.id}~r${seed}` };
 }

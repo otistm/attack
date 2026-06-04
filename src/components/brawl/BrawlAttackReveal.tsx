@@ -157,6 +157,9 @@ export interface BrawlRevealOutput {
   displayedBatterShield: number;
   /** Shield absorb on the pitcher seat pill. */
   displayedPitcherShield: number;
+  /** Volt barrier stacks on batter / pitcher pills. */
+  displayedBatterBarrier: number;
+  displayedPitcherBarrier: number;
   /** Burn stack on batter / pitcher pills. */
   displayedBatterBurn: number;
   displayedPitcherBurn: number;
@@ -282,6 +285,8 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
   const [displayedPitcherHP, setDisplayedPitcherHP] = useState(pitcherHP);
   const [displayedBatterShield, setDisplayedBatterShield] = useState(0);
   const [displayedPitcherShield, setDisplayedPitcherShield] = useState(0);
+  const [displayedBatterBarrier, setDisplayedBatterBarrier] = useState(0);
+  const [displayedPitcherBarrier, setDisplayedPitcherBarrier] = useState(0);
   const [displayedBatterBurn, setDisplayedBatterBurn] = useState(0);
   const [displayedPitcherBurn, setDisplayedPitcherBurn] = useState(0);
   const [displayedBatterPoison, setDisplayedBatterPoison] = useState(0);
@@ -313,6 +318,8 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       setDisplayedPitcherHP(snap.pitcherHP);
       setDisplayedBatterShield(0);
       setDisplayedPitcherShield(0);
+      setDisplayedBatterBarrier(0);
+      setDisplayedPitcherBarrier(0);
       setDisplayedBatterBurn(0);
       setDisplayedPitcherBurn(0);
       setDisplayedBatterPoison(0);
@@ -350,6 +357,8 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
     setDisplayedPitcherHP(startP);
     setDisplayedBatterShield(0);
     setDisplayedPitcherShield(0);
+    setDisplayedBatterBarrier(0);
+    setDisplayedPitcherBarrier(0);
     setDisplayedBatterBurn(0);
     setDisplayedPitcherBurn(0);
     setDisplayedBatterPoison(0);
@@ -593,26 +602,21 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
     const isGroupCooldownPaused = (group: BrawlAttackCard[]) =>
       group.some((card) => isCardCooldownPaused(card.id));
 
-    const attackableCardIds = (groups: BrawlAttackCard[][]) => {
-      const ids: string[] = [];
-      for (const group of groups) {
-        for (const card of group) {
-          if (!card.skipAttack) ids.push(card.id);
-        }
-      }
-      return ids;
+    const pickRandomAttackGroup = (groups: BrawlAttackCard[][]) => {
+      const eligible = groups.filter((group) =>
+        group.some((card) => !card.skipAttack),
+      );
+      if (eligible.length === 0) return null;
+      return eligible[Math.floor(Math.random() * eligible.length)] ?? null;
     };
 
-    const pickRandomCardId = (groups: BrawlAttackCard[][]) => {
-      const ids = attackableCardIds(groups);
-      if (ids.length === 0) return null;
-      return ids[Math.floor(Math.random() * ids.length)] ?? null;
-    };
-
-    const pauseCardCooldown = (cardId: string) => {
+    /** Chill pauses every card in the snapped segment (shared attack group). */
+    const pauseGroupCooldown = (group: BrawlAttackCard[]) => {
       const now = performance.now();
-      cardPauseUntil[cardId] = Math.max(cardPauseUntil[cardId] ?? 0, now) +
-        FREEZE_COOLDOWN_PAUSE_MS;
+      const until = now + FREEZE_COOLDOWN_PAUSE_MS;
+      for (const card of group) {
+        cardPauseUntil[card.id] = Math.max(cardPauseUntil[card.id] ?? 0, until);
+      }
     };
 
     const noteFreezeApplied = (state: ElementCombatState) => {
@@ -620,19 +624,19 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       const cpuDelta = state.freezeOnCpu - lastFreezeOnCpu;
 
       if (cpuDelta > 0) {
-        const cardId = pickRandomCardId(opponentAttackGroups);
-        if (cardId) pauseCardCooldown(cardId);
+        const group = pickRandomAttackGroup(opponentAttackGroups);
+        if (group) pauseGroupCooldown(group);
         if (state.freezeOnCpu >= FREEZE_BACKLASH_THRESHOLD) {
-          const backlash = pickRandomCardId(userAttackGroups);
-          if (backlash) pauseCardCooldown(backlash);
+          const backlash = pickRandomAttackGroup(userAttackGroups);
+          if (backlash) pauseGroupCooldown(backlash);
         }
       }
       if (playerDelta > 0) {
-        const cardId = pickRandomCardId(userAttackGroups);
-        if (cardId) pauseCardCooldown(cardId);
+        const group = pickRandomAttackGroup(userAttackGroups);
+        if (group) pauseGroupCooldown(group);
         if (state.freezeOnPlayer >= FREEZE_BACKLASH_THRESHOLD) {
-          const backlash = pickRandomCardId(opponentAttackGroups);
-          if (backlash) pauseCardCooldown(backlash);
+          const backlash = pickRandomAttackGroup(opponentAttackGroups);
+          if (backlash) pauseGroupCooldown(backlash);
         }
       }
 
@@ -665,10 +669,18 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       const pitcherBurn = userIsBatting ? state.burnOnCpu : state.burnOnPlayer;
       const batterPoison = userIsBatting ? state.poisonOnPlayer : state.poisonOnCpu;
       const pitcherPoison = userIsBatting ? state.poisonOnCpu : state.poisonOnPlayer;
+      const batterBarrier = userIsBatting
+        ? state.voltBarrierOnPlayer
+        : state.voltBarrierOnCpu;
+      const pitcherBarrier = userIsBatting
+        ? state.voltBarrierOnCpu
+        : state.voltBarrierOnPlayer;
       setDisplayedBatterHP(batterHp);
       setDisplayedPitcherHP(pitcherHp);
       setDisplayedBatterShield(batterShield);
       setDisplayedPitcherShield(pitcherShield);
+      setDisplayedBatterBarrier(batterBarrier);
+      setDisplayedPitcherBarrier(pitcherBarrier);
       setDisplayedBatterBurn(batterBurn);
       setDisplayedPitcherBurn(pitcherBurn);
       setDisplayedBatterPoison(batterPoison);
@@ -994,6 +1006,8 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
     displayedPitcherHP,
     displayedBatterShield,
     displayedPitcherShield,
+    displayedBatterBarrier,
+    displayedPitcherBarrier,
     displayedBatterBurn,
     displayedPitcherBurn,
     displayedBatterPoison,

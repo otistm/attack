@@ -266,6 +266,29 @@ function selfShieldGain(
   return Math.max(0, after.shieldOnCpu - before.shieldOnCpu);
 }
 
+function selfBarrierGain(
+  before: ElementCombatState,
+  after: ElementCombatState,
+  attackerIsPlayer: boolean,
+): number {
+  if (attackerIsPlayer) {
+    return Math.max(0, after.voltBarrierOnPlayer - before.voltBarrierOnPlayer);
+  }
+  return Math.max(0, after.voltBarrierOnCpu - before.voltBarrierOnCpu);
+}
+
+/** HP lost by the attacker when a defender's volt barrier retaliates. */
+function attackerBarrierRetaliate(
+  before: ElementCombatState,
+  after: ElementCombatState,
+  attackerIsPlayer: boolean,
+): number {
+  if (attackerIsPlayer) {
+    return Math.max(0, before.playerHP - after.playerHP);
+  }
+  return Math.max(0, before.cpuHP - after.cpuHP);
+}
+
 function cleanseAmount(before: ElementCombatState, after: ElementCombatState, attackerIsPlayer: boolean): number {
   if (attackerIsPlayer) {
     const burn = Math.max(0, before.burnOnPlayer - after.burnOnPlayer);
@@ -298,6 +321,12 @@ export function logCardCombatEvent(
   const shieldAbsorbed = defenderShieldDelta(before, after, params.attackerIsPlayer);
   const heal = selfHealDelta(before, after, params.attackerIsPlayer);
   const shieldGain = selfShieldGain(before, after, params.attackerIsPlayer);
+  const barrierGain = selfBarrierGain(before, after, params.attackerIsPlayer);
+  const barrierZap = attackerBarrierRetaliate(
+    before,
+    after,
+    params.attackerIsPlayer,
+  );
   const cleanse = cleanseAmount(before, after, params.attackerIsPlayer);
 
   const dotApplied: { fire?: number; poison?: number } = {};
@@ -325,9 +354,11 @@ export function logCardCombatEvent(
   if (!el) {
     if (hpDamage > 0) parts.push(`${hpDamage} damage`);
     if (shieldAbsorbed > 0) parts.push(`${shieldAbsorbed} blocked by shield`);
+    if (barrierZap > 0) parts.push(`barrier zaps ${barrierZap}`);
   } else if (el === "fire" || el === "poison") {
     if (hpDamage > 0) parts.push(`${hpDamage} instant HP`);
     if (shieldAbsorbed > 0) parts.push(`${shieldAbsorbed} absorbed by shield`);
+    if (barrierZap > 0) parts.push(`barrier zaps ${barrierZap}`);
     const dot = dotApplied.fire ?? dotApplied.poison ?? 0;
     if (dot > 0) parts.push(`+${dot} ${el} stack`);
     if (el === "fire" && elementCatalogId(params.cardId) === "el-05") {
@@ -369,13 +400,16 @@ export function logCardCombatEvent(
   } else if (el === "freeze") {
     if (hpDamage > 0) parts.push(`${hpDamage} chill damage`);
     if (shieldAbsorbed > 0) parts.push(`${shieldAbsorbed} absorbed by shield`);
+    if (barrierZap > 0) parts.push(`barrier zaps ${barrierZap}`);
     if (freezeApplied > 0) parts.push(`+${freezeApplied} freeze slow (1 card)`);
     if (elementCatalogId(params.cardId) === "el-11" && freezeApplied > 0) {
       parts.push("double freeze (Glacia)");
     }
   } else if (el === "volt") {
+    if (barrierGain > 0) parts.push(`+${barrierGain} volt barrier`);
     if (hpDamage > 0) parts.push(`${hpDamage} instant shock`);
     if (shieldAbsorbed > 0) parts.push(`${shieldAbsorbed} absorbed by shield`);
+    if (barrierZap > 0) parts.push(`barrier zaps ${barrierZap}`);
     if (elementCatalogId(params.cardId) === "el-22") {
       parts.push("double volt (Surge)");
     }

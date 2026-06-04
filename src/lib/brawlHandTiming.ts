@@ -30,6 +30,11 @@ export function computeHandDealCompleteMs(hand: CardDefinition[]): number {
   return Math.ceil(maxDelaySec * 1000 + 650);
 }
 
+/** Ms until one card's deal-in spring should finish (stagger delay + settle). */
+export function cardEntryAnimDurationMs(delaySec: number): number {
+  return Math.ceil(delaySec * 1000 + 650);
+}
+
 /** Pause after the CPU hand deal-in before brawl combat projectiles launch. */
 export const BRAWL_CPU_DEAL_SETTLE_MS = 200;
 

@@ -10,7 +10,12 @@ import {
   ELEMENT_ABILITY_CATALOG,
   resolvedSnapDisplayValue,
 } from "./elementAbilities";
-import { freshElementCombatState } from "./brawlElements";
+import {
+  freshElementCombatState,
+  tickCombatDotStacks,
+  VOLT_BARRIER_RETALIATE,
+  grantVoltBarrier,
+} from "./brawlElements";
 
 function assert(cond: boolean, msg: string, detail?: unknown) {
   if (!cond) {
@@ -36,7 +41,7 @@ function assert(cond: boolean, msg: string, detail?: unknown) {
   assert(bonds[0]?.power === 4, "ember+flare bond power", bonds[0]?.power);
 
   const baneQueue = buildHandAttackQueueWithAbilities([bane], [], null);
-  assert(baneQueue[0]?.power === 6, "bane solo hit", baneQueue[0]?.power);
+  assert(baneQueue[0]?.power === 5, "bane solo hit", baneQueue[0]?.power);
 
   let combat = freshElementCombatState();
   combat = applyElementCombatHit(
@@ -129,7 +134,7 @@ function assert(cond: boolean, msg: string, detail?: unknown) {
     { element: "poison", power: 4, leftCardId: grind.id, rightCardId: jolt.id },
     true,
   );
-  assert(combat.cpuHP === 92, "grind +4 from DoT stacks", combat.cpuHP);
+  assert(combat.cpuHP === 93, "grind +3 from DoT stacks (capped)", combat.cpuHP);
 
   const fuse = inst(ELEMENT_CARDS[25], "t");
   combat = freshElementCombatState();
@@ -192,8 +197,8 @@ function assert(cond: boolean, msg: string, detail?: unknown) {
     true,
   );
   assert(
-    combat.freezeOnCpu === 13 && combat.cpuHP === 97,
-    "hail +2 freeze at 8 stacks + chip",
+    combat.freezeOnCpu === 13 && combat.cpuHP === 96,
+    "hail +2 freeze at 8 stacks + chip (chilled bonus)",
     { freeze: combat.freezeOnCpu, hp: combat.cpuHP },
   );
 
@@ -220,8 +225,8 @@ function assert(cond: boolean, msg: string, detail?: unknown) {
     true,
   );
   assert(
-    combat.cpuHP === 96 && combat.poisonOnCpu === 8,
-    "miasma double poison stack",
+    combat.cpuHP === 96 && combat.poisonOnCpu === 6,
+    "miasma poison stack (trimmed)",
     { hp: combat.cpuHP, poison: combat.poisonOnCpu },
   );
 
@@ -297,15 +302,15 @@ function assert(cond: boolean, msg: string, detail?: unknown) {
     "t",
   );
   const icicleQueue = buildHandAttackQueueWithAbilities([icicle], [], null);
-  assert(icicleQueue[0]?.power === 2, "icicle solo chill", icicleQueue[0]?.power);
+  assert(icicleQueue[0]?.power === 3, "icicle solo chill", icicleQueue[0]?.power);
   combat = freshElementCombatState();
   combat = applyElementCombatHit(
     combat,
-    { power: 2, leftCardId: icicle.id },
+    { power: 3, leftCardId: icicle.id },
     true,
   );
   assert(
-    combat.cpuHP === 98 && combat.freezeOnCpu === 1,
+    combat.cpuHP === 97 && combat.freezeOnCpu === 1,
     "icicle solo chip + freeze",
     { hp: combat.cpuHP, freeze: combat.freezeOnCpu },
   );
@@ -323,7 +328,7 @@ function assert(cond: boolean, msg: string, detail?: unknown) {
     true,
   );
   assert(
-    combat.cpuHP === 95 && combat.freezeOnCpu === 7,
+    combat.cpuHP === 94 && combat.freezeOnCpu === 7,
     "chilltouch +1 freeze vs chilled foe + chip",
     { hp: combat.cpuHP, freeze: combat.freezeOnCpu },
   );
@@ -380,15 +385,15 @@ function assert(cond: boolean, msg: string, detail?: unknown) {
     "t",
   );
   const shiverQueue = buildHandAttackQueueWithAbilities([shiver], [], null);
-  assert(shiverQueue[0]?.power === 2, "shiver solo chill", shiverQueue[0]?.power);
+  assert(shiverQueue[0]?.power === 3, "shiver solo chill", shiverQueue[0]?.power);
   combat = freshElementCombatState();
   combat = applyElementCombatHit(
     combat,
-    { power: 2, leftCardId: shiver.id },
+    { power: 3, leftCardId: shiver.id },
     true,
   );
   assert(
-    combat.cpuHP === 98 && combat.freezeOnCpu === 2,
+    combat.cpuHP === 97 && combat.freezeOnCpu === 2,
     "shiver solo chip + deep chill",
     { hp: combat.cpuHP, freeze: combat.freezeOnCpu },
   );
@@ -421,10 +426,129 @@ function assert(cond: boolean, msg: string, detail?: unknown) {
     true,
   );
   assert(
-    combat.cpuHP === 95 && combat.freezeOnCpu === 7,
-    "permafrost +1 chip vs chilled foe",
+    combat.cpuHP === 93 && combat.freezeOnCpu === 7,
+    "permafrost +2 chip vs chilled foe",
     { hp: combat.cpuHP, freeze: combat.freezeOnCpu },
   );
+
+  const viperFang = inst(
+    ELEMENT_CARDS.find((c) => c.id === ELEMENT_ABILITY_CATALOG.viperFang)!,
+    "t",
+  );
+  combat = freshElementCombatState();
+  combat = applyElementCombatHit(
+    combat,
+    { power: 2, leftCardId: viperFang.id },
+    true,
+  );
+  assert(
+    combat.cpuHP === 98 && combat.poisonOnCpu === 1,
+    "viper fang solo chip + poison",
+    { hp: combat.cpuHP, poison: combat.poisonOnCpu },
+  );
+
+  const hemlock = inst(
+    ELEMENT_CARDS.find((c) => c.id === ELEMENT_ABILITY_CATALOG.hemlockNeedle)!,
+    "t",
+  );
+  const venin = inst(ELEMENT_CARDS.find((c) => c.id === "el-46")!, "t2");
+  combat = freshElementCombatState();
+  combat = applyElementCombatHit(
+    combat,
+    {
+      element: "poison",
+      power: 4,
+      leftCardId: hemlock.id,
+      rightCardId: venin.id,
+      combineCount: 2,
+    },
+    true,
+  );
+  assert(
+    combat.cpuHP === 96 && combat.poisonOnCpu === 1,
+    "hemlock needle activated chip + 1 poison",
+    { hp: combat.cpuHP, poison: combat.poisonOnCpu },
+  );
+
+  const snowHare = inst(
+    ELEMENT_CARDS.find((c) => c.id === ELEMENT_ABILITY_CATALOG.snowHare)!,
+    "t",
+  );
+  combat = freshElementCombatState();
+  combat = applyElementCombatHit(
+    combat,
+    { power: 2, leftCardId: snowHare.id },
+    true,
+  );
+  assert(
+    combat.cpuHP === 98 && combat.freezeOnCpu === 1,
+    "snow hare solo chip + chill",
+    { hp: combat.cpuHP, freeze: combat.freezeOnCpu },
+  );
+
+  const faraday = inst(
+    ELEMENT_CARDS.find((c) => c.id === ELEMENT_ABILITY_CATALOG.faradayCage)!,
+    "t",
+  );
+  const aegisPartner = inst(ELEMENT_CARDS.find((c) => c.id === "el-09")!, "t2");
+  combat = freshElementCombatState();
+  combat = applyElementCombatHit(
+    combat,
+    {
+      element: "volt",
+      power: 4,
+      leftCardId: faraday.id,
+      rightCardId: aegisPartner.id,
+      combineCount: 2,
+    },
+    true,
+  );
+  assert(
+    combat.cpuHP === 96 &&
+      combat.voltBarrierOnPlayer === 4,
+    "faraday cage barrier + activate chip",
+    { hp: combat.cpuHP, barrier: combat.voltBarrierOnPlayer },
+  );
+
+  combat = freshElementCombatState();
+  combat.voltBarrierOnCpu = 2;
+  combat = applyElementCombatHit(
+    combat,
+    { power: 3, leftCardId: viperFang.id },
+    true,
+  );
+  assert(
+    combat.cpuHP === 98 &&
+      combat.voltBarrierOnCpu === 1 &&
+      combat.playerHP === 100 - VOLT_BARRIER_RETALIATE &&
+      VOLT_BARRIER_RETALIATE === 3,
+    "volt barrier retaliates on card hit",
+    {
+      hp: combat.cpuHP,
+      barrier: combat.voltBarrierOnCpu,
+      playerHp: combat.playerHP,
+    },
+  );
+
+  combat = freshElementCombatState();
+  combat.voltBarrierOnCpu = 2;
+  combat.poisonOnCpu = 5;
+  const beforeDot = { ...combat };
+  combat = tickCombatDotStacks(combat);
+  assert(
+    combat.voltBarrierOnCpu === beforeDot.voltBarrierOnCpu &&
+      combat.playerHP === beforeDot.playerHP,
+    "DoT tick does not trigger barrier retaliate",
+    {
+      barrier: combat.voltBarrierOnCpu,
+      playerHp: combat.playerHP,
+    },
+  );
+
+  combat = grantVoltBarrier(freshElementCombatState(), true, 2);
+  assert(combat.voltBarrierOnPlayer === 2, "grant volt barrier", {
+    barrier: combat.voltBarrierOnPlayer,
+  });
 }
 
 {
@@ -472,7 +596,7 @@ function assert(cond: boolean, msg: string, detail?: unknown) {
   );
   assert(
     FREEZE_COOLDOWN_PAUSE_MS === 1200,
-    "each freeze hit pauses one random card for 1.5s",
+    "each freeze hit pauses one random snapped group for 1.5s",
   );
   assert(
     brawlCooldownDisplayMs(5000) === 5000,

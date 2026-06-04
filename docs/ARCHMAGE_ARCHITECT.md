@@ -136,7 +136,7 @@ When prompted to create a mechanic, card, system, or effect, provide a holistic 
 
 - **Classes:** Ignis (fire), Ren (freeze), Lumi (poison), Volta (volt) — see `BRAWL_CLASS_OPTIONS` in `elementClassPools.ts`.
 - **Bridge cards** (wildcards, solo finishers) raise weave reliability and fun; support cards dilute offensive identity — trim per-class when needed (Ignis and Ren use Mend + Aegis only).
-- **Freeze** applies chip damage + chill stacks; UI pauses one random defender card per freeze hit (`FREEZE_COOLDOWN_PAUSE_MS`).
+- **Freeze** applies chip damage + chill stacks; UI pauses one random snapped segment per freeze hit — all cards in that attack group (`FREEZE_COOLDOWN_PAUSE_MS`).
 - **Headless playtests** approximate pause delay but may not capture full UI feel — validate in-browser for stall mechanics.
 
 ---

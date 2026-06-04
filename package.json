@@ -14,7 +14,10 @@
   "test:cooldown": "tsx src/lib/__cooldown_check.ts",
   "test:copy": "tsx src/lib/__card_copy_check.ts",
   "test:playtest": "tsx src/lib/__brawl_class_playtest.ts",
-  "test": "npm run test:connect && npm run test:effects && npm run test:cooldown && npm run test:copy && npm run test:playtest"
+  "test:pool-audit": "tsx src/lib/__pool_seam_audit.ts",
+  "test:human-playtest": "tsx src/lib/__human_playtest.ts",
+  "test:fun-rundown": "tsx src/lib/__class_fun_rundown.ts",
+  "test": "npm run test:connect && npm run test:effects && npm run test:cooldown && npm run test:copy && npm run test:playtest && npm run test:pool-audit"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

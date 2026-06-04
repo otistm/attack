@@ -39,10 +39,7 @@ import { BrawlSandstormOverlay } from './brawl/BrawlSandstormOverlay';
 import { BrawlBattleResultScreen } from './brawl/BrawlBattleResultScreen';
 import { MageFinisherBanner } from './brawl/MageFinisherBanner';
 import { CardFocusOverlay } from './brawl/CardFocusOverlay';
-import {
-  CardElementActivationTags,
-  cardBrawlAbilityTagline,
-} from './brawl/CardAbilityHeader';
+import { CardBrawlAbilityFooter } from './brawl/CardBrawlAbilityFooter';
 import {
   ELEMENT_LABEL,
   BRAWL_START_HP,
@@ -55,6 +52,7 @@ import {
 import { buildHandAttackGroupsWithAbilities, resolvedSnapDisplayValue } from '../lib/elementAbilities';
 import {
   computeHandDealCompleteMs,
+  cardEntryAnimDurationMs,
   SIGNATURE_DELAY_CHILDREN,
   SIGNATURE_SETTLE_PAD,
   SIGNATURE_STAGGER,
@@ -399,17 +397,11 @@ export const CardItem = ({
 }) => {
   const equippedItemIdsRaw = useGameStore((s) => s.equippedItems[card.id]);
   const equippedItemIds = equippedItemIdsRaw || [];
-  // While the player is dragging, freeze ALL non-dragged cards' connection
-  // state to "not connected" so we don't trigger margin shifts (8px <-> 0px),
-  // border flips, or shape brightness flips on cards the user isn't holding.
-  // Reorder.Group recomputes the live `isConnectedLeft/Right` on every pointer
-  // tick as cards swap places; without this freeze the whole strip strobes
-  // (margins snap, shapes brighten, borders re-color) every few pixels of
-  // drag motion -- the "reload" the player has been seeing. The dragged
-  // card's own seam hints (leftHint/rightHint = 'allow'/'block') still give
-  // live can-connect feedback, so the player isn't flying blind.
-  const isConnectedLeft = dragActive ? false : rawIsConnectedLeft;
-  const isConnectedRight = dragActive ? false : rawIsConnectedRight;
+  // Parent snapshots seam margins at drag-start (keyed by card id) so a long
+  // cross-hand drag doesn't widen the strip or strobe borders on every
+  // Reorder swap. Seam hints on the dragged card still update live.
+  const isConnectedLeft = rawIsConnectedLeft;
+  const isConnectedRight = rawIsConnectedRight;
   const isConnected = isConnectedLeft || isConnectedRight;
   const sznMode = false;
   const cardBrawlMode = true;
@@ -622,9 +614,6 @@ export const CardItem = ({
     showFocusOverlay &&
     !dragActive &&
     (focusHoverOpen || gamepadFocused);
-  const brawlAbilityTagline =
-    cardBrawlMode && !cardIsAbility ? cardBrawlAbilityTagline(card) : null;
-
   return (
     <div className="relative overflow-visible">
       {showFocusOverlay && (
@@ -687,39 +676,6 @@ export const CardItem = ({
         <div className={`w-full ${cardHeaderNameClassName(compact, headerOnColoredBody)}`}>
           {card.name}
         </div>
-        {cardBrawlMode && !cardIsAbility && !focusPanelOpen && (
-          <>
-            <CardElementActivationTags
-              cardId={card.id}
-              hand={hand}
-              affirmedSeams={affirmedSeams}
-              compact={compact}
-            />
-            {brawlAbilityTagline && (
-              <motion.span
-                key={`tagline-${highlightTone ?? 'idle'}`}
-                className={`mt-0.5 ${compact ? 'text-[7px] leading-[1.1]' : 'text-[9px] leading-[1.15]'} font-bold uppercase tracking-tight text-amber-900 bg-amber-200/95 rounded px-1 py-0.5 max-w-[92%] text-center border border-amber-400/60 shadow-sm line-clamp-2`}
-                animate={
-                  highlightTone === 'source'
-                    ? {
-                        backgroundColor: ['rgba(254,243,199,0.95)', 'rgba(250,204,21,0.98)', 'rgba(254,243,199,0.95)'],
-                        scale: [1, 1.18, 1.06],
-                        x: [0, -2, 2, -1, 1, 0],
-                        boxShadow: [
-                          '0 0 0 0 rgba(250,204,21,0)',
-                          '0 0 14px 4px rgba(250,204,21,0.85)',
-                          '0 0 4px 1px rgba(250,204,21,0.35)',
-                        ],
-                      }
-                    : { scale: 1, x: 0 }
-                }
-                transition={{ duration: 0.5, ease: 'easeOut' }}
-              >
-                {brawlAbilityTagline}
-              </motion.span>
-            )}
-          </>
-        )}
       </div>
       {showCenterNumber && (
         <motion.div
@@ -762,7 +718,7 @@ export const CardItem = ({
               ? { duration: 1.15, repeat: Infinity, ease: 'easeInOut' }
               : { type: 'spring', stiffness: 300, damping: 15 }
           }
-          className={`${cardCenterValueClass()} ${sz.valueText} font-black z-20 transition-colors duration-300 ${
+          className={`${cardCenterValueClass()} ${sz.valueText} font-black transition-colors duration-300 ${
             snapBoostOnWhiteFace
               ? 'text-amber-950'
               : snapBoostOnColoredFace
@@ -802,6 +758,15 @@ export const CardItem = ({
           {abilityFooterText}
         </motion.div>
       )}
+      <CardBrawlAbilityFooter
+        card={card}
+        hand={hand}
+        affirmedSeams={affirmedSeams}
+        compact={compact}
+        onColoredBody={headerOnColoredBody}
+        highlightTone={highlightTone}
+        hidden={!cardBrawlMode || cardIsAbility || focusPanelOpen}
+      />
     </motion.div>
     </div>
   );
@@ -1206,6 +1171,8 @@ export const CardGameOverlay = () => {
       shieldOnCpu: 0,
       freezeOnPlayer: 0,
       freezeOnCpu: 0,
+      voltBarrierOnPlayer: 0,
+      voltBarrierOnCpu: 0,
     };
     return { start };
   }, [brawlMode, lastElementBonds, lastElementCombatStart]);
@@ -1456,6 +1423,20 @@ export const CardGameOverlay = () => {
         ? brawlReveal.displayedPitcherPoison
         : brawlReveal.displayedBatterPoison
       : brawlElementCombat.poisonOnCpu
+    : 0;
+  const userBarrierDisplay = showBrawlCombatStatus
+    ? isRevealing
+      ? userIsBatting
+        ? brawlReveal.displayedBatterBarrier
+        : brawlReveal.displayedPitcherBarrier
+      : brawlElementCombat.voltBarrierOnPlayer
+    : 0;
+  const aiBarrierDisplay = showBrawlCombatStatus
+    ? isRevealing
+      ? userIsBatting
+        ? brawlReveal.displayedPitcherBarrier
+        : brawlReveal.displayedBatterBarrier
+      : brawlElementCombat.voltBarrierOnCpu
     : 0;
   const userHealPulse =
     brawlMode && isRevealing
@@ -1900,6 +1881,7 @@ export const CardGameOverlay = () => {
                     brawlHpSide="opponent"
                     brawlHpFill={opponentBrawlHpFill}
                     brawlShield={aiShieldDisplay}
+                    brawlBarrier={aiBarrierDisplay}
                     brawlBurn={aiBurnDisplay}
                     brawlPoison={aiPoisonDisplay}
                     brawlHealPulse={aiHealPulse}
@@ -1978,6 +1960,7 @@ export const CardGameOverlay = () => {
               brawlHpSide="user"
               brawlHpFill={userBrawlHpFill}
               brawlShield={userShieldDisplay}
+              brawlBarrier={userBarrierDisplay}
               brawlBurn={userBurnDisplay}
               brawlPoison={userPoisonDisplay}
               brawlHealPulse={userHealPulse}
@@ -3044,6 +3027,8 @@ interface ScorePillProps {
   brawlHpFill?: boolean;
   /** Remaining shield absorb on this pill (ticks down as damage is blocked). */
   brawlShield?: number;
+  /** Volt barrier stacks — retaliates when this seat is hit. */
+  brawlBarrier?: number;
   /** Active burn / poison stacks on this pill. */
   brawlBurn?: number;
   brawlPoison?: number;
@@ -3084,6 +3069,7 @@ const ScorePill = ({
   brawlHpSide = 'user',
   brawlHpFill = false,
   brawlShield = 0,
+  brawlBarrier = 0,
   brawlBurn = 0,
   brawlPoison = 0,
   brawlHealPulse = 0,
@@ -3099,6 +3085,7 @@ const ScorePill = ({
   const clampedBurn = showBrawlFill ? Math.max(0, brawlBurn) : 0;
   const clampedPoison = showBrawlFill ? Math.max(0, brawlPoison) : 0;
   const shieldAbsorb = showBrawlFill ? Math.max(0, brawlShield) : 0;
+  const barrierStacks = showBrawlFill ? Math.max(0, brawlBarrier) : 0;
   const fillPct = showBrawlFill ? (clampedHp / safeMax) * 100 : 100;
   const critical = showBrawlFill && fillPct > 0 && fillPct <= 25;
   const hasBurn = clampedBurn > 0;
@@ -3206,6 +3193,16 @@ const ScorePill = ({
           <span className={compact ? `text-[10px] font-extrabold uppercase tracking-widest ${labelColor}` : `text-xs font-extrabold uppercase tracking-widest ${labelColor}`}>
             {label}
           </span>
+          {barrierStacks > 0 && (
+            <span
+              className={`rounded-full bg-amber-500/25 px-1.5 py-0.5 font-bold text-amber-200 ${
+                compact ? "text-[9px]" : "text-[10px]"
+              }`}
+              title="Volt barrier"
+            >
+              ⚡{barrierStacks}
+            </span>
+          )}
           <motion.span
             key={value === null ? 'na' : value}
             initial={{ scale: 1.18, opacity: 0.6 }}
@@ -4104,6 +4101,36 @@ function buildEntryConfig(
   };
 }
 
+/** Per-card connected margins at drag start — stable across Reorder swaps. */
+function snapshotHandConnections(
+  hand: CardDefinition[],
+  affirmedSeams: ReadonlySet<string> | undefined,
+): Record<string, { left: boolean; right: boolean }> {
+  const out: Record<string, { left: boolean; right: boolean }> = {};
+  for (let index = 0; index < hand.length; index++) {
+    const card = hand[index];
+    const seamLeftAffirmed =
+      index > 0 &&
+      (affirmedSeams === undefined ||
+        affirmedSeams.has(seamKey(hand[index - 1].id, card.id)));
+    const seamRightAffirmed =
+      index < hand.length - 1 &&
+      (affirmedSeams === undefined ||
+        affirmedSeams.has(seamKey(card.id, hand[index + 1].id)));
+    out[card.id] = {
+      left:
+        index > 0 &&
+        canConnectAny(hand[index - 1], card) &&
+        seamLeftAffirmed,
+      right:
+        index < hand.length - 1 &&
+        canConnectAny(card, hand[index + 1]) &&
+        seamRightAffirmed,
+    };
+  }
+  return out;
+}
+
 function makeItemExitTransition(reverseStaggerCount: number, index: number) {
   return {
     duration: 0.28,
@@ -4115,6 +4142,12 @@ function makeItemExitTransition(reverseStaggerCount: number, index: number) {
 // Snappy spring used for ALL non-stagger transitions on the cards: layout
 // shifts during reorder, drop snap-back, and re-layout when neighbors arrive.
 const ITEM_LAYOUT_TRANSITION = { type: 'spring' as const, stiffness: 400, damping: 32 } as const;
+/** Snappier sibling shifts while a card is mid-drag (long cross-hand moves). */
+const ITEM_STRIP_DRAG_LAYOUT_TRANSITION = {
+  type: 'spring' as const,
+  stiffness: 620,
+  damping: 36,
+} as const;
 const ITEM_DRAG_TRANSITION = { bounceStiffness: 600, bounceDamping: 35 } as const;
 // Used as the `initial` and `animate` props for cards that have already had
 // their fly-in animation in this at-bat (e.g. the dragged card on a
@@ -4712,6 +4745,27 @@ const HandStrip = ({
   deckDrawCardId = null,
   discardZoneRef,
 }: HandStripProps) => {
+  // Brawl discard uses AnimatePresence with initial={false} so exit/layout
+  // don't replay deal-in — but that also blocks mount animations. Only wrap
+  // the strip after the staggered deal-in finishes.
+  const [discardAnimateReady, setDiscardAnimateReady] = useState(!enableDiscard);
+  useEffect(() => {
+    if (!enableDiscard) {
+      setDiscardAnimateReady(true);
+      return;
+    }
+    setDiscardAnimateReady(false);
+  }, [atBatId, enableDiscard]);
+  useEffect(() => {
+    if (!enableDiscard || hand.length === 0) return;
+    const ms = computeHandDealCompleteMs(hand);
+    const t = window.setTimeout(() => setDiscardAnimateReady(true), ms);
+    return () => window.clearTimeout(t);
+    // Hand length/order is stable for the deal-in window; omit `hand` so
+    // mid-at-bat discards don't drop AnimatePresence and replay deal-in.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [atBatId, enableDiscard]);
+
   // Signature cards fly in from the screen edge they belong to (pitcher drops
   // from above, batter rises up from below); general-draw cards then sweep in
   // horizontally from off-screen right like they're being drawn from a deck.
@@ -4730,16 +4784,37 @@ const HandStrip = ({
   // there is unreliable).
   const draggingIdRef = useRef<string | null>(null);
   const lastPointerRef = useRef({ x: 0, y: 0 });
+  const lastSwapSfxAtRef = useRef(0);
+  const [frozenConnections, setFrozenConnections] = useState<Record<
+    string,
+    { left: boolean; right: boolean }
+  > | null>(null);
 
-  const handleDragStart = useCallback((id: string) => {
-    if (enableBrawlHandSfx) playCardPickup();
-    setDraggingId(id);
-    draggingIdRef.current = id;
-  }, [enableBrawlHandSfx]);
+  const beginDragSnapshot = useCallback(() => {
+    setFrozenConnections(snapshotHandConnections(hand, affirmedSeams));
+  }, [hand, affirmedSeams]);
+
+  const clearDragSnapshot = useCallback(() => {
+    setFrozenConnections(null);
+  }, []);
+
+  const handleDragStart = useCallback(
+    (id: string) => {
+      if (enableBrawlHandSfx) playCardPickup();
+      beginDragSnapshot();
+      setDraggingId(id);
+      draggingIdRef.current = id;
+    },
+    [beginDragSnapshot, enableBrawlHandSfx],
+  );
   const handleReorderWithSfx = useCallback(
     (next: CardDefinition[]) => {
       if (enableBrawlHandSfx && draggingIdRef.current) {
-        playCardSwap();
+        const now = performance.now();
+        if (now - lastSwapSfxAtRef.current >= 120) {
+          lastSwapSfxAtRef.current = now;
+          playCardSwap();
+        }
       }
       onReorder(next);
     },
@@ -4761,6 +4836,7 @@ const HandStrip = ({
     const id = draggingIdRef.current;
     draggingIdRef.current = null;
     setDraggingId(null);
+    clearDragSnapshot();
 
     if (discardZoneRef?.current) {
       discardZoneRef.current.dataset.discardHot = 'false';
@@ -4777,7 +4853,25 @@ const HandStrip = ({
     if (id && onAffirmConnections) {
       requestAnimationFrame(() => onAffirmConnections(id));
     }
-  }, [discardZoneRef, enableDiscard, onAffirmConnections, onDiscardCard]);
+  }, [
+    clearDragSnapshot,
+    discardZoneRef,
+    enableDiscard,
+    onAffirmConnections,
+    onDiscardCard,
+  ]);
+
+  // Gamepad grab uses the same margin snapshot so D-pad shifts don't strobes.
+  const prevGamepadGrabRef = useRef<string | null>(null);
+  useEffect(() => {
+    const grabbed = gamepadGrabbedCardId;
+    if (grabbed && grabbed !== prevGamepadGrabRef.current) {
+      beginDragSnapshot();
+    } else if (!grabbed && draggingIdRef.current === null) {
+      clearDragSnapshot();
+    }
+    prevGamepadGrabRef.current = grabbed;
+  }, [gamepadGrabbedCardId, beginDragSnapshot, clearDragSnapshot]);
 
   // Treat the controller "grabbed" card as a synthetic drag for hint /
   // dragActive / dragging-id purposes. Mouse drag and gamepad grab are
@@ -4849,12 +4943,15 @@ const HandStrip = ({
             index < hand.length - 1 &&
             (affirmedSeams === undefined ||
               affirmedSeams.has(seamKey(card.id, hand[index + 1].id)));
-          const isConnectedLeft =
+          const liveConnectedLeft =
             index > 0 && canConnectAny(hand[index - 1], card) && seamLeftAffirmed;
-          const isConnectedRight =
+          const liveConnectedRight =
             index < hand.length - 1 &&
             canConnectAny(card, hand[index + 1]) &&
             seamRightAffirmed;
+          const frozen = frozenConnections?.[card.id];
+          const isConnectedLeft = frozen ? frozen.left : liveConnectedLeft;
+          const isConnectedRight = frozen ? frozen.right : liveConnectedRight;
           const modifier = modifiers[card.id];
           const hintForCard = hints[index];
           const isGeneral = card.abilityType === 'General Draw';
@@ -4893,6 +4990,7 @@ const HandStrip = ({
               valueOverride={valueOverrides?.[card.id]}
               highlightTone={highlightTones?.[card.id]}
               dragActive={effectiveDraggingId !== null}
+              isDraggedCard={effectiveDraggingId === card.id}
               lockReorder={disabled}
               hasPendingChoice={hasPendingChoice}
               isChoiceActive={
@@ -4934,7 +5032,7 @@ const HandStrip = ({
         (wrapping with AnimatePresence + Reorder.Item `layout` together
         plays badly with Framer's reorder swap math).
       */}
-      {enableDiscard ? (
+      {enableDiscard && discardAnimateReady ? (
         <AnimatePresence mode="popLayout" initial={false}>
           {cardList}
         </AnimatePresence>
@@ -4975,6 +5073,8 @@ interface HandCardProps {
    * while the player is rearranging their hand.
    */
   dragActive?: boolean;
+  /** True when this card is the one being dragged (mouse or gamepad grab). */
+  isDraggedCard?: boolean;
   /**
    * True if this card has already played its entry animation in the current
    * at-bat. When true, the card mounts directly at its resting state instead
@@ -5061,6 +5161,7 @@ const HandCard = ({
   valueOverride,
   highlightTone,
   dragActive = false,
+  isDraggedCard = false,
   skipEntryAnim = false,
   deckDrawEntry = false,
   discardExit = false,
@@ -5077,10 +5178,11 @@ const HandCard = ({
   hand,
   affirmedSeams,
 }: HandCardProps) => {
-  useEffect(() => {
-    onEntryPlayed(card.id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  /** Local entry state — parent skipEntryAnim only applies on Reorder remounts. */
+  const [entryFinished, setEntryFinished] = useState(
+    () => (skipEntryAnim && !deckDrawEntry) || false,
+  );
+
   const entry = useMemo(
     () =>
       deckDrawEntry
@@ -5104,10 +5206,42 @@ const HandCard = ({
     [deckDrawEntry, isGeneral, index, signatureCount, fromY, fromRot],
   );
   useEffect(() => {
-    if (skipEntryAnim && !deckDrawEntry) return;
+    if (entryFinished && !deckDrawEntry) return;
     const delaySec = deckDrawEntry ? 0 : (entry.animate.transition.delay ?? 0);
     return scheduleCardsDealSound(delaySec);
-  }, [deckDrawEntry, entry, skipEntryAnim]);
+  }, [deckDrawEntry, entry, entryFinished]);
+
+  useEffect(() => {
+    if (entryFinished) return;
+    const delayMs = deckDrawEntry
+      ? 450
+      : cardEntryAnimDurationMs(entry.animate.transition.delay ?? 0);
+    const t = window.setTimeout(() => {
+      setEntryFinished(true);
+      onEntryPlayed(card.id);
+    }, delayMs);
+    return () => window.clearTimeout(t);
+  }, [
+    card.id,
+    deckDrawEntry,
+    entry.animate.transition.delay,
+    entryFinished,
+    onEntryPlayed,
+  ]);
+
+  const playingEntry = !entryFinished;
+  const entryTransition = entry.animate.transition;
+  const entryAtRest = useMemo(
+    () => ({
+      opacity: entry.animate.opacity,
+      x: entry.animate.x,
+      y: entry.animate.y,
+      rotate: entry.animate.rotate,
+      scale: entry.animate.scale,
+    }),
+    [entry],
+  );
+
   const exitConfig = useMemo(
     () =>
       discardExit
@@ -5129,27 +5263,39 @@ const HandCard = ({
     [discardExit, fromY, fromRot, handLength, index],
   );
   const handleDragStart = useCallback(() => onDragStart(card.id), [onDragStart, card.id]);
+  const stripDragging = dragActive;
 
   return (
     <Reorder.Item
       value={card}
       className="relative overflow-visible"
-      layout
-      // When this card has already played its entry once in this at-bat, skip
-      // the staggered fly-in on subsequent mounts. We can't use
-      // `initial={false}` here because Framer's Reorder.Item still applies
-      // entry's offset/scale/rotation when remounted mid-drag (verified via
-      // computed-style logging: `initial={false}` left the dragged card at
-      // opacity:0, scale:0.55, y:+212 mid-swap). We also have to override
-      // `animate` to drop the staggered entry delay -- otherwise Framer
-      // tweens from RESTING_STATE -> entry.animate over the original
-      // (delayed) transition, which still leaks the staggered initial.
-      // Setting both ends to the resting state with a 0-duration transition
-      // makes the remounted card paint immediately at its slot.
-      initial={skipEntryAnim && !deckDrawEntry ? RESTING_STATE : entry.initial}
-      animate={skipEntryAnim && !deckDrawEntry ? RESTING_ANIMATE : entry.animate}
+      layout={entryFinished && !isDraggedCard ? true : undefined}
+      whileDrag={
+        isDraggedCard
+          ? {
+              zIndex: 60,
+              scale: 1.04,
+              boxShadow: '0 16px 32px rgba(15, 23, 42, 0.28)',
+            }
+          : undefined
+      }
+      // Staggered deal-in: local entryFinished gates animation so parent
+      // skipEntryAnim is not set until after the fly-in completes (avoids
+      // killing the animation on the next render). Reorder remounts after
+      // drag skip straight to RESTING via skipEntryAnim on first paint.
+      initial={playingEntry ? entry.initial : RESTING_STATE}
+      animate={playingEntry ? entryAtRest : RESTING_ANIMATE}
       exit={exitConfig}
-      transition={ITEM_LAYOUT_TRANSITION}
+      transition={
+        playingEntry
+          ? entryTransition
+          : {
+              layout:
+                stripDragging && !isDraggedCard
+                  ? ITEM_STRIP_DRAG_LAYOUT_TRANSITION
+                  : ITEM_LAYOUT_TRANSITION,
+            }
+      }
       dragTransition={ITEM_DRAG_TRANSITION}
       drag={lockReorder ? false : true}
       onDragStart={handleDragStart}
@@ -5176,7 +5322,7 @@ const HandCard = ({
             : { y: 0, scale: 1 }
         }
         transition={{ type: 'spring', stiffness: 380, damping: 26 }}
-        className={`relative overflow-visible ${gamepadGrabbed ? 'z-50' : ''}`}
+        className={`relative overflow-visible ${gamepadGrabbed || isDraggedCard ? 'z-50' : ''}`}
       >
         <CardItem
           card={card}

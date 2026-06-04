@@ -137,13 +137,21 @@ const GLOSSARY: BrawlGlossaryEntry[] = [
     id: "chill",
     term: "Chill",
     pattern: /\bchill(s|ed)?\b/i,
-    explain: "Freeze stacks on the foe. Chill slows their cards and can pause a cooldown.",
+    explain:
+      "Freeze stacks on the foe. Chill pauses one random snapped segment — every card in that chain.",
   },
   {
     id: "shock",
     term: "Shock",
     pattern: /\bshock(s|ed)?\b/i,
     explain: "Volt damage — usually instant chip. Can thaw chill on you or the foe.",
+  },
+  {
+    id: "volt-barrier",
+    term: "Volt barrier",
+    pattern: /\bvolt\s+barrier\b/i,
+    explain:
+      "Protective stacks on you. When a card hit chips your HP or shield, lose 1 stack and zap the attacker for 2.",
   },
   {
     id: "volt",

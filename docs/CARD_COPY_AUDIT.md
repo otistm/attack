@@ -1,9 +1,22 @@
-# Card copy audit (61 cards)
+# Card copy audit (67 cards)
 
 Audit date: implementation of Card Description & Lore plan.  
 **Vocabulary:** activated (not bond). **Format:** single mechanical line per card.
 
-Legend: **Pool** = class decks that deal this card. **Grade** = new-player clarity after rewrite.
+## Pool assignment (activation puzzle pass)
+
+Pools are authoritative in [`src/lib/elementClassPools.ts`](../src/lib/elementClassPools.ts). Summary:
+
+- **Fire:** `el-02,12,16,19,26,31–35,51,52` + Mend — removed Blaze, Kindling, Oil Flask, duplicate Aegis; Scorch reshaped to mixed seam.
+- **Freeze:** `el-11,18,36,38–40,53–54,56,59–60` + Aegis — removed Rime Shard, Mend, Chilltouch, Bitter; Glacia/Hail/Black Ice mixed seams.
+- **Poison:** `el-03,10,13,17,25,46–50` + Mend — Aegis removed; Venin `triangle→diamond`.
+- **Volt:** `el-21–24,28–29,41–45,62–63` + Mend — removed Surge/Overload `star→star`; Surge/Overload/Chain Lightning mixed seams.
+
+Wildcard bridges in pools: **Tinderbox**, **Snowglobe** only (`seam power -1` copy). Kindling / Rime Shard remain in catalog, out of pools.
+
+Run `npm run test:pool-audit` for seam-difficulty metrics.
+
+Legend: **Pool** = class decks that deal this card (may be stale in rows below — use pools file). **Grade** = new-player clarity after rewrite.
 
 | ID | Name | Pool | Shapes | Prior line | Proposed line | Grade |
 |----|------|------|--------|------------|---------------|-------|
@@ -68,6 +81,20 @@ Legend: **Pool** = class decks that deal this card. **Grade** = new-player clari
 | el-59 | Shiver | freeze | circle→hexagon | solo chips 2, chills 2 | Solo: deals 2, applies 2 chill. | A |
 | el-60 | Permafrost | freeze | circle→hexagon | +1 chip vs chilled foes | Freeze activated: +1 chip vs chilled foes. | A |
 | el-61 | Rime Shard | freeze | circle→circle | left seam links anywhere | Left seam: connects to any shape. | A |
+| el-64 | Viper Fang | poison | triangle→star | solo chip+poison; activated +2 poison | Solo: deals 2, stacks 1 poison. If activated: stacks 2 poison. | A |
+| el-65 | Hemlock Needle | poison | triangle→square | solo chip; activated +1 poison | Solo: deals printed chip. If activated: stacks 1 poison. | A |
+| el-66 | Snow Hare | freeze | circle→star | solo chip+1 chill; activated +1 chill | Solo: deals 2, 1 chill. If activated: 1 chill. | A |
+| el-67 | Frost Mite | freeze | circle→square | solo chip+1 chill; activated +2 chill | Solo: deals 2, 1 chill. If activated: 2 chill. | A |
+| el-68 | Faraday Cage | volt | star→diamond | solo shock 2; activated +3 barrier | Solo: deals 2 shock. If activated: +3 volt barrier. | A |
+| el-69 | Static Ward | volt | star→hexagon | solo printed shock; activated +2 barrier | Solo: deals printed shock. If activated: +2 volt barrier. | A |
+
+### Pool swaps (dual-damage pass)
+
+| Class | Removed from pool | Added |
+|-------|-------------------|-------|
+| poison | el-49 Plague, el-46 Venin | el-64, el-65 |
+| freeze | el-38 Frostbite, el-55 Chilltouch | el-66, el-67 |
+| volt | el-42 Conduit, el-29 Relay | el-68, el-69 |
 
 ## Out-of-pool cards (retained in catalog)
 

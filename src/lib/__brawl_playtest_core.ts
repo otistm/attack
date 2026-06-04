@@ -1,6 +1,7 @@
 /**
  * Shared headless brawl simulator for class playtests.
  */
+import type { CardDefinition } from "./cards";
 import { dealBrawlElementHand, elementCatalogId } from "./elementDeal";
 import {
   buildHandAttackGroupsWithAbilities,
@@ -16,6 +17,7 @@ import {
   FREEZE_COOLDOWN_PAUSE_MS,
   freshElementCombatState,
   optimizeElementHand,
+  sumBondPower,
   tickCombatDotStacks,
   type BrawlHandAttack,
   type ElementCombatState,
@@ -44,6 +46,11 @@ export interface PlaytestGameResult {
   userBondPower: number;
   opponentClass: BrawlClass;
   sandstorm: boolean;
+}
+
+export interface BrawlHandLayout {
+  hand: CardDefinition[];
+  affirmedSeams: ReadonlySet<string>;
 }
 
 function fireGroup(
@@ -107,20 +114,18 @@ function delayRandomGroup(timers: GroupTimer[], delayMs: number): void {
   timers[idx]!.nextFireAt += delayMs;
 }
 
-function pauseCardOnSide(
+function pauseRandomGroupCards(
   cardPauseUntil: Record<string, number>,
   groups: BrawlHandAttack[][],
   nowMs: number,
 ): void {
-  const ids: string[] = [];
-  for (const g of groups) {
-    for (const c of g) {
-      if (!c.skipAttack) ids.push(c.id);
-    }
+  const eligible = groups.filter((g) => g.some((c) => !c.skipAttack));
+  if (eligible.length === 0) return;
+  const group = eligible[Math.floor(Math.random() * eligible.length)]!;
+  const until = nowMs + FREEZE_COOLDOWN_PAUSE_MS;
+  for (const card of group) {
+    cardPauseUntil[card.id] = Math.max(cardPauseUntil[card.id] ?? 0, until);
   }
-  if (ids.length === 0) return;
-  const id = ids[Math.floor(Math.random() * ids.length)]!;
-  cardPauseUntil[id] = Math.max(cardPauseUntil[id] ?? 0, nowMs) + FREEZE_COOLDOWN_PAUSE_MS;
 }
 
 function noteFreezeApplied(
@@ -138,18 +143,18 @@ function noteFreezeApplied(
 
   if (cpuDelta > 0) {
     delayRandomGroup(oppTimers, FREEZE_COOLDOWN_PAUSE_MS);
-    pauseCardOnSide(cardPauseUntil, oppGroups, nowMs);
+    pauseRandomGroupCards(cardPauseUntil, oppGroups, nowMs);
     if (state.freezeOnCpu >= FREEZE_BACKLASH_THRESHOLD) {
       delayRandomGroup(userTimers, FREEZE_COOLDOWN_PAUSE_MS);
-      pauseCardOnSide(cardPauseUntil, userGroups, nowMs);
+      pauseRandomGroupCards(cardPauseUntil, userGroups, nowMs);
     }
   }
   if (playerDelta > 0) {
     delayRandomGroup(userTimers, FREEZE_COOLDOWN_PAUSE_MS);
-    pauseCardOnSide(cardPauseUntil, userGroups, nowMs);
+    pauseRandomGroupCards(cardPauseUntil, userGroups, nowMs);
     if (state.freezeOnPlayer >= FREEZE_BACKLASH_THRESHOLD) {
       delayRandomGroup(oppTimers, FREEZE_COOLDOWN_PAUSE_MS);
-      pauseCardOnSide(cardPauseUntil, oppGroups, nowMs);
+      pauseRandomGroupCards(cardPauseUntil, oppGroups, nowMs);
     }
   }
 
@@ -157,42 +162,40 @@ function noteFreezeApplied(
   last.cpu = state.freezeOnCpu;
 }
 
-export function simulateBrawlGame(
-  userClass: BrawlClass,
-  seed: number,
+export function simulateBrawlCombat(
+  userLayout: BrawlHandLayout,
+  oppLayout: BrawlHandLayout,
+  opponentClass: BrawlClass,
 ): PlaytestGameResult {
-  const oppClass = randomOpponentClass(userClass);
-  const userRaw = dealBrawlElementHand(5, classPoolIds(userClass), seed);
-  const oppRaw = dealBrawlElementHand(5, classPoolIds(oppClass), seed + 5000);
-  const userOpt = optimizeElementHand(userRaw);
-  const oppOpt = optimizeElementHand(oppRaw);
-
   const userBonds = computeElementBondsWithAbilities(
-    userOpt.hand,
-    userOpt.affirmedSeams,
+    userLayout.hand,
+    userLayout.affirmedSeams,
   );
   const oppBonds = computeElementBondsWithAbilities(
-    oppOpt.hand,
-    oppOpt.affirmedSeams,
+    oppLayout.hand,
+    oppLayout.affirmedSeams,
   );
   const userGroups = buildHandAttackGroupsWithAbilities(
-    userOpt.hand,
+    userLayout.hand,
     userBonds,
-    userOpt.affirmedSeams,
+    userLayout.affirmedSeams,
   );
   const oppGroups = buildHandAttackGroupsWithAbilities(
-    oppOpt.hand,
+    oppLayout.hand,
     oppBonds,
-    oppOpt.affirmedSeams,
+    oppLayout.affirmedSeams,
   );
 
-  const userCatalogIds = userOpt.hand.map((c) => elementCatalogId(c.id));
-  const oppCatalogIds = oppOpt.hand.map((c) => elementCatalogId(c.id));
+  const userCatalogIds = userLayout.hand.map((c) => elementCatalogId(c.id));
+  const oppCatalogIds = oppLayout.hand.map((c) => elementCatalogId(c.id));
   const userDefLayout = defenderLayoutMetrics(
-    userOpt.hand,
-    userOpt.affirmedSeams,
+    userLayout.hand,
+    userLayout.affirmedSeams,
   );
-  const oppDefLayout = defenderLayoutMetrics(oppOpt.hand, oppOpt.affirmedSeams);
+  const oppDefLayout = defenderLayoutMetrics(
+    oppLayout.hand,
+    oppLayout.affirmedSeams,
+  );
 
   let state = freshElementCombatState();
   const introMs = 1500;
@@ -281,11 +284,27 @@ export function simulateBrawlGame(
     combatMs: Math.min(t, MAX_COMBAT_MS),
     userHp: state.playerHP,
     oppHp: state.cpuHP,
-    userSeams: userOpt.affirmedSeams.size,
-    userBondPower: userOpt.bondPower,
-    opponentClass: oppClass,
+    userSeams: userLayout.affirmedSeams.size,
+    userBondPower: sumBondPower(userBonds),
+    opponentClass,
     sandstorm,
   };
+}
+
+export function simulateBrawlGame(
+  userClass: BrawlClass,
+  seed: number,
+): PlaytestGameResult {
+  const oppClass = randomOpponentClass(userClass);
+  const userRaw = dealBrawlElementHand(5, classPoolIds(userClass), seed);
+  const oppRaw = dealBrawlElementHand(5, classPoolIds(oppClass), seed + 5000);
+  const userOpt = optimizeElementHand(userRaw);
+  const oppOpt = optimizeElementHand(oppRaw);
+  return simulateBrawlCombat(
+    { hand: userOpt.hand, affirmedSeams: userOpt.affirmedSeams },
+    { hand: oppOpt.hand, affirmedSeams: oppOpt.affirmedSeams },
+    oppClass,
+  );
 }
 
 export function runClassPlaytest(

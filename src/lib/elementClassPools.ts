@@ -5,16 +5,40 @@ import type { Element } from "./brawlElements";
 
 export type BrawlClass = Extract<Element, "fire" | "freeze" | "poison" | "volt">;
 
-/** Shared minimal support — Mend + Aegis only (no Bastion/Purge duplication). */
-export const CLASS_SUPPORT_CARD_IDS = ["el-06", "el-09"] as const;
+/** Wildcard bridges in class pools (one per class). */
+export const WILDCARD_BRIDGE_CARD_IDS = ["el-51", "el-53"] as const;
 
-const FIRE_SUPPORT_CARD_IDS = CLASS_SUPPORT_CARD_IDS;
-const POISON_SUPPORT_CARD_IDS = CLASS_SUPPORT_CARD_IDS;
-const VOLT_SUPPORT_CARD_IDS = ["el-06"] as const;
+/** All wildcard bridge catalog entries (penalty applies if either card is a bridge). */
+export const ALL_WILDCARD_BRIDGE_CATALOG_IDS = [
+  "el-51",
+  "el-57",
+  "el-53",
+  "el-61",
+] as const;
+
+const WILDCARD_SET = new Set<string>(ALL_WILDCARD_BRIDGE_CATALOG_IDS);
+
+export function isWildcardBridgeCatalogId(catalogId: string): boolean {
+  return WILDCARD_SET.has(catalogId);
+}
+
+/** Deal weight (default 1). Bridges are rarer in the pool RNG. */
+export const POOL_DEAL_WEIGHTS: Partial<Record<string, number>> = {
+  "el-51": 0.22,
+  "el-53": 0.22,
+};
+
+export function poolDealWeight(catalogId: string): number {
+  return POOL_DEAL_WEIGHTS[catalogId] ?? 1;
+}
+
+/** Mend — heal/cleanse support (fire, poison, volt). */
+const MEND_ID = "el-06" as const;
+/** Aegis — shield support (freeze only in this pass). */
+const AEGIS_ID = "el-09" as const;
 
 const FIRE_ELEMENT_IDS = [
   "el-02",
-  "el-05",
   "el-12",
   "el-16",
   "el-19",
@@ -26,30 +50,22 @@ const FIRE_ELEMENT_IDS = [
   "el-35",
   "el-51",
   "el-52",
-  "el-57",
-  "el-58",
 ] as const;
 
 const FREEZE_ELEMENT_IDS = [
-  "el-07",
   "el-11",
   "el-18",
   "el-36",
-  "el-37",
-  "el-38",
   "el-39",
   "el-40",
   "el-53",
   "el-54",
-  "el-55",
   "el-56",
   "el-59",
   "el-60",
-  "el-61",
+  "el-66",
+  "el-67",
 ] as const;
-
-/** Ren pool — Mend + Aegis only (trimmed from full class support). */
-const FREEZE_SUPPORT_CARD_IDS = ["el-06", "el-09"] as const;
 
 const POISON_ELEMENT_IDS = [
   "el-03",
@@ -57,11 +73,11 @@ const POISON_ELEMENT_IDS = [
   "el-13",
   "el-17",
   "el-25",
-  "el-46",
   "el-47",
   "el-48",
-  "el-49",
   "el-50",
+  "el-64",
+  "el-65",
 ] as const;
 
 const VOLT_ELEMENT_IDS = [
@@ -69,20 +85,22 @@ const VOLT_ELEMENT_IDS = [
   "el-22",
   "el-24",
   "el-28",
-  "el-29",
   "el-41",
-  "el-42",
   "el-43",
   "el-45",
   "el-62",
   "el-63",
+  "el-68",
+  "el-69",
 ] as const;
 
 export const BRAWL_CLASS_POOLS: Record<BrawlClass, readonly string[]> = {
-  fire: [...FIRE_ELEMENT_IDS, ...FIRE_SUPPORT_CARD_IDS],
-  freeze: [...FREEZE_ELEMENT_IDS, ...FREEZE_SUPPORT_CARD_IDS],
-  poison: [...POISON_ELEMENT_IDS, ...POISON_SUPPORT_CARD_IDS],
-  volt: [...VOLT_ELEMENT_IDS, ...VOLT_SUPPORT_CARD_IDS],
+  /** Mend removed — fire leans burn race, not heal pivot vs poison. */
+  fire: [...FIRE_ELEMENT_IDS],
+  freeze: [...FREEZE_ELEMENT_IDS, AEGIS_ID],
+  poison: [...POISON_ELEMENT_IDS, MEND_ID],
+  /** Mend removed — volt leans shock + barrier, not heal pivot. */
+  volt: [...VOLT_ELEMENT_IDS],
 };
 
 export const BRAWL_CLASSES: BrawlClass[] = ["fire", "freeze", "poison", "volt"];

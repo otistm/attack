@@ -35,8 +35,21 @@ export function abilityFooterClassName(compact: boolean): string {
   return compact ? "px-1.5 py-1" : "px-2 py-1.5";
 }
 
+/** Brawl value-card ability strip — pinned to card bottom, clear of center value. */
+export function cardBrawlFooterClassName(
+  compact: boolean,
+  onColoredBody = false,
+): string {
+  const pad = abilityFooterClassName(compact);
+  const surface = onColoredBody
+    ? "bg-black/35 border-white/25"
+    : "bg-white/95 border-slate-200";
+  return `${pad} border-t ${surface}`;
+}
+
+/** Centers the printed value on the card face (header/footer are absolute). */
 export function cardCenterValueClass(): string {
-  return "flex items-center justify-center";
+  return "absolute inset-0 z-20 flex items-center justify-center text-center leading-none pointer-events-none";
 }
 
 export const PLAY_CARD = {

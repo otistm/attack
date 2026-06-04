@@ -46,7 +46,7 @@ function assert(cond: boolean, msg: string, detail?: unknown) {
     },
     true,
   );
-  assert(combat.cpuHP === 89, "chain lightning +8 (4 chain)", combat.cpuHP);
+  assert(combat.cpuHP === 85, "chain lightning +15 (4 chain)", combat.cpuHP);
 }
 
 /** 10-game sample: no class should be auto-win or auto-loss. */

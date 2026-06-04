@@ -21,11 +21,14 @@ export function CardElementActivationTags({
   hand,
   affirmedSeams,
   compact = false,
+  inFooter = false,
 }: {
   cardId: string;
   hand?: readonly CardDefinition[];
   affirmedSeams?: ReadonlySet<string> | null;
   compact?: boolean;
+  /** When true, tags sit in the card footer (no extra top margin). */
+  inFooter?: boolean;
 }) {
   const active = activeElementsOnCard(cardId, hand ?? [], affirmedSeams);
   if (!active.length) return null;
@@ -35,7 +38,9 @@ export function CardElementActivationTags({
     : "text-[8px] leading-[1.15]";
 
   return (
-    <div className="mt-0.5 flex flex-wrap items-center justify-center gap-0.5 max-w-[92%]">
+    <div
+      className={`flex flex-wrap items-center justify-center gap-0.5 max-w-[96%] ${inFooter ? "" : "mt-0.5"}`}
+    >
       {active.map((el) => (
         <span
           key={el}

@@ -141,13 +141,22 @@ export interface ElementCombatState {
   /** Freeze stack — adds delay to that side's attack cooldown (stacks). */
   freezeOnPlayer: number;
   freezeOnCpu: number;
+  /** Volt barrier — retaliates when card hits reduce HP or shield (1 stack per hit). */
+  voltBarrierOnPlayer: number;
+  voltBarrierOnCpu: number;
 }
+
+/** Chip returned to the attacker when a volt barrier stack triggers. */
+export const VOLT_BARRIER_RETALIATE = 3;
 
 export const BRAWL_START_HP = 100;
 /** How often burn/poison stacks tick during combat. */
 export const BRAWL_DOT_TICK_MS = 1000;
 /** Damage dealt per DoT tick (1 point of stack consumed per damage). */
+/** Poison stack tick damage per second. */
 export const BRAWL_DOT_DAMAGE_PER_TICK = 1;
+/** Burn ticks faster than poison — helps fire race DoT classes. */
+export const BRAWL_BURN_DOT_DAMAGE_PER_TICK = 2;
 
 export function freshElementCombatState(): ElementCombatState {
   return {
@@ -161,6 +170,8 @@ export function freshElementCombatState(): ElementCombatState {
     shieldOnCpu: 0,
     freezeOnPlayer: 0,
     freezeOnCpu: 0,
+    voltBarrierOnPlayer: 0,
+    voltBarrierOnCpu: 0,
   };
 }
 
@@ -412,6 +423,9 @@ export function freezeChipDamage(
 }
 
 /** Apply freeze stacks plus scaled chip damage. */
+/** Bonus chip when the defender is already chilled (Ren closure). */
+export const FREEZE_CHILLED_CHIP_BONUS = 1;
+
 export function applyFreezeBondEffect(
   state: ElementCombatState,
   attackerIsPlayer: boolean,
@@ -419,10 +433,16 @@ export function applyFreezeBondEffect(
   freezeStacks: number,
   combineCount: number = 2,
 ): ElementCombatState {
-  const chip = freezeChipDamage(bondPower, combineCount);
+  let chip = freezeChipDamage(bondPower, combineCount);
+  const chilled = attackerIsPlayer
+    ? state.freezeOnCpu
+    : state.freezeOnPlayer;
+  if (chilled > 0) chip += FREEZE_CHILLED_CHIP_BONUS;
   let next: ElementCombatState = { ...state };
   if (chip > 0) {
-    next = applyDamageToDefender(next, attackerIsPlayer, chip);
+    next = applyDamageToDefender(next, attackerIsPlayer, chip, {
+      fromCardAttack: true,
+    });
   }
   const stacks = Math.max(0, freezeStacks);
   if (attackerIsPlayer) next.freezeOnCpu += stacks;
@@ -492,32 +512,144 @@ export function buildHandAttackGroups(
   );
 }
 
+export type ApplyDamageOptions = {
+  /** Card/projectile hit — may trigger volt barrier retaliate on the defender. */
+  fromCardAttack?: boolean;
+};
+
+function defenderBarrierStack(
+  state: ElementCombatState,
+  attackerIsPlayer: boolean,
+): number {
+  return attackerIsPlayer
+    ? state.voltBarrierOnCpu
+    : state.voltBarrierOnPlayer;
+}
+
+function applyBarrierRetaliate(
+  state: ElementCombatState,
+  attackerIsPlayer: boolean,
+): ElementCombatState {
+  const next = { ...state };
+  if (attackerIsPlayer) {
+    if (next.voltBarrierOnCpu <= 0) return next;
+    next.voltBarrierOnCpu -= 1;
+    next.playerHP = Math.max(
+      0,
+      next.playerHP - VOLT_BARRIER_RETALIATE,
+    );
+  } else {
+    if (next.voltBarrierOnPlayer <= 0) return next;
+    next.voltBarrierOnPlayer -= 1;
+    next.cpuHP = Math.max(0, next.cpuHP - VOLT_BARRIER_RETALIATE);
+  }
+  return next;
+}
+
+/** Grant volt barrier stacks to the attacking side. */
+export function grantVoltBarrier(
+  state: ElementCombatState,
+  attackerIsPlayer: boolean,
+  stacks: number,
+): ElementCombatState {
+  const n = Math.max(0, stacks);
+  if (n <= 0) return state;
+  const next = { ...state };
+  if (attackerIsPlayer) next.voltBarrierOnPlayer += n;
+  else next.voltBarrierOnCpu += n;
+  return next;
+}
+
 /** Apply damage to the defender's HP (through shield). */
 export function applyDamageToDefender(
   state: ElementCombatState,
   attackerIsPlayer: boolean,
   damage: number,
+  options?: ApplyDamageOptions,
 ): ElementCombatState {
   const dmg = Math.max(0, damage);
+  if (dmg <= 0) return state;
+
+  const beforeHp = attackerIsPlayer ? state.cpuHP : state.playerHP;
+  const beforeShield = attackerIsPlayer
+    ? state.shieldOnCpu
+    : state.shieldOnPlayer;
+
   const next = { ...state };
   if (attackerIsPlayer) {
     const res = applyDamageThroughShield(next.cpuHP, next.shieldOnCpu, dmg);
     next.cpuHP = res.hp;
     next.shieldOnCpu = res.shield;
   } else {
-    const res = applyDamageThroughShield(next.playerHP, next.shieldOnPlayer, dmg);
+    const res = applyDamageThroughShield(
+      next.playerHP,
+      next.shieldOnPlayer,
+      dmg,
+    );
     next.playerHP = res.hp;
     next.shieldOnPlayer = res.shield;
   }
+
+  const afterHp = attackerIsPlayer ? next.cpuHP : next.playerHP;
+  const afterShield = attackerIsPlayer
+    ? next.shieldOnCpu
+    : next.shieldOnPlayer;
+  const hpLost = beforeHp - afterHp;
+  const shieldLost = beforeShield - afterShield;
+
+  if (
+    options?.fromCardAttack &&
+    (hpLost > 0 || shieldLost > 0) &&
+    defenderBarrierStack(state, attackerIsPlayer) > 0
+  ) {
+    return applyBarrierRetaliate(next, attackerIsPlayer);
+  }
   return next;
 }
+
+/** Chip then poison stacks (dual-damage poison cards). */
+export function applyPoisonStrike(
+  state: ElementCombatState,
+  attackerIsPlayer: boolean,
+  chip: number,
+  stacks: number,
+): ElementCombatState {
+  let next = applyDamageToDefender(state, attackerIsPlayer, chip, {
+    fromCardAttack: true,
+  });
+  const add = Math.max(0, stacks);
+  if (add <= 0) return next;
+  if (attackerIsPlayer) next.poisonOnCpu += add;
+  else next.poisonOnPlayer += add;
+  return next;
+}
+
+/** Chip then chill stacks (dual-damage freeze cards). */
+export function applyFreezeStrike(
+  state: ElementCombatState,
+  attackerIsPlayer: boolean,
+  chip: number,
+  chillStacks: number,
+  combineCount: number = 1,
+): ElementCombatState {
+  return applyFreezeBondEffect(
+    state,
+    attackerIsPlayer,
+    chip,
+    chillStacks,
+    combineCount,
+  );
+}
+
 /** Plain card hit — instant HP damage, no element effect. */
 export function applyGenericCombatHit(
   state: ElementCombatState,
   power: number,
   attackerIsPlayer: boolean,
 ): ElementCombatState {
-  return applyDamageToDefender(state, attackerIsPlayer, power);
+  return applyDamageToDefender(state, attackerIsPlayer, power, {
+    fromCardAttack: true,
+  });
 }
 
 /** Tick burn/poison stacks once during continuous combat. */
@@ -533,16 +665,16 @@ export function tickCombatDotStacks(state: ElementCombatState): ElementCombatSta
     let p = poison;
     let h = hp;
     let s = shield;
-    const applyTick = (stack: number): number => {
+    const applyTick = (stack: number, perTick: number): number => {
       if (stack <= 0) return stack;
-      const dmg = Math.min(stack, BRAWL_DOT_DAMAGE_PER_TICK);
+      const dmg = Math.min(stack, perTick);
       const res = applyDamageThroughShield(h, s, dmg);
       h = res.hp;
       s = res.shield;
       return stack - dmg;
     };
-    b = applyTick(b);
-    p = applyTick(p);
+    b = applyTick(b, BRAWL_BURN_DOT_DAMAGE_PER_TICK);
+    p = applyTick(p, BRAWL_DOT_DAMAGE_PER_TICK);
     return { burn: b, poison: p, hp: h, shield: s };
   };
 
@@ -706,13 +838,19 @@ export function applyInstantCombatBond(
     case "fire":
     case "poison": {
       // Instant hit damage on impact, then DoT stack ticks down over time.
-      const afterHit = applyDamageToDefender(next, attackerIsPlayer, power);
+      const afterHit = applyDamageToDefender(next, attackerIsPlayer, power, {
+        fromCardAttack: true,
+      });
+      const stackGain =
+        bond.element === "poison"
+          ? Math.max(1, Math.floor(power * 0.8))
+          : power;
       if (attackerIsPlayer) {
-        if (bond.element === "fire") afterHit.burnOnCpu += power;
-        else afterHit.poisonOnCpu += power;
+        if (bond.element === "fire") afterHit.burnOnCpu += stackGain;
+        else afterHit.poisonOnCpu += stackGain;
       } else {
-        if (bond.element === "fire") afterHit.burnOnPlayer += power;
-        else afterHit.poisonOnPlayer += power;
+        if (bond.element === "fire") afterHit.burnOnPlayer += stackGain;
+        else afterHit.poisonOnPlayer += stackGain;
       }
       return afterHit;
     }
@@ -736,7 +874,9 @@ export function applyInstantCombatBond(
       }
       break;
     case "volt":
-      return applyDamageToDefender(next, attackerIsPlayer, power);
+      return applyDamageToDefender(next, attackerIsPlayer, power, {
+        fromCardAttack: true,
+      });
   }
   return next;
 }
