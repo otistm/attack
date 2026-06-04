@@ -1,17 +1,16 @@
 /**
- * Element class decks — offensive identity + shared heal/shield support.
+ * Mage class decks — offensive identity + per-class support staples.
  */
 import type { Element } from "./brawlElements";
 
 export type BrawlClass = Extract<Element, "fire" | "freeze" | "poison" | "volt">;
 
-/** Heal + shield staples woven into every class pool. */
-export const CLASS_SUPPORT_CARD_IDS = [
-  "el-06", // Mend — heal
-  "el-09", // Aegis — shield
-  "el-14", // Bastion — shield + heal
-  "el-15", // Purge — heal
-] as const;
+/** Shared minimal support — Mend + Aegis only (no Bastion/Purge duplication). */
+export const CLASS_SUPPORT_CARD_IDS = ["el-06", "el-09"] as const;
+
+const FIRE_SUPPORT_CARD_IDS = CLASS_SUPPORT_CARD_IDS;
+const POISON_SUPPORT_CARD_IDS = CLASS_SUPPORT_CARD_IDS;
+const VOLT_SUPPORT_CARD_IDS = ["el-06"] as const;
 
 const FIRE_ELEMENT_IDS = [
   "el-02",
@@ -74,15 +73,16 @@ const VOLT_ELEMENT_IDS = [
   "el-41",
   "el-42",
   "el-43",
-  "el-44",
   "el-45",
+  "el-62",
+  "el-63",
 ] as const;
 
 export const BRAWL_CLASS_POOLS: Record<BrawlClass, readonly string[]> = {
-  fire: [...FIRE_ELEMENT_IDS, ...CLASS_SUPPORT_CARD_IDS],
+  fire: [...FIRE_ELEMENT_IDS, ...FIRE_SUPPORT_CARD_IDS],
   freeze: [...FREEZE_ELEMENT_IDS, ...FREEZE_SUPPORT_CARD_IDS],
-  poison: [...POISON_ELEMENT_IDS, ...CLASS_SUPPORT_CARD_IDS],
-  volt: [...VOLT_ELEMENT_IDS, ...CLASS_SUPPORT_CARD_IDS],
+  poison: [...POISON_ELEMENT_IDS, ...POISON_SUPPORT_CARD_IDS],
+  volt: [...VOLT_ELEMENT_IDS, ...VOLT_SUPPORT_CARD_IDS],
 };
 
 export const BRAWL_CLASSES: BrawlClass[] = ["fire", "freeze", "poison", "volt"];

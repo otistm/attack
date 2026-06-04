@@ -40,3 +40,24 @@ export function dealBrawlElementHand(
   }
   return hand;
 }
+
+/**
+ * Draw one replacement card during setup, avoiding catalog ids already in hand.
+ */
+export function dealBrawlReplacementCard(
+  poolIds: readonly string[],
+  seed: number,
+  excludeCatalogIds: readonly string[],
+): CardDefinition {
+  const exclude = new Set(excludeCatalogIds);
+  const pool = poolIds
+    .map((id) => ELEMENT_CARDS.find((c) => c.id === id))
+    .filter((c): c is CardDefinition => !!c && !exclude.has(c.id));
+  if (pool.length === 0) {
+    throw new Error("dealBrawlReplacementCard: no cards left in pool");
+  }
+  const rng = mulberry32(seed);
+  const idx = Math.floor(rng() * pool.length);
+  const template = pool[idx]!;
+  return { ...template, id: `${template.id}~r${seed}` };
+}

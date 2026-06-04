@@ -27,11 +27,8 @@ export const SHAPE_COLORS: Record<ShapeType, string> = {
  * and ARIA labels so the visual geometry on the card has a stable readable
  * name (`Square` instead of `square`).
  *
- * Note: an earlier iteration tried to alias each shape to a baseball pitch
- * type (square=Fastball, circle=Off-Speed, ...). That created confusion the
- * moment a player saw the SAME shapes on their batter cards (the batter
- * isn't pitching, so calling their CIRCLE "Off-Speed" was nonsense). We're
- * back to plain shape names -- the visual geometry IS the vocabulary.
+ * Shapes map to elements at card seams (fire, freeze, poison, etc.). The
+ * geometry on the card edge is the vocabulary — no sport or role metaphors.
  */
 export const SHAPE_LABEL: Record<ShapeType, string> = {
   square: 'Fire',

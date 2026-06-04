@@ -19,11 +19,15 @@ import {
   type BrawlImpact,
   type BrawlAura,
 } from "./BrawlImpactCanvas";
+import { BrawlCardElementFxCanvas, type CardElementFx } from "./BrawlCardElementFx";
 import type { Element } from "../../lib/brawlElements";
-import { applyElementCombatHit } from "../../lib/elementAbilities";
 import {
-  ELEMENT_LABEL,
+  applyElementCombatHit,
+  type DefenderLayoutMetrics,
+} from "../../lib/elementAbilities";
+import {
   brawlCardOverlayCooldownMs,
+  FREEZE_BACKLASH_THRESHOLD,
   FREEZE_COOLDOWN_PAUSE_MS,
   consumeAttackerFreeze,
   isSelfBuffBond,
@@ -37,6 +41,7 @@ import {
   applySandstormTick,
   BRAWL_SANDSTORM_TICK_MS,
   BRAWL_SANDSTORM_WARNING_MS,
+  sandstormEdgeVignetteIntensity,
   shouldActivateSandstorm,
 } from "../../lib/brawlSandstorm";
 import {
@@ -114,6 +119,10 @@ export interface BrawlRevealInput {
   onComplete: () => void;
   /** Fired on every impact so the parent can ping the screen-shake. */
   onImpact?: (power: number, grand: boolean) => void;
+  /** Foe layout when the user attacks (locked-in opponent hand). */
+  opponentDefenderLayout?: DefenderLayoutMetrics;
+  /** Foe layout when the opponent attacks the user. */
+  userDefenderLayout?: DefenderLayoutMetrics;
   /**
    * A monotonically increasing id for the parent's at-bat. Bump it to
    * force the timeline to tear down + rebuild even if the other inputs
@@ -156,14 +165,17 @@ export interface BrawlRevealOutput {
   /** Incremented when heal lands on each seat — drives pill burst VFX. */
   displayedBatterHealPulse: number;
   displayedPitcherHealPulse: number;
+  /** Incremented when shield absorbs damage — drives absorb flash VFX. */
+  displayedBatterShieldPulse: number;
+  displayedPitcherShieldPulse: number;
   /** Active impacts the VFX canvas should render. */
   impacts: BrawlImpact[];
+  /** Element bursts on activating cards (R3F overlay). */
+  cardElementFx: CardElementFx[];
   /** Active projectiles in flight (DOM streaks). */
   projectiles: BrawlProjectile[];
   /** @deprecated Use `projectiles`. Kept for callers that haven't migrated. */
   flying: BrawlProjectile[];
-  /** Floating "-N" numbers spawned at impact. */
-  hitNumbers: HitNumber[];
   /** True iff at least one card is mid-arc. Useful for masking other UI. */
   attacking: boolean;
   /**
@@ -178,6 +190,8 @@ export interface BrawlRevealOutput {
   sandstormActive: boolean;
   /** Current sandstorm tick index (ramps damage). */
   sandstormTickIndex: number;
+  /** 0–1 edge vignette darkness (5s pre-strike through sandstorm ticks). */
+  sandstormVignetteIntensity: number;
 }
 
 /** Drives the bottom-up cooldown fill on a card after it fires. */
@@ -218,19 +232,6 @@ interface BrawlProjectile {
   flightMs: number;
 }
 
-interface HitNumber {
-  id: string;
-  x: number;
-  y: number;
-  value: number;
-  defender: "user" | "opponent";
-  bornAt: number;
-  grand?: boolean;
-  label?: string;
-  /** Sandstorm ticks use a shared warm tint on both pills. */
-  variant?: "sandstorm";
-}
-
 export interface BrawlShakePulse {
   id: number;
   power: number;
@@ -251,7 +252,6 @@ const DENOUEMENT_MS = 800;
 const PROJECTILE_MS = 280;
 /** How long a screen-space impact stays in the queue before we GC it. */
 const IMPACT_GC_MS = 1100;
-const HIT_NUMBER_LIFETIME_MS = 820;
 /** How long a projectile stays mounted after impact (dissolve). */
 const PROJECTILE_TAIL_MS = 180;
 
@@ -288,15 +288,19 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
   const [displayedPitcherPoison, setDisplayedPitcherPoison] = useState(0);
   const [displayedBatterHealPulse, setDisplayedBatterHealPulse] = useState(0);
   const [displayedPitcherHealPulse, setDisplayedPitcherHealPulse] = useState(0);
+  const [displayedBatterShieldPulse, setDisplayedBatterShieldPulse] = useState(0);
+  const [displayedPitcherShieldPulse, setDisplayedPitcherShieldPulse] = useState(0);
   const [impacts, setImpacts] = useState<BrawlImpact[]>([]);
+  const [cardElementFx, setCardElementFx] = useState<CardElementFx[]>([]);
   const [projectiles, setProjectiles] = useState<BrawlProjectile[]>([]);
-  const [hitNumbers, setHitNumbers] = useState<HitNumber[]>([]);
   const [attackPhase, setAttackPhase] = useState<BrawlAttackPhase>("idle");
   const [cardCooldowns, setCardCooldowns] = useState<
     Record<string, CardCooldownPulse>
   >({});
   const [sandstormActive, setSandstormActive] = useState(false);
   const [sandstormTickIndex, setSandstormTickIndex] = useState(0);
+  const [sandstormVignetteIntensity, setSandstormVignetteIntensity] =
+    useState(0);
   const attackingRef = useRef(false);
   const [attacking, setAttacking] = useState(false);
 
@@ -315,13 +319,16 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       setDisplayedPitcherPoison(0);
       setDisplayedBatterHealPulse(0);
       setDisplayedPitcherHealPulse(0);
+      setDisplayedBatterShieldPulse(0);
+      setDisplayedPitcherShieldPulse(0);
       setImpacts([]);
+      setCardElementFx([]);
       setProjectiles([]);
-      setHitNumbers([]);
       setAttackPhase("idle");
       setCardCooldowns({});
       setSandstormActive(false);
       setSandstormTickIndex(0);
+      setSandstormVignetteIntensity(0);
       attackingRef.current = false;
       setAttacking(false);
       return;
@@ -349,15 +356,21 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
     setDisplayedPitcherPoison(0);
     setDisplayedBatterHealPulse(0);
     setDisplayedPitcherHealPulse(0);
+    setDisplayedBatterShieldPulse(0);
+    setDisplayedPitcherShieldPulse(0);
     setImpacts([]);
+    setCardElementFx([]);
     setProjectiles([]);
-    setHitNumbers([]);
     setAttackPhase("intro");
     setCardCooldowns({});
     setSandstormActive(false);
     setSandstormTickIndex(0);
+    setSandstormVignetteIntensity(0);
     attackingRef.current = true;
     setAttacking(true);
+
+    const combatStartedAt = performance.now();
+    const CARD_FX_LIFETIME_MS = 1100;
 
     let combat: ElementCombatState = elementCombatStart
       ? { ...freshElementCombatState(), ...elementCombatStart }
@@ -380,6 +393,9 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       const attackerHandCatalogIds = isUser
         ? input.userHandCatalogIds ?? []
         : input.opponentHandCatalogIds ?? [];
+      const defenderLayout = isUser
+        ? input.opponentDefenderLayout
+        : input.userDefenderLayout;
       const after = applyElementCombatHit(
         before,
         {
@@ -389,19 +405,20 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
           rightCardId: card.rightCardId,
           combineCount: card.combineCount,
           attackerHandCatalogIds,
+          defenderLayout,
         },
         isUser,
       );
-      combatEvents.push(
-        logCardCombatEvent(before, after, {
-          cardId: card.id,
-          rightCardId: card.rightCardId,
-          power: card.power,
-          element: card.element,
-          label: card.label,
-          attackerIsPlayer: isUser,
-        }),
-      );
+
+      const evt = logCardCombatEvent(before, after, {
+        cardId: card.id,
+        rightCardId: card.rightCardId,
+        power: card.power,
+        element: card.element,
+        label: card.label,
+        attackerIsPlayer: isUser,
+      });
+      combatEvents.push(evt);
       return after;
     };
 
@@ -417,6 +434,14 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
         setDisplayedBatterHealPulse((n) => n + 1);
       } else {
         setDisplayedPitcherHealPulse((n) => n + 1);
+      }
+    };
+
+    const pulseShieldOnSeat = (seat: "batter" | "pitcher") => {
+      if (seat === "batter") {
+        setDisplayedBatterShieldPulse((n) => n + 1);
+      } else {
+        setDisplayedPitcherShieldPulse((n) => n + 1);
       }
     };
 
@@ -443,7 +468,7 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
     const cardRectFor = (
       id: string,
       attacker: "user" | "opponent",
-    ): { x: number; y: number } => {
+    ): { x: number; y: number; w: number; h: number } => {
       const scope =
         attacker === "user"
           ? '[data-brawl-hand="user"]'
@@ -453,11 +478,18 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       );
       const pick = (r: DOMRect | null) =>
         r && r.width > 0 && r.height > 0
-          ? { x: r.left + r.width / 2, y: r.top + r.height / 2 }
+          ? {
+              x: r.left + r.width / 2,
+              y: r.top + r.height / 2,
+              w: r.width,
+              h: r.height,
+            }
           : null;
       const fromScoped = pick(scoped);
       if (fromScoped) return fromScoped;
-      return attacker === "user" ? userPillFallback : opponentPillFallback;
+      const fb =
+        attacker === "user" ? userPillFallback : opponentPillFallback;
+      return { ...fb, w: 88, h: 120 };
     };
 
     const pillAt = (side: "user" | "opponent") => {
@@ -501,6 +533,26 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       combat.playerHP <= 0 || combat.cpuHP <= 0;
 
     const timers: ReturnType<typeof setTimeout>[] = [];
+
+    const spawnCardElementFx = (
+      cardId: string,
+      element: Element | undefined,
+      uiSide: "user" | "opponent",
+    ) => {
+      if (!element || element === "shield" || element === "heal") return;
+      const rect = cardRectFor(cardId, uiSide);
+      const bornAt = performance.now();
+      const id = `fx-${cardId}-${bornAt}`;
+      setCardElementFx((prev) => [
+        ...prev,
+        { id, element, x: rect.x, y: rect.y, w: rect.w, h: rect.h, bornAt },
+      ]);
+      timers.push(
+        setTimeout(() => {
+          setCardElementFx((prev) => prev.filter((f) => f.id !== id));
+        }, CARD_FX_LIFETIME_MS),
+      );
+    };
 
     const endCombat = () => {
       if (combatOver) return;
@@ -564,14 +616,26 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
     };
 
     const noteFreezeApplied = (state: ElementCombatState) => {
-      if (state.freezeOnPlayer > lastFreezeOnPlayer) {
-        const cardId = pickRandomCardId(userAttackGroups);
-        if (cardId) pauseCardCooldown(cardId);
-      }
-      if (state.freezeOnCpu > lastFreezeOnCpu) {
+      const playerDelta = state.freezeOnPlayer - lastFreezeOnPlayer;
+      const cpuDelta = state.freezeOnCpu - lastFreezeOnCpu;
+
+      if (cpuDelta > 0) {
         const cardId = pickRandomCardId(opponentAttackGroups);
         if (cardId) pauseCardCooldown(cardId);
+        if (state.freezeOnCpu >= FREEZE_BACKLASH_THRESHOLD) {
+          const backlash = pickRandomCardId(userAttackGroups);
+          if (backlash) pauseCardCooldown(backlash);
+        }
       }
+      if (playerDelta > 0) {
+        const cardId = pickRandomCardId(userAttackGroups);
+        if (cardId) pauseCardCooldown(cardId);
+        if (state.freezeOnPlayer >= FREEZE_BACKLASH_THRESHOLD) {
+          const backlash = pickRandomCardId(opponentAttackGroups);
+          if (backlash) pauseCardCooldown(backlash);
+        }
+      }
+
       lastFreezeOnPlayer = state.freezeOnPlayer;
       lastFreezeOnCpu = state.freezeOnCpu;
     };
@@ -701,36 +765,15 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
         }
         if (card.element === "heal") {
           pulseHealOnSeat(selfSeat);
+        } else if (card.element === "shield") {
+          pulseShieldOnSeat(selfSeat);
         }
-        const buffLabel =
-          card.element === "heal"
-            ? `+${card.power} Heal`
-            : `+${card.power} Shield`;
-        const hitNumber: HitNumber = {
-          id: `${fxKey}-buff`,
-          x: selfPill.x,
-          y: selfPill.y,
-          value: card.power,
-          defender: attackerUi,
-          bornAt: performance.now(),
-          label: buffLabel,
-        };
-        setHitNumbers((prev) => [...prev, hitNumber]);
-        timers.push(
-          setTimeout(() => {
-            setHitNumbers((prev) =>
-              prev.filter((n) => n.id !== `${fxKey}-buff`),
-            );
-          }, HIT_NUMBER_LIFETIME_MS),
-        );
+        spawnCardElementFx(card.id, card.element, attackerUi);
         return;
       }
 
+      spawnCardElementFx(card.id, card.element, attackerUi);
       const src = cardRectFor(card.id, attackerUi);
-      const hitLabel = card.element
-        ? `${card.power} ${ELEMENT_LABEL[card.element]}`
-        : `${card.power} Hit`;
-
       setProjectiles((prev) => [
         ...prev,
         {
@@ -753,38 +796,23 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       timers.push(
         setTimeout(() => {
           resolveCardHit(card, isUser);
+          const evt = combatEvents[combatEvents.length - 1];
+          if (evt && evt.shieldAbsorbed > 0) {
+            pulseShieldOnSeat(foeSeat);
+          }
 
           const impactPayload: BrawlImpact = {
             id: fxKey,
             x: foePill.x,
             y: foePill.y,
-            power: card.power,
+            power: evt?.hpDamage ?? card.power,
             bornAt: performance.now(),
             defender: defenderUi,
             grand: false,
+            element: card.element,
           };
           setImpacts((prev) => [...prev, impactPayload]);
-          setHitNumbers((prev) => [
-            ...prev,
-            {
-              id: `${fxKey}-hit`,
-              x: foePill.x,
-              y: foePill.y,
-              value: card.power,
-              defender: defenderUi,
-              bornAt: performance.now(),
-              label: hitLabel,
-            },
-          ]);
-          onImpactRef.current?.(card.power, false);
-
-          timers.push(
-            setTimeout(() => {
-              setHitNumbers((prev) =>
-                prev.filter((n) => n.id !== `${fxKey}-hit`),
-              );
-            }, HIT_NUMBER_LIFETIME_MS),
-          );
+          onImpactRef.current?.(evt?.hpDamage ?? card.power, false);
         }, PROJECTILE_MS),
       );
 
@@ -874,47 +902,6 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
       }
     };
 
-    const spawnSandstormFloaters = (damage: number, tick: number) => {
-      const bornAt = performance.now();
-      const userP = pillAt("user");
-      const oppP = pillAt("opponent");
-      const label = `-${damage}`;
-      setHitNumbers((prev) => [
-        ...prev,
-        {
-          id: `sandstorm-user-${tick}-${bornAt}`,
-          x: userP.x,
-          y: userP.y,
-          value: damage,
-          defender: "user",
-          bornAt,
-          label,
-          variant: "sandstorm",
-        },
-        {
-          id: `sandstorm-opp-${tick}-${bornAt}`,
-          x: oppP.x,
-          y: oppP.y,
-          value: damage,
-          defender: "opponent",
-          bornAt,
-          label,
-          variant: "sandstorm",
-        },
-      ]);
-      timers.push(
-        setTimeout(() => {
-          setHitNumbers((prev) =>
-            prev.filter(
-              (n) =>
-                n.id !== `sandstorm-user-${tick}-${bornAt}` &&
-                n.id !== `sandstorm-opp-${tick}-${bornAt}`,
-            ),
-          );
-        }, HIT_NUMBER_LIFETIME_MS),
-      );
-    };
-
     let sandstormTick = 0;
     let sandstormInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -934,8 +921,13 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
         combat = next;
         combatEvents.push(logSandstormEvent(damage, sandstormTick));
         syncDisplayInstant(combat);
-        spawnSandstormFloaters(damage, sandstormTick);
         setSandstormTickIndex(sandstormTick);
+        setSandstormVignetteIntensity(
+          sandstormEdgeVignetteIntensity(
+            performance.now() - combatStartedAt,
+            sandstormTick,
+          ),
+        );
         onImpactRef.current?.(damage, instantEnd);
         if (instantEnd || isCombatOver()) endCombat();
       }, BRAWL_SANDSTORM_TICK_MS);
@@ -958,6 +950,10 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
     const pauseSyncInterval = setInterval(() => {
       if (combatOver) return;
       syncCardCooldownOverlays();
+      const elapsed = performance.now() - combatStartedAt;
+      setSandstormVignetteIntensity(
+        sandstormEdgeVignetteIntensity(elapsed, sandstormTickCount),
+      );
     }, 100);
 
     timers.push(
@@ -1004,15 +1000,18 @@ export function useBrawlAttackReveal(input: BrawlRevealInput): BrawlRevealOutput
     displayedPitcherPoison,
     displayedBatterHealPulse,
     displayedPitcherHealPulse,
+    displayedBatterShieldPulse,
+    displayedPitcherShieldPulse,
     impacts,
+    cardElementFx,
     projectiles,
     flying: projectiles,
-    hitNumbers,
     attacking,
     attackPhase,
     cardCooldowns,
     sandstormActive,
     sandstormTickIndex,
+    sandstormVignetteIntensity,
   };
 }
 
@@ -1157,19 +1156,19 @@ function cssEscape(s: string): string {
 
 export function BrawlAttackOverlay({
   impacts,
+  cardElementFx = [],
   flying,
   projectiles,
   auras,
-  hitNumbers,
   shakePulse,
   attackPhase,
 }: {
   impacts: BrawlImpact[];
+  cardElementFx?: CardElementFx[];
   /** @deprecated Prefer `projectiles`. */
   flying?: BrawlProjectile[];
   projectiles?: BrawlProjectile[];
   auras: BrawlAura[];
-  hitNumbers: HitNumber[];
   shakePulse: BrawlShakePulse;
   attackPhase: BrawlAttackPhase;
 }) {
@@ -1196,6 +1195,7 @@ export function BrawlAttackOverlay({
       {/* R3F canvas stays outside the shake wrapper — CSS transforms on a
           WebGL parent often blank the framebuffer to white. */}
       <div className="fixed inset-0 z-[53] pointer-events-none">
+        <BrawlCardElementFxCanvas bursts={cardElementFx} />
         <BrawlImpactCanvas impacts={impacts} auras={auras} />
       </div>
       <motion.div
@@ -1204,7 +1204,6 @@ export function BrawlAttackOverlay({
         animate={shake}
       >
         <ProjectileLayer projectiles={activeProjectiles} />
-        <HitNumberLayer numbers={hitNumbers} />
         <BrawlPhaseBanner phase={attackPhase} />
       </motion.div>
     </>
@@ -1385,30 +1384,3 @@ function BrawlProjectileStreak({ proj }: { proj: BrawlProjectile }) {
   );
 }
 
-function HitNumberLayer({ numbers }: { numbers: HitNumber[] }) {
-  return (
-    <div className="absolute inset-0 z-[54] pointer-events-none" aria-hidden="true">
-      <AnimatePresence>
-        {numbers.map((n) => (
-          <motion.div
-            key={n.id}
-            className={`absolute -translate-x-1/2 -translate-y-1/2 px-2 py-1 rounded-md border text-xs font-black tracking-[0.14em] ${
-              n.variant === "sandstorm"
-                ? "bg-orange-600/90 border-orange-200/80 text-orange-50 shadow-[0_0_12px_rgba(251,146,60,0.65)]"
-                : n.defender === "user"
-                  ? "bg-rose-500/85 border-rose-200/80 text-rose-50"
-                  : "bg-amber-500/85 border-amber-200/80 text-amber-50"
-            }`}
-            style={{ left: n.x, top: n.y }}
-            initial={{ y: 0, opacity: 0, scale: 0.72 }}
-            animate={{ y: -42, opacity: 1, scale: n.grand ? 1.18 : 1 }}
-            exit={{ y: -68, opacity: 0, scale: 0.82 }}
-            transition={{ duration: 0.62, ease: [0.2, 0.82, 0.2, 1] }}
-          >
-            {n.label ?? `-${n.value}`}
-          </motion.div>
-        ))}
-      </AnimatePresence>
-    </div>
-  );
-}

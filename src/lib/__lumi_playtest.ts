@@ -1,6 +1,6 @@
 /**
- * Ignis (fire class) playtest — 10 simulated brawls with full combat loop.
- * Run: tsx src/lib/__ignis_playtest.ts
+ * Lumi (poison class) playtest — 10 simulated brawls with full combat loop.
+ * Run: tsx src/lib/__lumi_playtest.ts
  */
 import { dealBrawlElementHand } from "./elementDeal";
 import { elementCatalogId } from "./elementDeal";
@@ -27,7 +27,7 @@ import { elementCardById } from "./elementCards";
 import { applySandstormTick, BRAWL_SANDSTORM_WARNING_MS } from "./brawlSandstorm";
 
 const GAMES = 10;
-const USER_CLASS: BrawlClass = "fire";
+const USER_CLASS: BrawlClass = "poison";
 const STEP_MS = 50;
 const DOT_TICK_MS = 1000;
 const MAX_COMBAT_MS = 120_000;
@@ -196,7 +196,7 @@ let tinderboxGames = 0;
 let matchstickGames = 0;
 let tinderboxSavedSeams = 0;
 
-let totalOppBurn = 0;
+let totalOppPoison = 0;
 
 for (let g = 0; g < GAMES; g++) {
   const seed = 5000 + g * 9973;
@@ -248,13 +248,15 @@ for (let g = 0; g < GAMES; g++) {
     if (userOpt.affirmedSeams.size > 0) tinderboxSavedSeams++;
   }
   if (hadMatchstick) matchstickGames++;
-  totalOppBurn += state.burnOnCpu;
+  totalOppPoison += state.poisonOnCpu;
 
   for (const c of userRaw) {
     const cat = elementCatalogId(c.id);
     cardPickCounts[cat] = (cardPickCounts[cat] ?? 0) + 1;
     if (cat === "el-06") supportInHand.mend++;
     if (cat === "el-09") supportInHand.aegis++;
+    if (cat === "el-14") supportInHand.bastion++;
+    if (cat === "el-15") supportInHand.purge++;
   }
 
   reports.push({
@@ -271,7 +273,7 @@ for (let g = 0; g < GAMES; g++) {
     oppHp: state.cpuHP,
     userBurnDealt: 100 - state.cpuHP,
     oppBurnDealt: 100 - state.playerHP,
-    oppBurnStacks: state.burnOnCpu,
+    oppBurnStacks: state.poisonOnCpu,
     sandstorm,
     cardAppearances: trackAbilityTriggers(userOpt.hand, userOpt.affirmedSeams),
     abilityTriggers: {},
@@ -280,7 +282,7 @@ for (let g = 0; g < GAMES; g++) {
 
 avgCombatMs /= GAMES;
 
-console.log("=== IGNIS PLAYTEST (10 games, current pool) ===\n");
+console.log("=== LUMI (POISON) PLAYTEST (10 games, current pool) ===\n");
 for (const r of reports) {
   console.log(
     `Game ${r.game} vs ${r.opponentClass}: ${r.won ? "WIN" : "LOSS"} | ` +
@@ -289,7 +291,7 @@ for (const r of reports) {
   );
   console.log(`  Dealt: ${r.userHand.join(", ")}`);
   console.log(
-    `  Optimal: ${r.userLayout.join(" → ")} (${r.userSeams} seams, power ${r.userBondPower}) | foe burn ${r.oppBurnStacks}`,
+    `  Optimal: ${r.userLayout.join(" → ")} (${r.userSeams} seams, power ${r.userBondPower}) | foe poison ${r.oppBurnStacks}`,
   );
   console.log(`  Foe: ${r.oppHand.join(", ")}`);
   console.log("");
@@ -298,7 +300,7 @@ for (const r of reports) {
 console.log(`Record: ${wins}-${GAMES - wins}`);
 console.log(`Avg combat: ${(avgCombatMs / 1000).toFixed(1)}s`);
 console.log(`Sandstorm reached: ${sandstormGames}/${GAMES}`);
-console.log(`Avg foe burn stacks at end: ${(totalOppBurn / GAMES).toFixed(1)}`);
+console.log(`Avg foe poison stacks at end: ${(totalOppPoison / GAMES).toFixed(1)}`);
 console.log("\nCard appearance frequency (user hands):");
 const sortedCards = Object.entries(cardPickCounts).sort((a, b) => b[1] - a[1]);
 for (const [id, n] of sortedCards) {
@@ -308,4 +310,4 @@ console.log(`Zero-seam optimal hands: ${zeroSeamGames}/${GAMES}`);
 console.log(`Tinderbox dealt: ${tinderboxGames}/${GAMES} (formed seams: ${tinderboxSavedSeams})`);
 console.log(`Matchstick dealt: ${matchstickGames}/${GAMES}`);
 console.log("\nSupport cards in hands:");
-console.log(`  Mend ${supportInHand.mend}, Aegis ${supportInHand.aegis}`);
+console.log(`  Mend ${supportInHand.mend}, Aegis ${supportInHand.aegis}, Bastion ${supportInHand.bastion}, Purge ${supportInHand.purge}`);

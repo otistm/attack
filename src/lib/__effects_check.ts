@@ -388,8 +388,8 @@ function assert(cond: boolean, msg: string, detail?: unknown) {
     true,
   );
   assert(
-    combat.cpuHP === 98 && combat.freezeOnCpu === 1,
-    "shiver solo chip + freeze",
+    combat.cpuHP === 98 && combat.freezeOnCpu === 2,
+    "shiver solo chip + deep chill",
     { hp: combat.cpuHP, freeze: combat.freezeOnCpu },
   );
 
@@ -471,7 +471,7 @@ function assert(cond: boolean, msg: string, detail?: unknown) {
     "third solo slot waits intro + three 5s slots",
   );
   assert(
-    FREEZE_COOLDOWN_PAUSE_MS === 1500,
+    FREEZE_COOLDOWN_PAUSE_MS === 1200,
     "each freeze hit pauses one random card for 1.5s",
   );
   assert(

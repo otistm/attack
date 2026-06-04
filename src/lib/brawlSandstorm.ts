@@ -3,8 +3,10 @@
  */
 import type { ElementCombatState } from "./brawlElements";
 
-/** Countdown before sandstorm ticks begin (ms). */
+/** Combat time before sandstorm damage ticks begin (ms). */
 export const BRAWL_SANDSTORM_WARNING_MS = 60_000;
+/** Edge vignette begins this many ms before ticks start. */
+export const BRAWL_SANDSTORM_PREWARNING_MS = 5_000;
 /** Sandstorm damage interval — one ramp step per second. */
 export const BRAWL_SANDSTORM_TICK_MS = 1000;
 /** Cap per tick; reaching this ends the match instantly. */
@@ -36,10 +38,34 @@ export function shouldActivateSandstorm(state: ElementCombatState): boolean {
   return state.playerHP > 0 && state.cpuHP > 0;
 }
 
-/** Progress toward sandstorm (0–1) from combat start elapsed ms. */
-export function sandstormProgressFromElapsed(elapsedMs: number): number {
-  if (elapsedMs <= 0) return 0;
-  return Math.min(1, elapsedMs / BRAWL_SANDSTORM_WARNING_MS);
+/** Ms into combat when the pre-strike edge vignette begins. */
+export function sandstormPreVignetteStartMs(): number {
+  return BRAWL_SANDSTORM_WARNING_MS - BRAWL_SANDSTORM_PREWARNING_MS;
+}
+
+/**
+ * Unified edge vignette strength (0–1): silent until 5s before storm, then
+ * darkens through the warning window and ramps with sandstorm ticks until KO.
+ */
+export function sandstormEdgeVignetteIntensity(
+  elapsedMs: number,
+  tickIndex: number,
+): number {
+  const preStart = sandstormPreVignetteStartMs();
+  if (elapsedMs < preStart) return 0;
+
+  /** Vignette level when damage ticks begin. */
+  const preStrikeCap = 0.34;
+
+  if (elapsedMs < BRAWL_SANDSTORM_WARNING_MS) {
+    const t =
+      (elapsedMs - preStart) / BRAWL_SANDSTORM_PREWARNING_MS;
+    const eased = t * t;
+    return preStrikeCap * eased;
+  }
+
+  const tickPart = sandstormVignetteIntensity(Math.max(0, tickIndex));
+  return Math.min(1, preStrikeCap + tickPart * (1 - preStrikeCap));
 }
 
 /**

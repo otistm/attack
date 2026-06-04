@@ -218,7 +218,10 @@ export function brawlGroupFirstFireMs(
 }
 
 /** Ms added to one random defender card's cooldown each time freeze lands. */
-export const FREEZE_COOLDOWN_PAUSE_MS = 1500;
+export const FREEZE_COOLDOWN_PAUSE_MS = 1200;
+
+/** Chill stacks on the foe that can trigger freeze backlash on the attacker. */
+export const FREEZE_BACKLASH_THRESHOLD = 14;
 
 /** Side attack slot duration (chain-reduced base). Freeze pauses timers separately. */
 export function brawlEffectiveAttackCooldownMs(
@@ -281,6 +284,29 @@ export function consumeAttackerFreeze(
 }
 
 /** Longest adjacent affirmed group in the hand (minimum 1). */
+/** Locked-in layout stats for volt cards that scale with foe connections. */
+export function defenderLayoutMetrics(
+  hand: CardDefinition[],
+  affirmedSeams: ReadonlySet<string> | null,
+): {
+  maxChainLength: number;
+  connectedCardCount: number;
+  seamCount: number;
+} {
+  const maxChainLength = maxAffirmedChainLength(hand, affirmedSeams);
+  let connectedCardCount = 0;
+  if (affirmedSeams && affirmedSeams.size > 0) {
+    for (const group of buildGroups(hand, affirmedSeams)) {
+      if (group.length >= 2) connectedCardCount += group.length;
+    }
+  }
+  return {
+    maxChainLength,
+    connectedCardCount,
+    seamCount: affirmedSeams?.size ?? 0,
+  };
+}
+
 export function maxAffirmedChainLength(
   hand: CardDefinition[],
   affirmedSeams: ReadonlySet<string> | null,
@@ -327,6 +353,33 @@ export function computeElementBonds(
     }
   }
   return bonds;
+}
+
+const ELEMENT_DISPLAY_ORDER: Element[] = [
+  "fire",
+  "freeze",
+  "volt",
+  "poison",
+  "shield",
+  "heal",
+];
+
+/**
+ * Elements currently activated on this card — affirmed seam, card is the left
+ * attacker (same rule as `computeElementBonds`).
+ */
+export function activeElementsOnCard(
+  cardId: string,
+  hand: readonly CardDefinition[],
+  affirmedSeams: ReadonlySet<string> | null | undefined,
+): Element[] {
+  if (!hand.length || !affirmedSeams?.size) return [];
+  const bonds = computeElementBonds([...hand], affirmedSeams);
+  const active = new Set<Element>();
+  for (const bond of bonds) {
+    if (bond.leftCardId === cardId) active.add(bond.element);
+  }
+  return ELEMENT_DISPLAY_ORDER.filter((el) => active.has(el));
 }
 
 /** One card's slot in the continuous attack rotation. */

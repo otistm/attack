@@ -2,9 +2,9 @@
 <img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
 </div>
 
-# Dugout
+# When Things Attack
 
-A 3D baseball-card matchup game built with React, Three.js (R3F), Tailwind, and Zustand.
+A mage-themed elemental card autobattler built with React, Three.js (R3F), Tailwind, and Zustand. Choose your archmage, weave elemental bonds in the arena, then watch the duel resolve in real time.
 
 ## Run Locally
 
@@ -23,10 +23,6 @@ Game design, balance, and engineering standards live in **[docs/ARCHMAGE_ARCHITE
 
 ## Notes
 
-- The repo currently has no remote-AI integration. The draft AI is a deterministic
-  heuristic auction engine in [`src/lib/draft.ts`](src/lib/draft.ts) and does not
-  call any external API. If you wire one in later, route the call through a
-  server-side process -- never inline an API key into the client bundle via
-  Vite's `define` (see comment in [`vite.config.ts`](vite.config.ts)).
-- Test scripts: `npm run test:connect`, `npm run test:effects`, `npm run test:copy`,
-  or `npm test` to run all three.
+- The repo currently has no remote-AI integration. Opponent hands use deterministic optimization in [`src/lib/brawlElements.ts`](src/lib/brawlElements.ts) and do not call external APIs.
+- Test scripts: `npm run test:connect`, `npm run test:effects`, `npm run test:cooldown`, or `npm test` for all three.
+- Class playtests: `npx tsx src/lib/__ignis_playtest.ts`, `npx tsx src/lib/__ren_playtest.ts`, `npx tsx src/lib/__lumi_playtest.ts`, `npx tsx src/lib/__volta_playtest.ts`

@@ -58,6 +58,8 @@ export interface BrawlImpact {
   /** Optional "grand slam" flag — escalates particle count + ring scale + a
    *  rainbow tint so a 21+ HP swing reads as the apex spectacle. */
   grand?: boolean;
+  /** Element that landed — drives burst palette. */
+  element?: "fire" | "poison" | "freeze" | "volt" | "shield" | "heal";
 }
 
 export interface BrawlAura {
@@ -81,9 +83,35 @@ interface BrawlImpactCanvasProps {
 
 const IMPACT_LIFETIME_MS = 900;
 const SHOCKWAVE_LIFETIME_MS = 700;
-const PARTICLE_COUNT_BASE = 24;
-const PARTICLE_COUNT_PER_POWER = 6;
-const PARTICLE_COUNT_MAX = 120;
+const PARTICLE_COUNT_BASE = 36;
+const PARTICLE_COUNT_PER_POWER = 8;
+const PARTICLE_COUNT_MAX = 160;
+
+const IMPACT_ELEMENT_TONE: Record<
+  string,
+  { ring: string; spark: string; flash: string }
+> = {
+  fire: { ring: "#fb923c", spark: "#f97316", flash: "#fff7ed" },
+  poison: { ring: "#c084fc", spark: "#a855f7", flash: "#f5f3ff" },
+  freeze: { ring: "#38bdf8", spark: "#7dd3fc", flash: "#f0f9ff" },
+  volt: { ring: "#fbbf24", spark: "#f59e0b", flash: "#fffbeb" },
+};
+
+function impactPalette(impact: BrawlImpact): {
+  ring: string;
+  spark: string;
+  flash: string;
+} {
+  if (impact.grand) {
+    return { ring: "#fffbe6", spark: "#fde68a", flash: "#ffffff" };
+  }
+  if (impact.element && IMPACT_ELEMENT_TONE[impact.element]) {
+    return IMPACT_ELEMENT_TONE[impact.element];
+  }
+  return impact.defender === "user"
+    ? { ring: "#f87171", spark: "#ff5470", flash: "#ffffff" }
+    : { ring: "#fbbf24", spark: "#fcd34d", flash: "#ffffff" };
+}
 
 // ---------------------------------------------------------------------------
 // Public component
@@ -197,11 +225,24 @@ function ImpactCluster({ impact }: { impact: BrawlImpact }) {
       (impact.grand ? 60 : 0),
   );
 
+  const palette = impactPalette(impact);
+
   return (
     <group position={[wx, wy, 0]}>
-      <ShockwaveRing impact={impact} />
-      <ImpactSparks impact={impact} count={particleCount} />
-      <CoreFlash impact={impact} />
+      <ShockwaveRing impact={impact} palette={palette} />
+      <ImpactSparks impact={impact} count={particleCount} palette={palette} />
+      <CoreFlash impact={impact} palette={palette} />
+      {impact.element && impact.element !== "shield" && impact.element !== "heal" && (
+        <Sparkles
+          count={12 + Math.floor(impact.power)}
+          size={5}
+          speed={1.4}
+          scale={[90 + impact.power * 4, 90 + impact.power * 4, 30]}
+          color={palette.spark}
+          opacity={0.9}
+          noise={2}
+        />
+      )}
     </group>
   );
 }
@@ -210,7 +251,13 @@ function ImpactCluster({ impact }: { impact: BrawlImpact }) {
 // Shockwave ring — expanding torus that fades out fast.
 // ---------------------------------------------------------------------------
 
-function ShockwaveRing({ impact }: { impact: BrawlImpact }) {
+function ShockwaveRing({
+  impact,
+  palette,
+}: {
+  impact: BrawlImpact;
+  palette: ReturnType<typeof impactPalette>;
+}) {
   const meshRef = useRef<THREE.Mesh>(null);
   const matRef = useRef<THREE.MeshBasicMaterial>(null);
   // Inner / outer ring radii (world units == px). A heavy hit punches
@@ -220,13 +267,7 @@ function ShockwaveRing({ impact }: { impact: BrawlImpact }) {
     [impact.power, impact.grand],
   );
 
-  // Two-color tint: defender side flavors the ring (rose if we got hit;
-  // amber if we landed the blow). Grand slam paints the ring white-hot.
-  const color = impact.grand
-    ? "#fffbe6"
-    : impact.defender === "user"
-      ? "#f87171" /* rose-400 */
-      : "#fbbf24" /* amber-400 */;
+  const color = palette.ring;
 
   useFrame(() => {
     const now =
@@ -266,9 +307,11 @@ function ShockwaveRing({ impact }: { impact: BrawlImpact }) {
 function ImpactSparks({
   impact,
   count,
+  palette,
 }: {
   impact: BrawlImpact;
   count: number;
+  palette: ReturnType<typeof impactPalette>;
 }) {
   const pointsRef = useRef<THREE.Points>(null);
   const matRef = useRef<THREE.PointsMaterial>(null);
@@ -298,14 +341,7 @@ function ImpactSparks({
     return { positions, velocities, lifetimes };
   }, [count, impact.power]);
 
-  // Tint palette: warm side for the attacker, cool for the defender,
-  // rainbow-shift for grand slam. We snapshot the *base color* in the
-  // material and modulate brightness via opacity during the tween.
-  const color = impact.grand
-    ? "#ffd166"
-    : impact.defender === "user"
-      ? "#ff5470" /* coral / rose flush */
-      : "#fcd34d" /* amber-300 */;
+  const color = palette.spark;
 
   useFrame(() => {
     const now =
@@ -366,7 +402,13 @@ function ImpactSparks({
 // Central bright "flash" disc at the impact center.
 // ---------------------------------------------------------------------------
 
-function CoreFlash({ impact }: { impact: BrawlImpact }) {
+function CoreFlash({
+  impact,
+  palette,
+}: {
+  impact: BrawlImpact;
+  palette: ReturnType<typeof impactPalette>;
+}) {
   const meshRef = useRef<THREE.Mesh>(null);
   const matRef = useRef<THREE.MeshBasicMaterial>(null);
 
@@ -389,7 +431,7 @@ function CoreFlash({ impact }: { impact: BrawlImpact }) {
       <circleGeometry args={[28, 32]} />
       <meshBasicMaterial
         ref={matRef}
-        color="#ffffff"
+        color={palette.flash}
         transparent
         opacity={1}
         blending={THREE.AdditiveBlending}

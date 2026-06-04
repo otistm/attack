@@ -12,31 +12,17 @@ import {
 } from "../../lib/brawlCombatLog";
 import { ELEMENT_LABEL } from "../../lib/brawlElements";
 import type { Element } from "../../lib/brawlElements";
+import type { BrawlClass } from "../../lib/elementClassPools";
+import { classTipForReport } from "../../lib/classCombatTraits";
 
 export interface BrawlBattleResultScreenProps {
   report: BrawlCombatReport;
   phase: "between-at-bats" | "game-over";
   onContinue: () => void;
+  brawlUserClass?: BrawlClass | null;
 }
 
-type ResultView = "summary" | "breakdown";
-
-function headline(report: BrawlCombatReport): {
-  title: string;
-  tone: "win" | "lose" | "neutral";
-} {
-  const { endPlayerHp, endCpuHp } = report;
-  if (endPlayerHp <= 0 && endCpuHp <= 0) {
-    return { title: "Draw", tone: "neutral" };
-  }
-  if (report.userWon) {
-    return { title: "You Win", tone: "win" };
-  }
-  if (endPlayerHp <= 0) {
-    return { title: "You Lose", tone: "lose" };
-  }
-  return { title: "Combat Ended", tone: "neutral" };
-}
+type ResultView = "menu" | "breakdown";
 
 const ELEMENT_CHIP: Record<Element, string> = {
   fire: "bg-orange-500/20 text-orange-100 ring-orange-400/40",
@@ -112,45 +98,6 @@ function EnvironmentalRow({ row }: { row: BrawlEnvironmentalBreakdown }) {
   );
 }
 
-function HpSummary({ report }: { report: BrawlCombatReport }) {
-  return (
-    <div className="flex justify-center gap-8 text-sm">
-      <div className="text-center">
-        <p className="text-[10px] font-semibold uppercase tracking-wide text-emerald-300/80">
-          You
-        </p>
-        <p className="mt-0.5 font-bold tabular-nums text-white">
-          {report.startPlayerHp}
-          <span className="mx-1 text-white/35">→</span>
-          <span
-            className={
-              report.endPlayerHp <= 0 ? "text-rose-400" : "text-emerald-200"
-            }
-          >
-            {report.endPlayerHp}
-          </span>
-        </p>
-      </div>
-      <div className="text-center">
-        <p className="text-[10px] font-semibold uppercase tracking-wide text-rose-300/80">
-          Opponent
-        </p>
-        <p className="mt-0.5 font-bold tabular-nums text-white">
-          {report.startCpuHp}
-          <span className="mx-1 text-white/35">→</span>
-          <span
-            className={
-              report.endCpuHp <= 0 ? "text-rose-400" : "text-rose-200/90"
-            }
-          >
-            {report.endCpuHp}
-          </span>
-        </p>
-      </div>
-    </div>
-  );
-}
-
 function BreakdownPanel({ report }: { report: BrawlCombatReport }) {
   const { cards, environmental } = aggregateCardBreakdown(
     report.events,
@@ -221,82 +168,62 @@ export function BrawlBattleResultScreen({
   report,
   phase,
   onContinue,
+  brawlUserClass = null,
 }: BrawlBattleResultScreenProps) {
-  const [view, setView] = useState<ResultView>("summary");
-  const { title, tone } = headline(report);
+  const [view, setView] = useState<ResultView>("menu");
+  const classTip = classTipForReport(brawlUserClass, report);
 
   useEffect(() => {
-    setView("summary");
+    setView("menu");
   }, [report]);
 
-  const titleClass =
-    tone === "win"
-      ? "text-emerald-300"
-      : tone === "lose"
-        ? "text-rose-300"
-        : "text-amber-200";
-
-  const continueLabel = phase === "game-over" ? "New Game" : "Next Round";
-  const continueClass =
+  const playAgainClass =
     phase === "game-over"
       ? "bg-rose-500 text-rose-950 hover:bg-rose-400"
       : "bg-emerald-500 text-emerald-950 hover:bg-emerald-400";
 
   return (
     <motion.div
-      className="fixed inset-0 z-[60] flex items-center justify-center p-4 sm:p-8 pointer-events-auto"
+      className="fixed inset-0 z-[60] flex items-center justify-center p-4 pointer-events-none"
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       role="dialog"
       aria-modal="true"
-      aria-labelledby="brawl-battle-result-title"
+      aria-label="Post-battle actions"
     >
-      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" />
-
       <motion.div
-        className="relative w-full max-w-lg overflow-hidden rounded-2xl bg-gradient-to-b from-slate-900/95 to-slate-950/98 shadow-2xl ring-1 ring-white/15"
-        initial={{ scale: 0.94, y: 16 }}
+        className={`pointer-events-auto w-full overflow-hidden rounded-2xl bg-gradient-to-b from-slate-900/95 to-slate-950/98 shadow-2xl ring-1 ring-white/20 backdrop-blur-md ${
+          view === "menu" ? "max-w-xs" : "max-w-lg"
+        }`}
+        initial={{ scale: 0.94, y: 12 }}
         animate={{ scale: 1, y: 0 }}
         transition={{ type: "spring", stiffness: 380, damping: 32 }}
       >
         <AnimatePresence mode="wait" initial={false}>
-          {view === "summary" ? (
+          {view === "menu" ? (
             <motion.div
-              key="summary"
-              initial={{ opacity: 0, x: -12 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -12 }}
+              key="menu"
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
               transition={{ duration: 0.18 }}
+              className="flex flex-col gap-2 px-4 py-4"
             >
-              <header className="px-5 py-8 text-center sm:px-6 sm:py-10">
-                <h2
-                  id="brawl-battle-result-title"
-                  className={`text-4xl font-black tracking-tight sm:text-5xl ${titleClass}`}
-                >
-                  {title}
-                </h2>
-                <div className="mt-6">
-                  <HpSummary report={report} />
-                </div>
-              </header>
-
-              <footer className="flex flex-col gap-2 border-t border-white/10 px-4 py-4 sm:px-5">
-                <button
-                  type="button"
-                  onClick={() => setView("breakdown")}
-                  className="w-full rounded-xl bg-white/10 px-4 py-3 text-sm font-bold uppercase tracking-wide text-white transition hover:bg-white/15 active:scale-[0.98]"
-                >
-                  View Breakdown
-                </button>
-                <button
-                  type="button"
-                  onClick={onContinue}
-                  className={`w-full rounded-xl px-4 py-3 text-sm font-bold uppercase tracking-wide transition active:scale-[0.98] ${continueClass}`}
-                >
-                  {continueLabel}
-                </button>
-              </footer>
+              <button
+                type="button"
+                onClick={() => setView("breakdown")}
+                className="w-full rounded-xl bg-white/10 px-4 py-3.5 text-sm font-bold uppercase tracking-wide text-white transition hover:bg-white/15 active:scale-[0.98]"
+              >
+                View battle report
+              </button>
+              <button
+                type="button"
+                onClick={onContinue}
+                className={`w-full rounded-xl px-4 py-3.5 text-sm font-bold uppercase tracking-wide transition active:scale-[0.98] ${playAgainClass}`}
+              >
+                Play again
+              </button>
             </motion.div>
           ) : (
             <motion.div
@@ -307,30 +234,36 @@ export function BrawlBattleResultScreen({
               transition={{ duration: 0.18 }}
               className="flex flex-col"
             >
-              <header className="flex items-center gap-3 border-b border-white/10 px-4 py-4 sm:px-5">
+              <header className="flex items-center gap-3 border-b border-white/10 px-4 py-3">
                 <button
                   type="button"
-                  onClick={() => setView("summary")}
+                  onClick={() => setView("menu")}
                   className="shrink-0 rounded-lg bg-white/10 px-3 py-1.5 text-xs font-bold uppercase tracking-wide text-white/80 transition hover:bg-white/15"
-                  aria-label="Back to result"
+                  aria-label="Back to menu"
                 >
                   Back
                 </button>
                 <h2 className="min-w-0 flex-1 text-center text-sm font-bold uppercase tracking-wide text-white/70">
-                  Battle Breakdown
+                  Battle report
                 </h2>
                 <div className="w-[52px] shrink-0" aria-hidden />
               </header>
 
+              {classTip ? (
+                <p className="mx-4 mt-3 text-xs leading-relaxed text-center text-violet-200/90">
+                  {classTip}
+                </p>
+              ) : null}
+
               <BreakdownPanel report={report} />
 
-              <footer className="border-t border-white/10 px-4 py-4 sm:px-5">
+              <footer className="border-t border-white/10 px-4 py-3">
                 <button
                   type="button"
                   onClick={onContinue}
-                  className={`w-full rounded-xl px-4 py-3 text-sm font-bold uppercase tracking-wide transition active:scale-[0.98] ${continueClass}`}
+                  className={`w-full rounded-xl px-4 py-3 text-sm font-bold uppercase tracking-wide transition active:scale-[0.98] ${playAgainClass}`}
                 >
-                  {continueLabel}
+                  Play again
                 </button>
               </footer>
             </motion.div>

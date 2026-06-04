@@ -268,6 +268,15 @@ export function ClassSelectScreen({ onSelect }: ClassSelectScreenProps) {
         }}
       />
 
+      <div className="pointer-events-none absolute left-6 top-6 sm:left-10 sm:top-10 z-[3]">
+        <p className="text-[10px] font-bold uppercase tracking-[0.35em] text-white/50">
+          When Things Attack
+        </p>
+        <p className="mt-1 text-xs font-semibold text-white/70">
+          Choose your archmage
+        </p>
+      </div>
+
       {/* Detail panel — right */}
       <aside className="absolute right-0 top-0 bottom-52 sm:bottom-56 z-[3] flex w-full max-w-md flex-col justify-center px-8 sm:px-12 pointer-events-none">
         <AnimatePresence mode="wait">
@@ -347,7 +356,7 @@ export function ClassSelectScreen({ onSelect }: ClassSelectScreenProps) {
                           "linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent)",
                       }}
                     />
-                    <span className="relative">Lock In</span>
+                    <span className="relative">Enter Arena</span>
                   </motion.button>
                 )}
 

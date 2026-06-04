@@ -1,5 +1,5 @@
 /**
- * Per-card snap and fight abilities for the 52-card element brawl deck.
+ * Per-card snap and fight abilities for the 61-card mage arena deck.
  */
 import type { CardDefinition } from "./cards";
 import { printedNumericValue } from "./cardModel";
@@ -22,6 +22,7 @@ import {
 
 export const ELEMENT_ABILITY_CATALOG = {
   ember: "el-01",
+  flare: "el-02",
   toxin: "el-03",
   blaze: "el-05",
   mend: "el-06",
@@ -73,6 +74,8 @@ export const ELEMENT_ABILITY_CATALOG = {
   shiver: "el-59",
   permafrost: "el-60",
   rimeShard: "el-61",
+  gridSurge: "el-62",
+  chainLightning: "el-63",
 } as const;
 
 const BANE_SOLO_POWER = 6;
@@ -83,7 +86,7 @@ const MATCHSTICK_SOLO_BURN = 1;
 const ICICLE_SOLO_POWER = 2;
 const ICICLE_SOLO_FREEZE = 1;
 const SHIVER_SOLO_POWER = 2;
-const SHIVER_SOLO_FREEZE = 1;
+const SHIVER_SOLO_FREEZE = 2;
 const CHILLTOUCH_FREEZE_BONUS = 1;
 const PERMAFROST_CHIP_BONUS = 1;
 const TOXIN_SHIELD_PIERCE = 2;
@@ -106,7 +109,9 @@ const FUSE_VOLT_BONUS = 2;
 const WILDFIRE_EXTRA_BURN = 1;
 export const OIL_FLASK_BURN_BONUS = 1;
 const SCORCH_BURN_BONUS = 1;
+const FLARE_BURN_BONUS = 1;
 const CASCADE_CHIP_BONUS = 2;
+const CHAIN_LIGHTNING_PER_CARD = 2;
 const AVALANCHE_CHIP_BONUS = 2;
 const HEAL_ON_HIT = 1;
 
@@ -290,7 +295,7 @@ export function buildHandAttackQueueWithAbilities(
       catalogId === ELEMENT_ABILITY_CATALOG.shiver &&
       !isInAffirmedChain(attack.id, hand, affirmedSeams)
     ) {
-      return { ...attack, power: SHIVER_SOLO_POWER, label: "Solo Shiver" };
+      return { ...attack, power: SHIVER_SOLO_POWER, label: "Deep Shiver" };
     }
     return attack;
   });
@@ -506,6 +511,12 @@ function finishCombatHit(
 }
 
 /** Resolve one card hit with catalog fight abilities. */
+export type DefenderLayoutMetrics = {
+  maxChainLength: number;
+  connectedCardCount: number;
+  seamCount: number;
+};
+
 export function applyElementCombatHit(
   state: ElementCombatState,
   params: {
@@ -517,6 +528,8 @@ export function applyElementCombatHit(
     combineCount?: number;
     /** Catalog ids in the attacker's locked hand (Oil Flask passive). */
     attackerHandCatalogIds?: readonly string[];
+    /** Foe layout at lock-in — scales Grid Surge / Chain Lightning. */
+    defenderLayout?: DefenderLayoutMetrics;
   },
   attackerIsPlayer: boolean,
 ): ElementCombatState {
@@ -534,6 +547,7 @@ function resolveElementCombatHit(
     rightCardId?: string;
     combineCount?: number;
     attackerHandCatalogIds?: readonly string[];
+    defenderLayout?: DefenderLayoutMetrics;
   },
   attackerIsPlayer: boolean,
 ): ElementCombatState {
@@ -650,6 +664,20 @@ function resolveElementCombatHit(
       { ...bond, power: bond.power + SCORCH_BURN_BONUS },
       attackerIsPlayer,
     );
+  }
+
+  if (
+    bond.element === "fire" &&
+    bondIncludesCatalog("flare", params.leftCardId, params.rightCardId) &&
+    defenderBurnStack(state, attackerIsPlayer) > 0
+  ) {
+    const fired = applyInstantCombatBond(state, bond, attackerIsPlayer);
+    if (attackerIsPlayer) {
+      fired.burnOnCpu += FLARE_BURN_BONUS;
+    } else {
+      fired.burnOnPlayer += FLARE_BURN_BONUS;
+    }
+    return fired;
   }
 
   if (
@@ -885,6 +913,30 @@ function resolveElementCombatHit(
   ) {
     const shocked = applyDamageToDefender(state, attackerIsPlayer, bond.power);
     return healAttacker(shocked, attackerIsPlayer, HEAL_ON_HIT);
+  }
+
+  if (
+    bond.element === "volt" &&
+    bondIncludesCatalog("gridSurge", params.leftCardId, params.rightCardId)
+  ) {
+    const seams = params.defenderLayout?.seamCount ?? 0;
+    return applyDamageToDefender(
+      state,
+      attackerIsPlayer,
+      bond.power + seams,
+    );
+  }
+
+  if (
+    bond.element === "volt" &&
+    bondIncludesCatalog("chainLightning", params.leftCardId, params.rightCardId)
+  ) {
+    const chain = Math.max(1, params.defenderLayout?.maxChainLength ?? 1);
+    return applyDamageToDefender(
+      state,
+      attackerIsPlayer,
+      bond.power + chain * CHAIN_LIGHTNING_PER_CARD,
+    );
   }
 
   if (

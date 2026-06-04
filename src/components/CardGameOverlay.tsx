@@ -1,5 +1,4 @@
 import { useMemo, useState, useCallback, useEffect, useRef } from 'react';
-import { createPortal } from 'react-dom';
 import { Reorder, motion, AnimatePresence } from 'motion/react';
 import { CardDefinition } from '../lib/cards';
 import { canConnect, canConnectAny, colorModeForSide, edgeColorForSide, shapeModeForSide, seamKey } from '../lib/connect';
@@ -38,12 +37,19 @@ import {
 } from './brawl/BrawlAttackReveal';
 import { BrawlSandstormOverlay } from './brawl/BrawlSandstormOverlay';
 import { BrawlBattleResultScreen } from './brawl/BrawlBattleResultScreen';
+import { MageFinisherBanner } from './brawl/MageFinisherBanner';
+import { CardFocusOverlay } from './brawl/CardFocusOverlay';
+import {
+  CardElementActivationTags,
+  cardBrawlAbilityTagline,
+} from './brawl/CardAbilityHeader';
 import {
   ELEMENT_LABEL,
   BRAWL_START_HP,
   brawlAttackCooldownMs,
   brawlConnectionBorderTone,
   maxAffirmedChainLength,
+  defenderLayoutMetrics,
   type ElementBond,
 } from '../lib/brawlElements';
 import { buildHandAttackGroupsWithAbilities, resolvedSnapDisplayValue } from '../lib/elementAbilities';
@@ -58,6 +64,7 @@ import {
   BrawlPillFireAnimation,
   BrawlPillHealAnimation,
   BrawlPillPoisonAnimation,
+  BrawlPillShieldAbsorbFlash,
   BrawlPillShieldBorder,
 } from './brawl/BrawlPillEffects';
 import type { BrawlAura } from './brawl/BrawlImpactCanvas';
@@ -87,8 +94,6 @@ const REVEAL_TWEEN_MS = 520;
 const REVEAL_FINAL_PAUSE_MS = 520;
 
 /** Portaled hover UI: above modals (≈50–60), tutorial (45), and overflow clips. */
-const HOVER_LAYER_Z_CLASS = 'z-[10000]';
-
 const TEXT_COLORS: Record<string, string> = {
   'bg-blue-500': 'text-blue-500',
   'bg-indigo-500': 'text-indigo-500',
@@ -333,6 +338,12 @@ export const CardItem = ({
   tutorialRegions = false,
   readOnly = false,
   snapDisplay,
+  showFocusOverlay = false,
+  focusPlacement = 'above',
+  cardCooldown,
+  gamepadFocused = false,
+  hand,
+  affirmedSeams,
 }: {
   card: CardDefinition;
   isConnectedLeft: boolean;
@@ -378,6 +389,13 @@ export const CardItem = ({
   readOnly?: boolean;
   /** Snap-adjusted center value (e.g. Ember worth 2 in a chain). */
   snapDisplay?: { value: number; boosted: boolean };
+  /** Portaled focus panel (ability, cooldown, flavor) on hover / gamepad focus. */
+  showFocusOverlay?: boolean;
+  focusPlacement?: 'above' | 'below';
+  cardCooldown?: CardCooldownPulse;
+  gamepadFocused?: boolean;
+  hand?: readonly CardDefinition[];
+  affirmedSeams?: ReadonlySet<string>;
 }) => {
   const equippedItemIdsRaw = useGameStore((s) => s.equippedItems[card.id]);
   const equippedItemIds = equippedItemIdsRaw || [];
@@ -547,117 +565,80 @@ export const CardItem = ({
       ? { duration: 0.45, ease: 'easeOut' as const }
       : { duration: 0.35, ease: 'easeOut' as const };
 
-  const cardSurfaceRef = useRef<HTMLDivElement>(null);
-  const abilityHoverRef = useRef(false);
-  const abilityLeaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [abilityHoverOpen, setAbilityHoverOpen] = useState(false);
-  const [abilityAnchor, setAbilityAnchor] = useState<{ cx: number; top: number } | null>(null);
+  const focusHoverRef = useRef(false);
+  const focusLeaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [focusHoverOpen, setFocusHoverOpen] = useState(false);
 
-  const clearAbilityLeaveTimer = useCallback(() => {
-    if (abilityLeaveTimerRef.current != null) {
-      clearTimeout(abilityLeaveTimerRef.current);
-      abilityLeaveTimerRef.current = null;
+  const clearFocusLeaveTimer = useCallback(() => {
+    if (focusLeaveTimerRef.current != null) {
+      clearTimeout(focusLeaveTimerRef.current);
+      focusLeaveTimerRef.current = null;
     }
   }, []);
 
-  const openAbilityHover = useCallback(() => {
-    clearAbilityLeaveTimer();
-    abilityHoverRef.current = true;
-    const el = cardSurfaceRef.current;
-    if (el) {
-      const r = el.getBoundingClientRect();
-      setAbilityAnchor({ cx: r.left + r.width / 2, top: r.top });
-    }
-    setAbilityHoverOpen(true);
-  }, [clearAbilityLeaveTimer]);
+  const openCardFocus = useCallback(() => {
+    if (!showFocusOverlay || dragActive) return;
+    clearFocusLeaveTimer();
+    focusHoverRef.current = true;
+    setFocusHoverOpen(true);
+  }, [clearFocusLeaveTimer, showFocusOverlay, dragActive]);
 
-  const scheduleCloseAbilityHover = useCallback(() => {
-    clearAbilityLeaveTimer();
-    abilityLeaveTimerRef.current = setTimeout(() => {
-      abilityHoverRef.current = false;
-      setAbilityHoverOpen(false);
-      setAbilityAnchor(null);
-      abilityLeaveTimerRef.current = null;
+  const scheduleCloseCardFocus = useCallback(() => {
+    if (gamepadFocused) return;
+    clearFocusLeaveTimer();
+    focusLeaveTimerRef.current = setTimeout(() => {
+      focusHoverRef.current = false;
+      setFocusHoverOpen(false);
+      focusLeaveTimerRef.current = null;
     }, 120);
-  }, [clearAbilityLeaveTimer]);
+  }, [clearFocusLeaveTimer, gamepadFocused]);
 
   useEffect(
     () => () => {
-      clearAbilityLeaveTimer();
+      clearFocusLeaveTimer();
     },
-    [clearAbilityLeaveTimer],
+    [clearFocusLeaveTimer],
   );
 
-  const syncAbilityAnchor = useCallback(() => {
-    const el = cardSurfaceRef.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    setAbilityAnchor({ cx: r.left + r.width / 2, top: r.top });
-  }, []);
+  useEffect(() => {
+    if (!showFocusOverlay) return;
+    if (gamepadFocused) {
+      setFocusHoverOpen(true);
+      return;
+    }
+    if (!focusHoverRef.current) {
+      setFocusHoverOpen(false);
+    }
+  }, [gamepadFocused, showFocusOverlay]);
 
   useEffect(() => {
-    if (!abilityHoverOpen) return;
-    const onScrollOrResize = () => syncAbilityAnchor();
-    window.addEventListener('scroll', onScrollOrResize, true);
-    window.addEventListener('resize', onScrollOrResize);
-    return () => {
-      window.removeEventListener('scroll', onScrollOrResize, true);
-      window.removeEventListener('resize', onScrollOrResize);
-    };
-  }, [abilityHoverOpen, syncAbilityAnchor]);
+    if (dragActive) {
+      focusHoverRef.current = false;
+      setFocusHoverOpen(false);
+    }
+  }, [dragActive]);
 
-  const abilityTooltip =
-    cardIsAbility &&
-    abilityHoverOpen &&
-    abilityAnchor &&
-    typeof document !== 'undefined' &&
-    createPortal(
-      <div
-        data-tutorial={tutorialRegions ? 'card-ability' : undefined}
-        className={`pointer-events-auto fixed ${HOVER_LAYER_Z_CLASS} w-64 max-w-[calc(100vw-1.25rem)] max-h-[min(85vh,32rem)] overflow-y-auto rounded-lg border border-slate-600 bg-slate-800 p-3 shadow-2xl sm:w-72`}
-        style={{
-          left: abilityAnchor.cx,
-          top: abilityAnchor.top,
-          transform: 'translate(-50%, calc(-100% - 8px))',
-        }}
-        role="tooltip"
-        onPointerEnter={openAbilityHover}
-        onPointerLeave={scheduleCloseAbilityHover}
-      >
-        <div className="mb-1.5 border-b border-slate-700 pb-1 text-[10px] font-black uppercase tracking-widest text-slate-500">
-          Ability
-        </div>
-        <div className="mb-1.5 flex items-center justify-between gap-2">
-          <div className="truncate text-[11px] font-black uppercase tracking-tight leading-none text-white">
-            {card.name}
-          </div>
-          {/* Hide the "EncounterItem" pill -- it's tagged on every SZN
-              item and adds no signal next to the card name. Other
-              ability types (General Draw, Player, signature roles)
-              still render their tag for context. */}
-          {card.abilityType !== 'EncounterItem' && (
-            <div
-              className={`shrink-0 rounded px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider text-white ${card.color || 'bg-slate-700'}`}
-            >
-              {card.abilityType}
-            </div>
-          )}
-        </div>
-        {!hideCardPlayer && card.player && (
-          <div className="mb-1.5 text-[9px] font-semibold uppercase tracking-widest text-slate-400">
-            {card.player}
-          </div>
-        )}
-        <div className="text-xs font-medium leading-snug text-slate-300">{card.description}</div>
-      </div>,
-      document.body,
-    );
+  const focusPanelOpen =
+    showFocusOverlay &&
+    !dragActive &&
+    (focusHoverOpen || gamepadFocused);
+  const brawlAbilityTagline =
+    cardBrawlMode && !cardIsAbility ? cardBrawlAbilityTagline(card) : null;
 
   return (
-    <>
-      {abilityTooltip}
+    <div className="relative overflow-visible">
+      {showFocusOverlay && (
+        <CardFocusOverlay
+          card={card}
+          visible={focusPanelOpen}
+          placement={focusPlacement}
+          cooldown={cardCooldown}
+          hand={hand}
+          affirmedSeams={affirmedSeams}
+          gamepadFocused={gamepadFocused}
+        />
+      )}
       <motion.div
-        ref={cardSurfaceRef}
         data-tutorial={tutorialRegions ? 'card-shapes' : undefined}
         data-card-id={card.id}
         className={`
@@ -665,11 +646,8 @@ export const CardItem = ({
         flex flex-col items-center justify-center
         ${readOnly ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'}
       `}
-        onPointerEnter={cardIsValue ? undefined : openAbilityHover}
-        onPointerLeave={cardIsValue ? undefined : scheduleCloseAbilityHover}
-        onPointerMove={() => {
-          if (!cardIsValue && abilityHoverRef.current) syncAbilityAnchor();
-        }}
+        onPointerEnter={showFocusOverlay ? openCardFocus : undefined}
+        onPointerLeave={showFocusOverlay ? scheduleCloseCardFocus : undefined}
         animate={revealAnimate ?? baseAnimate}
         transition={revealAnimate ? revealTransition : baseTransition}
         style={{
@@ -709,28 +687,38 @@ export const CardItem = ({
         <div className={`w-full ${cardHeaderNameClassName(compact, headerOnColoredBody)}`}>
           {card.name}
         </div>
-        {cardBrawlMode && card.brawlTagline && !cardIsAbility && (
-          <motion.span
-            key={`tagline-${highlightTone ?? 'idle'}`}
-            className={`mt-0.5 ${compact ? 'text-[7px] leading-[1.1]' : 'text-[9px] leading-[1.15]'} font-bold uppercase tracking-tight text-amber-900 bg-amber-200/95 rounded px-1 py-0.5 max-w-[92%] text-center border border-amber-400/60 shadow-sm line-clamp-2`}
-            animate={
-              highlightTone === 'source'
-                ? {
-                    backgroundColor: ['rgba(254,243,199,0.95)', 'rgba(250,204,21,0.98)', 'rgba(254,243,199,0.95)'],
-                    scale: [1, 1.18, 1.06],
-                    x: [0, -2, 2, -1, 1, 0],
-                    boxShadow: [
-                      '0 0 0 0 rgba(250,204,21,0)',
-                      '0 0 14px 4px rgba(250,204,21,0.85)',
-                      '0 0 4px 1px rgba(250,204,21,0.35)',
-                    ],
-                  }
-                : { scale: 1, x: 0 }
-            }
-            transition={{ duration: 0.5, ease: 'easeOut' }}
-          >
-            {card.brawlTagline}
-          </motion.span>
+        {cardBrawlMode && !cardIsAbility && !focusPanelOpen && (
+          <>
+            <CardElementActivationTags
+              cardId={card.id}
+              hand={hand}
+              affirmedSeams={affirmedSeams}
+              compact={compact}
+            />
+            {brawlAbilityTagline && (
+              <motion.span
+                key={`tagline-${highlightTone ?? 'idle'}`}
+                className={`mt-0.5 ${compact ? 'text-[7px] leading-[1.1]' : 'text-[9px] leading-[1.15]'} font-bold uppercase tracking-tight text-amber-900 bg-amber-200/95 rounded px-1 py-0.5 max-w-[92%] text-center border border-amber-400/60 shadow-sm line-clamp-2`}
+                animate={
+                  highlightTone === 'source'
+                    ? {
+                        backgroundColor: ['rgba(254,243,199,0.95)', 'rgba(250,204,21,0.98)', 'rgba(254,243,199,0.95)'],
+                        scale: [1, 1.18, 1.06],
+                        x: [0, -2, 2, -1, 1, 0],
+                        boxShadow: [
+                          '0 0 0 0 rgba(250,204,21,0)',
+                          '0 0 14px 4px rgba(250,204,21,0.85)',
+                          '0 0 4px 1px rgba(250,204,21,0.35)',
+                        ],
+                      }
+                    : { scale: 1, x: 0 }
+                }
+                transition={{ duration: 0.5, ease: 'easeOut' }}
+              >
+                {brawlAbilityTagline}
+              </motion.span>
+            )}
+          </>
         )}
       </div>
       {showCenterNumber && (
@@ -815,7 +803,7 @@ export const CardItem = ({
         </motion.div>
       )}
     </motion.div>
-    </>
+    </div>
   );
 };
 
@@ -886,6 +874,9 @@ export const CardGameOverlay = () => {
   const lastOpponentSideCooldownMs = useGameStore((s) => s.lastOpponentSideCooldownMs);
   const lastBrawlCombatReport = useGameStore((s) => s.lastBrawlCombatReport);
   const dismissBrawlBattleReport = useGameStore((s) => s.dismissBrawlBattleReport);
+  const [brawlPostBattleMenuReady, setBrawlPostBattleMenuReady] = useState(false);
+  const brawlUserClass = useGameStore((s) => s.brawlUserClass);
+  const brawlClassCombat = useGameStore((s) => s.brawlClassCombat);
   const commitElementCombatResult = useGameStore((s) => s.commitElementCombatResult);
   const scoreBatterFn = useGameStore((s) => s.scoreBatter);
   const scorePitcherFn = useGameStore((s) => s.scorePitcher);
@@ -977,6 +968,8 @@ export const CardGameOverlay = () => {
   const affirmedSeams = useGameStore((s) => s.affirmedSeams);
   const brawlOpponentSeams = useGameStore((s) => s.brawlOpponentSeams);
   const affirmDraggedCard = useGameStore((s) => s.affirmDraggedCard);
+  const discardUserCard = useGameStore((s) => s.discardUserCard);
+  const brawlLastReplacedCardId = useGameStore((s) => s.brawlLastReplacedCardId);
   // Bag <-> hand recall. The footer rail's CROSS / mouse-click already
   // wires the deal direction (bag -> hand); the in-hand controller
   // CIRCLE handler below wires the recall direction (hand -> bag) so
@@ -1025,6 +1018,14 @@ export const CardGameOverlay = () => {
   const handLiftPx = sznRunActive && footerDeckHeight > 0 ? -footerDeckHeight : 0;
   const isRevealing = phase === 'revealing';
   const isResolved = phase === 'between-at-bats' || phase === 'game-over';
+
+  useEffect(() => {
+    setBrawlPostBattleMenuReady(false);
+  }, [atBatId, lastBrawlCombatReport]);
+
+  const onBrawlFinisherDismissed = useCallback(() => {
+    setBrawlPostBattleMenuReady(true);
+  }, []);
 
   // Non-SZN post-at-bat CTA controller binding. CROSS advances:
   //   - between-at-bats   -> startNextAtBat
@@ -1107,6 +1108,19 @@ export const CardGameOverlay = () => {
     grand: false,
   });
   const [brawlSnapRemainingMs, setBrawlSnapRemainingMs] = useState(BRAWL_SNAP_DURATION_MS);
+  const brawlBoardCenterRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!brawlLastReplacedCardId) return;
+    const id = brawlLastReplacedCardId;
+    const t = window.setTimeout(() => {
+      if (useGameStore.getState().brawlLastReplacedCardId === id) {
+        useGameStore.setState({ brawlLastReplacedCardId: null });
+      }
+    }, 900);
+    return () => window.clearTimeout(t);
+  }, [brawlLastReplacedCardId]);
+
   // Attacker queues are derived from the locked-in card chains in the
   // reveal math snapshot. Falling back to the raw hand keeps us
   // resilient if the snapshot hasn't populated yet.
@@ -1213,6 +1227,28 @@ export const CardGameOverlay = () => {
   // opponent hand deal-in animation (the CPU strip was hidden until lock-in).
   const brawlOpponentRevealDelayMs = 0;
 
+  const brawlDefenderLayouts = useMemo(() => {
+    if (!brawlMode) {
+      return {
+        user: { maxChainLength: 1, connectedCardCount: 0, seamCount: 0 },
+        opponent: { maxChainLength: 1, connectedCardCount: 0, seamCount: 0 },
+      };
+    }
+    const userHand = userIsBatting ? batterHand : pitcherHand;
+    const oppHand = userIsBatting ? pitcherHand : batterHand;
+    return {
+      user: defenderLayoutMetrics(userHand, affirmedSeams),
+      opponent: defenderLayoutMetrics(oppHand, brawlOpponentSeams),
+    };
+  }, [
+    brawlMode,
+    userIsBatting,
+    batterHand,
+    pitcherHand,
+    affirmedSeams,
+    brawlOpponentSeams,
+  ]);
+
   const brawlHandCatalogIds = useMemo(() => {
     if (!brawlMode) {
       return { user: [] as string[], opponent: [] as string[] };
@@ -1251,7 +1287,9 @@ export const CardGameOverlay = () => {
       }));
       playHit();
     },
-    // runId pins the timeline to the current at-bat -- two sequential
+    userDefenderLayout: brawlDefenderLayouts.user,
+    opponentDefenderLayout: brawlDefenderLayouts.opponent,
+    // runId pins the timeline to the current round — sequential rounds
     // brawl at-bats can't have the second one inherit timers from the
     // first because atBatId increments on every deal.
     runId: atBatId,
@@ -1376,42 +1414,49 @@ export const CardGameOverlay = () => {
         : BRAWL_START_HP;
   const userBrawlHpFill = brawlMode && userBrawlHpMax != null;
   const opponentBrawlHpFill = brawlMode && opponentBrawlHpMax != null;
-  const userShieldDisplay =
-    brawlMode && isRevealing
+  const showBrawlCombatStatus = brawlMode && (isRevealing || isResolved);
+  const userShieldDisplay = showBrawlCombatStatus
+    ? isRevealing
       ? userIsBatting
         ? brawlReveal.displayedBatterShield
         : brawlReveal.displayedPitcherShield
-      : 0;
-  const aiShieldDisplay =
-    brawlMode && isRevealing
+      : brawlElementCombat.shieldOnPlayer
+    : 0;
+  const aiShieldDisplay = showBrawlCombatStatus
+    ? isRevealing
       ? userIsBatting
         ? brawlReveal.displayedPitcherShield
         : brawlReveal.displayedBatterShield
-      : 0;
-  const userBurnDisplay =
-    brawlMode && isRevealing
+      : brawlElementCombat.shieldOnCpu
+    : 0;
+  const userBurnDisplay = showBrawlCombatStatus
+    ? isRevealing
       ? userIsBatting
         ? brawlReveal.displayedBatterBurn
         : brawlReveal.displayedPitcherBurn
-      : 0;
-  const aiBurnDisplay =
-    brawlMode && isRevealing
+      : brawlElementCombat.burnOnPlayer
+    : 0;
+  const aiBurnDisplay = showBrawlCombatStatus
+    ? isRevealing
       ? userIsBatting
         ? brawlReveal.displayedPitcherBurn
         : brawlReveal.displayedBatterBurn
-      : 0;
-  const userPoisonDisplay =
-    brawlMode && isRevealing
+      : brawlElementCombat.burnOnCpu
+    : 0;
+  const userPoisonDisplay = showBrawlCombatStatus
+    ? isRevealing
       ? userIsBatting
         ? brawlReveal.displayedBatterPoison
         : brawlReveal.displayedPitcherPoison
-      : 0;
-  const aiPoisonDisplay =
-    brawlMode && isRevealing
+      : brawlElementCombat.poisonOnPlayer
+    : 0;
+  const aiPoisonDisplay = showBrawlCombatStatus
+    ? isRevealing
       ? userIsBatting
         ? brawlReveal.displayedPitcherPoison
         : brawlReveal.displayedBatterPoison
-      : 0;
+      : brawlElementCombat.poisonOnCpu
+    : 0;
   const userHealPulse =
     brawlMode && isRevealing
       ? userIsBatting
@@ -1424,7 +1469,19 @@ export const CardGameOverlay = () => {
         ? brawlReveal.displayedPitcherHealPulse
         : brawlReveal.displayedBatterHealPulse
       : 0;
-  const brawlHpInstant = brawlMode && isRevealing;
+  const userShieldPulse =
+    brawlMode && isRevealing
+      ? userIsBatting
+        ? brawlReveal.displayedBatterShieldPulse
+        : brawlReveal.displayedPitcherShieldPulse
+      : 0;
+  const aiShieldPulse =
+    brawlMode && isRevealing
+      ? userIsBatting
+        ? brawlReveal.displayedPitcherShieldPulse
+        : brawlReveal.displayedBatterShieldPulse
+      : 0;
+  const brawlHpInstant = false;
   const userLabel = 'Player 1';
   const brawlCardCooldowns =
     brawlMode && isRevealing ? brawlReveal.cardCooldowns : undefined;
@@ -1846,13 +1903,14 @@ export const CardGameOverlay = () => {
                     brawlBurn={aiBurnDisplay}
                     brawlPoison={aiPoisonDisplay}
                     brawlHealPulse={aiHealPulse}
+                    brawlShieldPulse={aiShieldPulse}
                     brawlHpInstant={brawlHpInstant}
                   />
                 </motion.div>
               )}
             </AnimatePresence>
           </div>
-          <div data-tutorial="opponent-hand" data-brawl-hand="opponent">
+          <div data-tutorial="opponent-hand" data-brawl-hand="opponent" className="overflow-visible">
             {hideCpuUi ? (
               <BrawlHiddenOpponentHandSlot compact={opponentUiCompact} />
             ) : (
@@ -1872,6 +1930,16 @@ export const CardGameOverlay = () => {
         </div>
       </motion.div>
 
+      {/* Invisible board-center drop target for setup-phase card replacement. */}
+      {brawlMode && isSelecting && (
+        <div
+          ref={brawlBoardCenterRef}
+          data-brawl-board-center
+          className="pointer-events-none absolute left-1/2 top-[46%] z-[12] h-[min(42vh,24rem)] w-[min(52vw,34rem)] -translate-x-1/2 -translate-y-1/2 rounded-[50%] border-2 border-transparent transition-[border-color,box-shadow] duration-200 data-[discard-hot=true]:border-amber-400/30 data-[discard-hot=true]:shadow-[0_0_56px_rgba(251,191,36,0.22)]"
+          aria-hidden
+        />
+      )}
+
       {/* User hand - bottom of screen. Always interactive: drag, connect,
           lock-in. Whether the user is the batter or the pitcher this half
           is decided by `userTeam` + `half` via getUserSide.
@@ -1885,7 +1953,7 @@ export const CardGameOverlay = () => {
       <motion.div
         animate={{ y: handLiftPx }}
         transition={{ type: 'spring', stiffness: 220, damping: 28 }}
-        className="absolute inset-x-0 bottom-0 pointer-events-none flex flex-col items-center justify-end pb-8 bg-gradient-to-t from-slate-900/80 via-slate-900/40 to-transparent pt-32 h-80"
+        className="absolute inset-x-0 bottom-0 pointer-events-none flex flex-col items-center justify-end overflow-visible pb-8 bg-gradient-to-t from-slate-900/80 via-slate-900/40 to-transparent pt-32 h-80"
       >
 
         <div className="pointer-events-auto flex flex-col items-center gap-4">
@@ -1913,6 +1981,7 @@ export const CardGameOverlay = () => {
               brawlBurn={userBurnDisplay}
               brawlPoison={userPoisonDisplay}
               brawlHealPulse={userHealPulse}
+              brawlShieldPulse={userShieldPulse}
               brawlHpInstant={brawlHpInstant}
             />
           </div>
@@ -1941,7 +2010,7 @@ export const CardGameOverlay = () => {
             />
           )}
 
-          <div data-tutorial="user-hand" data-brawl-hand="user">
+          <div data-tutorial="user-hand" data-brawl-hand="user" className="overflow-visible">
             <HandStrip
               hand={userHand}
               onReorder={reorderUser}
@@ -1989,6 +2058,10 @@ export const CardGameOverlay = () => {
                 gamepadPresent ? gamepadGrabbedHandCardId : null
               }
               enableBrawlHandSfx={brawlMode && isSelecting}
+              enableDiscard={brawlMode && isSelecting}
+              onDiscardCard={discardUserCard}
+              deckDrawCardId={brawlLastReplacedCardId}
+              discardZoneRef={brawlBoardCenterRef}
             />
           </div>
 
@@ -2025,7 +2098,7 @@ export const CardGameOverlay = () => {
                     tone="emerald"
                     size="md"
                   >
-                    Next Round
+                    Next Duel
                   </CtaButton>
                 ) : (
                   <CtaButton
@@ -2057,23 +2130,35 @@ export const CardGameOverlay = () => {
       {phase === 'revealing' && (
         <>
           <BrawlSandstormOverlay
-            active={brawlReveal.sandstormActive}
-            tickIndex={brawlReveal.sandstormTickIndex}
+            intensity={brawlReveal.sandstormVignetteIntensity}
           />
           <BrawlAttackOverlay
             impacts={brawlReveal.impacts}
+            cardElementFx={brawlReveal.cardElementFx}
             projectiles={brawlReveal.projectiles}
             auras={brawlAuras}
-            hitNumbers={brawlReveal.hitNumbers}
             shakePulse={brawlShake}
             attackPhase={brawlReveal.attackPhase}
           />
         </>
       )}
 
+      {brawlMode &&
+        isResolved &&
+        lastBrawlCombatReport &&
+        (phase === 'between-at-bats' || phase === 'game-over') && (
+          <MageFinisherBanner
+            atBatId={atBatId}
+            userWon={lastBrawlCombatReport.userWon}
+            phase={phase}
+            onDismissed={onBrawlFinisherDismissed}
+          />
+        )}
+
       <AnimatePresence>
         {brawlMode &&
           isResolved &&
+          brawlPostBattleMenuReady &&
           lastBrawlCombatReport &&
           (phase === 'between-at-bats' || phase === 'game-over') && (
             <BrawlBattleResultScreen
@@ -2081,6 +2166,7 @@ export const CardGameOverlay = () => {
               report={lastBrawlCombatReport}
               phase={phase}
               onContinue={dismissBrawlBattleReport}
+              brawlUserClass={brawlUserClass}
             />
           )}
       </AnimatePresence>
@@ -2170,6 +2256,23 @@ const QuickResolveToggle = ({
  * auto-lock the fresh one. A ref-guard ensures `onLockIn` fires at most
  * once (manual click OR timeout, never both).
  */
+/** Hit-test helper for board-center discard drops. */
+function pointerInElement(
+  x: number,
+  y: number,
+  el: HTMLElement | null,
+  pad = 12,
+): boolean {
+  if (!el) return false;
+  const r = el.getBoundingClientRect();
+  return (
+    x >= r.left - pad &&
+    x <= r.right + pad &&
+    y >= r.top - pad &&
+    y <= r.bottom + pad
+  );
+}
+
 function BrawlSnapAttackHint({
   remainingMs,
   hasSnapChain,
@@ -2199,10 +2302,10 @@ function BrawlSnapAttackHint({
           aria-live="polite"
         >
           <div className="text-[10px] font-black uppercase tracking-[0.28em] text-center">
-            Snap bonds to strike
+            Snap cards to activate elements
           </div>
           <div className="mt-0.5 text-[11px] font-semibold text-center opacity-90">
-            Drag adjacent cards together before time runs out
+            Drag cards together to activate — drag a card to the board center to replace it
           </div>
         </motion.div>
       )}
@@ -2946,6 +3049,8 @@ interface ScorePillProps {
   brawlPoison?: number;
   /** Incrementing id — triggers a one-shot heal burst on the pill. */
   brawlHealPulse?: number;
+  /** Incrementing id — triggers a shield-absorb flash on the pill. */
+  brawlShieldPulse?: number;
   /** Skip bar tween — HP updates instantly on each hit. */
   brawlHpInstant?: boolean;
   /** When true the score renders as a single green total (brawl HP preview). */
@@ -2982,6 +3087,7 @@ const ScorePill = ({
   brawlBurn = 0,
   brawlPoison = 0,
   brawlHealPulse = 0,
+  brawlShieldPulse = 0,
   brawlHpInstant = false,
   highlightValue = false,
 }: ScorePillProps) => {
@@ -3035,14 +3141,6 @@ const ScorePill = ({
     <div className="relative z-30 flex flex-col items-center" data-score-pill={tone}>
       <div className="relative">
         {showBrawlFill && <BrawlPillShieldBorder active={shieldAbsorb > 0} />}
-        {showBrawlFill && shieldAbsorb > 0 && (
-          <div
-            className="absolute -top-1.5 -right-1.5 z-20 min-w-[1.35rem] px-1.5 py-0.5 rounded-full bg-amber-400/95 text-amber-950 text-[10px] font-black leading-none shadow-md border border-amber-200/80 pointer-events-none"
-            aria-label={`${shieldAbsorb} shield absorb remaining`}
-          >
-            {shieldAbsorb}
-          </div>
-        )}
       <motion.div
         layout
         className={`relative overflow-hidden rounded-full font-bold shadow-xl border-2 flex flex-wrap items-center justify-center gap-1 ${containerSize} ${
@@ -3078,6 +3176,7 @@ const ScorePill = ({
             )}
             {hasPoison && <BrawlPillPoisonAnimation widthPct={fillPct} />}
             <BrawlPillHealAnimation pulseId={brawlHealPulse} />
+            <BrawlPillShieldAbsorbFlash pulseId={brawlShieldPulse} />
             {[25, 50, 75].map((t) => (
               <div
                 key={t}
@@ -4322,6 +4421,8 @@ const FlipPitcherStrip = ({
               highlightTone={highlightTones?.[card.id]}
               cardCooldown={cardCooldowns?.[card.id]}
               snapDisplay={snapDisplay}
+              hand={hand}
+              affirmedSeams={affirmedSeams}
             />
           );
         })}
@@ -4352,6 +4453,8 @@ interface PitcherCardProps {
   cardCooldown?: CardCooldownPulse;
   /** Snap-adjusted center value when affirmed seams are tracked. */
   snapDisplay?: { value: number; boosted: boolean };
+  hand?: readonly CardDefinition[];
+  affirmedSeams?: ReadonlySet<string>;
 }
 
 /**
@@ -4377,6 +4480,8 @@ const PitcherCard = ({
   isArranging = false,
   cardCooldown,
   snapDisplay,
+  hand,
+  affirmedSeams,
 }: PitcherCardProps) => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const entry = useMemo(() => buildEntryConfig(isGeneral, index, signatureCount, fromY, fromRot), []);
@@ -4446,7 +4551,7 @@ const PitcherCard = ({
 
         {/* Front face (real CardItem). */}
         <div
-          className="absolute inset-0 overflow-hidden rounded-[inherit]"
+          className="absolute inset-0 overflow-visible rounded-[inherit]"
           style={{
             backfaceVisibility: 'hidden',
             WebkitBackfaceVisibility: 'hidden',
@@ -4463,6 +4568,11 @@ const PitcherCard = ({
             valueOverride={valueOverride}
             highlightTone={highlightTone}
             snapDisplay={snapDisplay}
+            showFocusOverlay={revealed}
+            focusPlacement="below"
+            cardCooldown={cardCooldown}
+            hand={hand}
+            affirmedSeams={affirmedSeams}
           />
           {cardCooldown && (
             <BrawlCardCooldownOverlay pulse={cardCooldown} compact={compact} />
@@ -4568,6 +4678,13 @@ interface HandStripProps {
   enableBrawlHandSfx?: boolean;
   /** Brawl combat: per-card cooldown fill after each bond fires. */
   cardCooldowns?: Record<string, CardCooldownPulse>;
+  /** Setup: drag a card to the board center to replace it. */
+  enableDiscard?: boolean;
+  onDiscardCard?: (cardId: string) => boolean;
+  /** Card id that should play the deck-draw replacement entry. */
+  deckDrawCardId?: string | null;
+  /** Hit-test target for board-center discard (invisible arena zone). */
+  discardZoneRef?: React.RefObject<HTMLDivElement | null>;
 }
 
 const HandStrip = ({
@@ -4590,6 +4707,10 @@ const HandStrip = ({
   gamepadGrabbedCardId = null,
   enableBrawlHandSfx = false,
   cardCooldowns,
+  enableDiscard = false,
+  onDiscardCard,
+  deckDrawCardId = null,
+  discardZoneRef,
 }: HandStripProps) => {
   // Signature cards fly in from the screen edge they belong to (pitcher drops
   // from above, batter rises up from below); general-draw cards then sweep in
@@ -4608,6 +4729,7 @@ const HandStrip = ({
   // setState path in handleDragEnd is async, so reading state directly
   // there is unreliable).
   const draggingIdRef = useRef<string | null>(null);
+  const lastPointerRef = useRef({ x: 0, y: 0 });
 
   const handleDragStart = useCallback((id: string) => {
     if (enableBrawlHandSfx) playCardPickup();
@@ -4623,23 +4745,39 @@ const HandStrip = ({
     },
     [enableBrawlHandSfx, onReorder],
   );
+  const handleCardDrag = useCallback(
+    (_event: unknown, info: { point: { x: number; y: number } }) => {
+      const { x, y } = info.point;
+      lastPointerRef.current = { x, y };
+      if (enableDiscard && discardZoneRef?.current) {
+        const hot = pointerInElement(x, y, discardZoneRef.current);
+        discardZoneRef.current.dataset.discardHot = hot ? 'true' : 'false';
+      }
+    },
+    [enableDiscard, discardZoneRef],
+  );
+
   const handleDragEnd = useCallback(() => {
     const id = draggingIdRef.current;
     draggingIdRef.current = null;
     setDraggingId(null);
-    // The drop is the affirming gesture: tell the store to recompute
-    // affirmedSeams against the fresh hand order. Re-affirms the dropped
-    // card's new left/right seams (if mechanically connectable) and prunes
-    // any seams the reorder broke.
-    //
-    // Defer one frame so Framer's final `onReorder` lands in the store
-    // before we derive seams -- otherwise drag-end can affirm against the
-    // pre-drop layout and the pill/card totals stay stale even though the
-    // cards visually snapped together.
+
+    if (discardZoneRef?.current) {
+      discardZoneRef.current.dataset.discardHot = 'false';
+    }
+
+    if (id && enableDiscard && onDiscardCard) {
+      const { x, y } = lastPointerRef.current;
+      if (pointerInElement(x, y, discardZoneRef?.current ?? null)) {
+        onDiscardCard(id);
+        return;
+      }
+    }
+
     if (id && onAffirmConnections) {
       requestAnimationFrame(() => onAffirmConnections(id));
     }
-  }, [onAffirmConnections]);
+  }, [discardZoneRef, enableDiscard, onAffirmConnections, onDiscardCard]);
 
   // Treat the controller "grabbed" card as a synthetic drag for hint /
   // dragActive / dragging-id purposes. Mouse drag and gamepad grab are
@@ -4697,26 +4835,7 @@ const HandStrip = ({
     entryPlayedRef.current.cards.add(cardId);
   }, []);
 
-  return (
-    <Reorder.Group
-      axis="x"
-      values={hand}
-      onReorder={handleReorderWithSfx}
-      className="flex flex-row items-center justify-center list-none p-0 m-0"
-    >
-      {/*
-        Intentionally NO <AnimatePresence> here. In legacy / quick-match
-        lanes the hand is set once by `dealHand` and never mutated until
-        the at-bat resolves, so there's nothing for AnimatePresence to
-        track. In SZN the player CAN deal/recall items mid-at-bat via
-        the persistent footer — those operations route through the
-        store's `reconcileSznHandState()` which rebuilds the hand atomically;
-        the reorder list re-renders fresh on the new `hand` reference,
-        which is enough animation continuity for the deck-style swap UX
-        (wrapping with AnimatePresence + Reorder.Item `layout` together
-        plays badly with Framer's reorder swap math).
-      */}
-      {hand.map((card, index) => {
+  const cardList = hand.map((card, index) => {
           // A seam is "connected" only if (a) the mechanic allows it
           // (canConnect) AND (b) the user has affirmed it. When the strip
           // doesn't get an `affirmedSeams` set (pitcher strip, reveal phase),
@@ -4739,7 +4858,9 @@ const HandStrip = ({
           const modifier = modifiers[card.id];
           const hintForCard = hints[index];
           const isGeneral = card.abilityType === 'General Draw';
-          const skipEntryAnim = entryPlayedRef.current.cards.has(card.id);
+          const skipEntryAnim =
+            entryPlayedRef.current.cards.has(card.id) &&
+            card.id !== deckDrawCardId;
           const hasPendingChoice =
             pendingChoiceIds?.has(card.id) ?? false;
           const snapDisplay =
@@ -4761,10 +4882,13 @@ const HandStrip = ({
               leftHint={hintForCard?.left}
               rightHint={hintForCard?.right}
               onDragStart={handleDragStart}
+              onDrag={handleCardDrag}
               onDragEnd={handleDragEnd}
               fromY={fromY}
               fromRot={fromRot}
               skipEntryAnim={skipEntryAnim}
+              deckDrawEntry={card.id === deckDrawCardId}
+              discardExit={enableDiscard}
               onEntryPlayed={markEntryPlayed}
               valueOverride={valueOverrides?.[card.id]}
               highlightTone={highlightTones?.[card.id]}
@@ -4784,10 +4908,41 @@ const HandStrip = ({
               gamepadGrabbed={gamepadGrabbedCardId === card.id}
               cardCooldown={cardCooldowns?.[card.id]}
               snapDisplay={snapDisplay}
+              hand={hand}
+              affirmedSeams={affirmedSeams}
             />
           );
-        })}
+        });
+
+  return (
+    <div className="flex flex-col items-center overflow-visible">
+    <Reorder.Group
+      axis="x"
+      values={hand}
+      onReorder={handleReorderWithSfx}
+      className="flex flex-row items-center justify-center list-none p-0 m-0 overflow-visible"
+    >
+      {/*
+        Intentionally NO <AnimatePresence> here. In legacy / quick-match
+        lanes the hand is set once by `dealHand` and never mutated until
+        the at-bat resolves, so there's nothing for AnimatePresence to
+        track. In SZN the player CAN deal/recall items mid-at-bat via
+        the persistent footer — those operations route through the
+        store's `reconcileSznHandState()` which rebuilds the hand atomically;
+        the reorder list re-renders fresh on the new `hand` reference,
+        which is enough animation continuity for the deck-style swap UX
+        (wrapping with AnimatePresence + Reorder.Item `layout` together
+        plays badly with Framer's reorder swap math).
+      */}
+      {enableDiscard ? (
+        <AnimatePresence mode="popLayout" initial={false}>
+          {cardList}
+        </AnimatePresence>
+      ) : (
+        cardList
+      )}
     </Reorder.Group>
+    </div>
   );
 };
 
@@ -4804,9 +4959,14 @@ interface HandCardProps {
   leftHint?: ConnectHint;
   rightHint?: ConnectHint;
   onDragStart: (id: string) => void;
+  onDrag?: (event: unknown, info: { point: { x: number; y: number } }) => void;
   onDragEnd: () => void;
   fromY: number;
   fromRot: number;
+  /** Replacement draw from board-center discard — sweeps in from the deck. */
+  deckDrawEntry?: boolean;
+  /** Fly toward board center when discarded. */
+  discardExit?: boolean;
   valueOverride?: number;
   highlightTone?: 'source' | 'target' | null;
   /**
@@ -4872,6 +5032,8 @@ interface HandCardProps {
   cardCooldown?: CardCooldownPulse;
   /** Snap-adjusted center value when affirmed seams are tracked. */
   snapDisplay?: { value: number; boosted: boolean };
+  hand?: readonly CardDefinition[];
+  affirmedSeams?: ReadonlySet<string>;
 }
 
 /**
@@ -4892,6 +5054,7 @@ const HandCard = ({
   leftHint,
   rightHint,
   onDragStart,
+  onDrag,
   onDragEnd,
   fromY,
   fromRot,
@@ -4899,6 +5062,8 @@ const HandCard = ({
   highlightTone,
   dragActive = false,
   skipEntryAnim = false,
+  deckDrawEntry = false,
+  discardExit = false,
   onEntryPlayed,
   hasPendingChoice = false,
   isChoiceActive = false,
@@ -4909,36 +5074,66 @@ const HandCard = ({
   gamepadGrabbed = false,
   cardCooldown,
   snapDisplay,
+  hand,
+  affirmedSeams,
 }: HandCardProps) => {
   useEffect(() => {
     onEntryPlayed(card.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const entry = useMemo(() => buildEntryConfig(isGeneral, index, signatureCount, fromY, fromRot), []);
+  const entry = useMemo(
+    () =>
+      deckDrawEntry
+        ? {
+            initial: { opacity: 0, x: 200, y: 36, rotate: 16, scale: 0.48 },
+            animate: {
+              opacity: 1,
+              x: 0,
+              y: 0,
+              rotate: 0,
+              scale: 1,
+              transition: {
+                type: 'spring' as const,
+                stiffness: 280,
+                damping: 24,
+                delay: 0,
+              },
+            },
+          }
+        : buildEntryConfig(isGeneral, index, signatureCount, fromY, fromRot),
+    [deckDrawEntry, isGeneral, index, signatureCount, fromY, fromRot],
+  );
   useEffect(() => {
-    if (skipEntryAnim) return;
-    const delaySec = entry.animate.transition.delay ?? 0;
+    if (skipEntryAnim && !deckDrawEntry) return;
+    const delaySec = deckDrawEntry ? 0 : (entry.animate.transition.delay ?? 0);
     return scheduleCardsDealSound(delaySec);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deckDrawEntry, entry, skipEntryAnim]);
   const exitConfig = useMemo(
-    () => ({
-      opacity: 0,
-      y: -fromY * 0.5,
-      rotate: -fromRot,
-      scale: 0.6,
-      transition: makeItemExitTransition(handLength, index),
-    }),
-    [],
+    () =>
+      discardExit
+        ? {
+            opacity: 0,
+            y: -260,
+            x: 0,
+            rotate: -10,
+            scale: 0.36,
+            transition: { duration: 0.38, ease: [0.4, 0, 0.85, 1] as const },
+          }
+        : {
+            opacity: 0,
+            y: -fromY * 0.5,
+            rotate: -fromRot,
+            scale: 0.6,
+            transition: makeItemExitTransition(handLength, index),
+          },
+    [discardExit, fromY, fromRot, handLength, index],
   );
   const handleDragStart = useCallback(() => onDragStart(card.id), [onDragStart, card.id]);
 
   return (
     <Reorder.Item
       value={card}
-      className="relative"
+      className="relative overflow-visible"
       layout
       // When this card has already played its entry once in this at-bat, skip
       // the staggered fly-in on subsequent mounts. We can't use
@@ -4951,13 +5146,14 @@ const HandCard = ({
       // (delayed) transition, which still leaks the staggered initial.
       // Setting both ends to the resting state with a 0-duration transition
       // makes the remounted card paint immediately at its slot.
-      initial={skipEntryAnim ? RESTING_STATE : entry.initial}
-      animate={skipEntryAnim ? RESTING_ANIMATE : entry.animate}
+      initial={skipEntryAnim && !deckDrawEntry ? RESTING_STATE : entry.initial}
+      animate={skipEntryAnim && !deckDrawEntry ? RESTING_ANIMATE : entry.animate}
       exit={exitConfig}
       transition={ITEM_LAYOUT_TRANSITION}
       dragTransition={ITEM_DRAG_TRANSITION}
       drag={lockReorder ? false : true}
       onDragStart={handleDragStart}
+      onDrag={onDrag}
       onDragEnd={onDragEnd}
       // Brawl Mode reveal needs a stable selector to grab each card's
       // screen-space rect so the flying-card ghost can launch from the
@@ -4980,7 +5176,7 @@ const HandCard = ({
             : { y: 0, scale: 1 }
         }
         transition={{ type: 'spring', stiffness: 380, damping: 26 }}
-        className={`relative ${gamepadGrabbed ? 'z-50' : ''}`}
+        className={`relative overflow-visible ${gamepadGrabbed ? 'z-50' : ''}`}
       >
         <CardItem
           card={card}
@@ -4996,6 +5192,12 @@ const HandCard = ({
           tutorialRegions={tutorialRegions}
           readOnly={lockReorder}
           snapDisplay={snapDisplay}
+          showFocusOverlay
+          focusPlacement="above"
+          cardCooldown={cardCooldown}
+          gamepadFocused={gamepadFocused}
+          hand={hand}
+          affirmedSeams={affirmedSeams}
         />
         {cardCooldown && (
           <BrawlCardCooldownOverlay pulse={cardCooldown} compact={compact} />

@@ -1,9 +1,13 @@
 /**
- * Element brawl game state — player vs CPU, no baseball/SZN/draft paths.
+ * Mage arena game state — player vs CPU autobattle.
  */
 import { create } from "zustand";
+import {
+  freshClassCombatRuntime,
+  type ClassCombatRuntime,
+} from "./classCombatTraits";
 import type { CardDefinition } from "./cards";
-import { dealBrawlElementHand } from "./elementDeal";
+import { dealBrawlElementHand, dealBrawlReplacementCard, elementCatalogId } from "./elementDeal";
 import {
   classPoolIds,
   randomOpponentClass,
@@ -20,7 +24,7 @@ import {
 } from "./brawlElements";
 import type { BrawlCombatReport } from "./brawlCombatLog";
 import { canConnectAny, seamKey } from "./connect";
-import { playCardSnap, startStadiumAmbience } from "./gameAudio";
+import { playCardSnap, playCardsDeal, startStadiumAmbience } from "./gameAudio";
 import type { ScoringResult } from "./scoring";
 
 export type Team = "PLAYER" | "CPU";
@@ -63,8 +67,11 @@ export interface MatchupPreview {
 
 export const BRAWL_SNAP_DURATION_MS = 60_000;
 
-export function brawlSnapSpeedBonus(_remainingMs: number): number {
-  return 0;
+/** Ms shaved from user attack cooldown when locking in quickly (max 500). */
+export function brawlSnapSpeedBonus(remainingMs: number): number {
+  const saved = BRAWL_SNAP_DURATION_MS - remainingMs;
+  if (saved < 12_000) return 0;
+  return Math.min(500, Math.floor((saved - 12_000) / 50));
 }
 
 export function getUserSide(s: {
@@ -99,6 +106,23 @@ function emptyScoringResult(): ScoringResult {
   return { totalValue: 0, bestGroup: [], cardModifiers: {} };
 }
 
+function pruneAffirmedSeamsForCard(
+  seams: Set<string>,
+  removedCardId: string,
+): Set<string> {
+  const next = new Set<string>();
+  for (const key of seams) {
+    const sep = key.indexOf("|");
+    if (sep === -1) continue;
+    const left = key.slice(0, sep);
+    const right = key.slice(sep + 1);
+    if (left !== removedCardId && right !== removedCardId) {
+      next.add(key);
+    }
+  }
+  return next;
+}
+
 function computeBrawlOpponentPrep(
   s: Pick<
     GameState,
@@ -111,9 +135,10 @@ function computeBrawlOpponentPrep(
     userSide === "Batting" ? s.pitcherHand : s.batterHand;
   if (opponentHand.length === 0) return null;
   const optimized = optimizeElementHand(opponentHand);
+  const seams = optimized.affirmedSeams;
   return {
     brawlOpponentPlanHand: optimized.hand,
-    brawlOpponentSeams: new Set(optimized.affirmedSeams),
+    brawlOpponentSeams: new Set(seams),
   };
 }
 
@@ -223,10 +248,16 @@ export interface GameState {
   brawlOpponentPool: string[];
   brawlUserClass: BrawlClass | null;
   brawlOpponentClass: BrawlClass | null;
+  brawlClassCombat: ClassCombatRuntime;
+  /** Monotonic discard counter — seeds replacement draws. */
+  brawlDiscardSerial: number;
+  /** Triggers deck-draw entry animation on the replacement card. */
+  brawlLastReplacedCardId: string | null;
 
   reorderBatterHand: (cards: CardDefinition[]) => void;
   reorderPitcherHand: (cards: CardDefinition[]) => void;
   affirmDraggedCard: (cardId: string) => void;
+  discardUserCard: (cardId: string) => boolean;
   lockIn: () => void;
   completeReveal: () => void;
   commitElementCombatResult: (
@@ -322,9 +353,53 @@ export const useGameStore = create<GameState>((set, get) => ({
   brawlOpponentPool: [],
   brawlUserClass: null,
   brawlOpponentClass: null,
+  brawlClassCombat: freshClassCombatRuntime(),
+  brawlDiscardSerial: 0,
+  brawlLastReplacedCardId: null,
 
   reorderBatterHand: (cards) => set({ batterHand: cards }),
   reorderPitcherHand: (cards) => set({ pitcherHand: cards }),
+
+  discardUserCard: (cardId) => {
+    const s = get();
+    if (s.phase !== "selecting" || s.gameMode !== "brawl" || !s.brawlUserClass) {
+      return false;
+    }
+    const userSide = getUserSide(s);
+    const handKey = userSide === "Batting" ? "batterHand" : "pitcherHand";
+    const hand = s[handKey];
+    const idx = hand.findIndex((c) => c.id === cardId);
+    if (idx === -1) return false;
+
+    const catalogInHand = hand.map((c) => elementCatalogId(c.id));
+    const serial = s.brawlDiscardSerial + 1;
+    const seed = s.atBatId * 100_000 + serial;
+    let newCard;
+    try {
+      newCard = dealBrawlReplacementCard(
+        s.brawlUserPool,
+        seed,
+        catalogInHand,
+      );
+    } catch {
+      return false;
+    }
+
+    const nextHand = [...hand];
+    nextHand[idx] = newCard;
+    const nextSeams = pruneAffirmedSeamsForCard(s.affirmedSeams, cardId);
+
+    set({
+      [handKey]: nextHand,
+      affirmedSeams: nextSeams,
+      brawlDiscardSerial: serial,
+      brawlLastReplacedCardId: newCard.id,
+    });
+    playCardsDeal();
+    const prep = computeBrawlOpponentPrep(get());
+    if (prep) set(prep);
+    return true;
+  },
 
   affirmDraggedCard: (cardId) =>
     set((s) => {
@@ -393,14 +468,24 @@ export const useGameStore = create<GameState>((set, get) => ({
     const combatStart = state.brawlElementCombat;
     const userChain = maxAffirmedChainLength(userHand, state.affirmedSeams);
     const oppChain = maxAffirmedChainLength(oppHand, state.brawlOpponentSeams);
+    const snapStarted = state.brawlSnapStartedAt ?? Date.now();
+    const remainingMs = Math.max(
+      0,
+      BRAWL_SNAP_DURATION_MS - (Date.now() - snapStarted),
+    );
+    const speedBonus = brawlSnapSpeedBonus(remainingMs);
 
     set({
+      brawlClassCombat: freshClassCombatRuntime(),
       lastElementBonds: { user: userBonds, opponent: oppBonds },
       lastElementCombatStart: {
         playerHP: combatStart.playerHP,
         cpuHP: combatStart.cpuHP,
       },
-      lastUserSideCooldownMs: brawlAttackCooldownMs(userChain),
+      lastUserSideCooldownMs: Math.max(
+        0,
+        brawlAttackCooldownMs(userChain) - speedBonus,
+      ),
       lastOpponentSideCooldownMs: brawlAttackCooldownMs(oppChain),
       lastBatterScore: combatStart.playerHP,
       lastPitcherScore: combatStart.cpuHP,
@@ -475,6 +560,9 @@ export const useGameStore = create<GameState>((set, get) => ({
       revealUiUserSide: null,
       brawlUserPool: [...classPoolIds(s.brawlUserClass)],
       brawlOpponentPool: [...classPoolIds(s.brawlOpponentClass)],
+      brawlClassCombat: freshClassCombatRuntime(),
+      brawlDiscardSerial: 0,
+      brawlLastReplacedCardId: null,
     });
     const prep = computeBrawlOpponentPrep(get());
     if (prep) set(prep);
@@ -511,6 +599,9 @@ export const useGameStore = create<GameState>((set, get) => ({
       brawlOpponentClass: opponentClass,
       brawlUserPool: [...classPoolIds(brawlClass)],
       brawlOpponentPool: [...classPoolIds(opponentClass)],
+      brawlClassCombat: freshClassCombatRuntime(),
+      brawlDiscardSerial: 0,
+      brawlLastReplacedCardId: null,
     });
     const prep = computeBrawlOpponentPrep(get());
     if (prep) set(prep);
@@ -534,6 +625,7 @@ export const useGameStore = create<GameState>((set, get) => ({
       brawlOpponentClass: null,
       brawlUserPool: [],
       brawlOpponentPool: [],
+      brawlClassCombat: freshClassCombatRuntime(),
       revealScript: [],
       pendingResolvedPhase: null,
       revealUiUserSide: null,

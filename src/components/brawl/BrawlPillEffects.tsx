@@ -136,6 +136,64 @@ export function BrawlPillHealAnimation({ pulseId }: { pulseId: number }) {
               "linear-gradient(180deg, rgba(134,239,172,0.35), transparent 60%)",
           }}
         />
+        {[0, 1, 2, 3, 4].map((i) => (
+          <motion.span
+            key={i}
+            className="absolute font-black text-emerald-200 select-none"
+            style={{
+              left: `${18 + i * 16}%`,
+              bottom: "28%",
+              fontSize: 14 + (i % 2) * 4,
+              textShadow: "0 0 8px rgba(74,222,128,0.9)",
+            }}
+            initial={{ y: 0, opacity: 0, scale: 0.5 }}
+            animate={{ y: -28 - i * 6, opacity: [0, 1, 0], scale: [0.5, 1.1, 0.85] }}
+            transition={{
+              duration: 0.55 + i * 0.06,
+              ease: [0.2, 0.8, 0.2, 1],
+              delay: i * 0.07,
+            }}
+          >
+            +
+          </motion.span>
+        ))}
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
+/** Brief gold ripple when shield absorbs a hit (no numeric label). */
+export function BrawlPillShieldAbsorbFlash({ pulseId }: { pulseId: number }) {
+  if (pulseId <= 0) return null;
+  return (
+    <AnimatePresence mode="wait">
+      <motion.div
+        key={pulseId}
+        className="absolute -inset-[4px] pointer-events-none z-[6] rounded-full overflow-visible"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        aria-hidden="true"
+      >
+        <motion.div
+          className="absolute inset-0 rounded-full"
+          initial={{ scale: 0.85, opacity: 0.95 }}
+          animate={{ scale: 1.35, opacity: 0 }}
+          transition={{ duration: 0.45, ease: [0.2, 0.75, 0.2, 1] }}
+          style={{
+            boxShadow:
+              "0 0 0 3px rgba(250,204,21,0.75), 0 0 24px rgba(251,191,36,0.55)",
+          }}
+        />
+        {[0, 1].map((i) => (
+          <motion.div
+            key={i}
+            className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-amber-200/80"
+            initial={{ width: 20, height: 20, opacity: 0.85 }}
+            animate={{ width: 100 + i * 24, height: 100 + i * 24, opacity: 0 }}
+            transition={{ duration: 0.55 + i * 0.1, ease: "easeOut", delay: i * 0.05 }}
+          />
+        ))}
       </motion.div>
     </AnimatePresence>
   );

@@ -1,6 +1,6 @@
 # Archmage Architect Development Guide
 
-> Canonical design and engineering reference for **When Things Attack** (Dugout). Consult this document when adding cards, mechanics, class pools, combat tuning, VFX, or balance changes.
+> Canonical design and engineering reference for **When Things Attack**. Consult this document when adding cards, mechanics, class pools, combat tuning, VFX, or balance changes.
 
 ---
 
@@ -89,7 +89,7 @@ When prompted to create a mechanic, card, system, or effect, provide a holistic 
 
 ---
 
-## Appendix: This Project (When Things Attack / Dugout)
+## Appendix: This Project (When Things Attack)
 
 ### Current Stack vs Aspirational Stack
 
@@ -132,10 +132,10 @@ When prompted to create a mechanic, card, system, or effect, provide a holistic 
 6. **Run class playtest** script when relevant; run `npm run test:effects` after ability changes.
 7. **Do not change cooldown formulas** unless explicitly requested.
 
-### Element Brawl Design Notes
+### Mage Autobattle Design Notes
 
 - **Classes:** Ignis (fire), Ren (freeze), Lumi (poison), Volta (volt) — see `BRAWL_CLASS_OPTIONS` in `elementClassPools.ts`.
-- **Bridge cards** (wildcards, solo finishers) raise weave reliability and fun; support cards dilute offensive identity — trim per-class when needed (Ren uses Mend + Aegis only).
+- **Bridge cards** (wildcards, solo finishers) raise weave reliability and fun; support cards dilute offensive identity — trim per-class when needed (Ignis and Ren use Mend + Aegis only).
 - **Freeze** applies chip damage + chill stacks; UI pauses one random defender card per freeze hit (`FREEZE_COOLDOWN_PAUSE_MS`).
 - **Headless playtests** approximate pause delay but may not capture full UI feel — validate in-browser for stall mechanics.
 
@@ -150,4 +150,6 @@ npm run test:cooldown   # cooldown math
 npm test                # all three
 npx tsx src/lib/__ignis_playtest.ts   # fire class sim
 npx tsx src/lib/__ren_playtest.ts     # freeze class sim
+npx tsx src/lib/__lumi_playtest.ts    # poison class sim
+npx tsx src/lib/__volta_playtest.ts   # volt class sim
 ```
